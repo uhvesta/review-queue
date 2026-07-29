@@ -401,6 +401,30 @@ describe("responsive reviewer escape hatches", () => {
 });
 
 describe("diff anchor selection", () => {
+  it("navigates hunks across the entire continuous multi-file review", async () => {
+    await openPaginationReview();
+
+    const navigation = screen.getByRole("navigation", { name: "Review hunk navigation" });
+    const next = within(navigation).getByRole("button", { name: "Next hunk in review" });
+    await waitFor(() => expect(next).toBeEnabled());
+    const initiallySelected = document.querySelector<HTMLElement>(".continuous-diff-path[aria-current='true']");
+    const firstFile = initiallySelected?.closest(".continuous-diff-file");
+    if (!initiallySelected || !firstFile) throw new Error("The first changed file was not selected.");
+    const firstPath = initiallySelected.textContent;
+    const firstFileHunks = firstFile.querySelectorAll(".diff-hunk").length;
+    expect(firstFileHunks).toBeGreaterThan(0);
+
+    for (let index = 0; index < firstFileHunks; index += 1) {
+      fireEvent.click(next);
+    }
+
+    await waitFor(() => {
+      const selected = document.querySelector<HTMLElement>(".continuous-diff-path[aria-current='true']");
+      expect(selected?.textContent).not.toBe(firstPath);
+    });
+    expect(document.querySelector(".active-hunk[id^='review-queue-hunk-']")).toBeInTheDocument();
+  });
+
   it("creates a side-correct /ask anchor from a split-diff line", async () => {
     const sendPrompt = vi.fn();
     vi.doMock("../src/api.fixture.ts", async (importOriginal) => {

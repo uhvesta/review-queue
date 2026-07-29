@@ -398,6 +398,19 @@ button:disabled {
 .toolbar-view-modes {
   margin-left: 4px;
 }
+.global-hunk-navigation {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.global-hunk-navigation button {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+}
 .viewed-progress {
   display: flex;
   align-items: center;
@@ -1164,6 +1177,9 @@ button:disabled {
   }
 }
 @media (max-width: 580px) {
+  .global-hunk-navigation span {
+    display: none;
+  }
   .workspace {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(0, 1fr);

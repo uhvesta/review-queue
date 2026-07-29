@@ -1069,6 +1069,7 @@ function Reviewer({
   const [diffLoadVersion, setDiffLoadVersion] = useState(0);
   const [actionFailure, setActionFailure] = useState<ReviewerActionFailure | null>(null);
   const [selectedKey, setSelectedKey] = useState("");
+  const [activeHunkKey, setActiveHunkKey] = useState("");
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(new Set());
   const [viewed, setViewed] = useState<Set<string>>(new Set());
   const [diffLoading, setDiffLoading] = useState(true);
@@ -1349,13 +1350,32 @@ function Reviewer({
     }
     return counts;
   }, [files, formalComments, importedComments]);
+  const hunkTargets = useMemo(() => files.flatMap(({ file, path }, fileIndex) => {
+    const key = fileKey(file.repository_id, path);
+    return file.hunks.map((_, hunkIndex) => ({
+      key: `${key}:${hunkIndex}`,
+      fileKey: key,
+      fileIndex,
+      hunkIndex,
+      path,
+      elementId: `review-queue-hunk-${fileIndex}-${hunkIndex}`,
+    }));
+  }), [files]);
+  const activeHunkPosition = hunkTargets.findIndex((target) => target.key === activeHunkKey);
+  const activeHunkTarget = activeHunkPosition >= 0 ? hunkTargets[activeHunkPosition] : null;
   const selected = files.find(({ file, path }) =>
     fileKey(file.repository_id, path) === selectedKey) ?? files[0];
   const diffFileElements = useRef(new Map<string, HTMLElement>());
 
   useEffect(() => {
     setCollapsedFiles(new Set());
+    setActiveHunkKey("");
   }, [round.id]);
+
+  useEffect(() => {
+    if (!hunkTargets.length || activeHunkPosition >= 0) return;
+    setActiveHunkKey(hunkTargets[0].key);
+  }, [activeHunkPosition, hunkTargets]);
 
   useEffect(() => {
     if (!selectedKey || viewMode === "file") return;
@@ -1375,6 +1395,24 @@ function Reviewer({
       return next;
     });
     setSelectedKey(key);
+    const firstHunk = hunkTargets.find((target) => target.fileKey === key);
+    if (firstHunk) setActiveHunkKey(firstHunk.key);
+  };
+
+  const navigateToHunk = (position: number) => {
+    const target = hunkTargets[Math.max(0, Math.min(position, hunkTargets.length - 1))];
+    if (!target) return;
+    setActiveHunkKey(target.key);
+    setSelectedKey(target.fileKey);
+    setCollapsedFiles((current) => {
+      if (!current.has(target.fileKey)) return current;
+      const next = new Set(current);
+      next.delete(target.fileKey);
+      return next;
+    });
+    window.requestAnimationFrame(() => {
+      document.getElementById(target.elementId)?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
   };
 
   const toggleDiffFileCollapsed = (key: string) => {
@@ -1520,6 +1558,23 @@ function Reviewer({
             </button>
           ))}
         </div>
+        <nav className="global-hunk-navigation" aria-label="Review hunk navigation">
+          <button
+            aria-label="Previous hunk in review"
+            disabled={activeHunkPosition <= 0 || viewMode === "file"}
+            onClick={() => navigateToHunk(activeHunkPosition - 1)}
+          >↑</button>
+          <span aria-live="polite">
+            {hunkTargets.length
+              ? `${Math.max(0, activeHunkPosition) + 1} / ${hunkTargets.length} hunks`
+              : "No hunks"}
+          </span>
+          <button
+            aria-label="Next hunk in review"
+            disabled={activeHunkPosition < 0 || activeHunkPosition >= hunkTargets.length - 1 || viewMode === "file"}
+            onClick={() => navigateToHunk(activeHunkPosition + 1)}
+          >↓</button>
+        </nav>
         <div
           className="viewed-progress"
           aria-label={`${viewedCount} of ${totalFiles} files viewed`}
@@ -1670,6 +1725,12 @@ function Reviewer({
                         file={file}
                         fileIndex={index}
                         continuous
+                        activeHunk={activeHunkTarget?.fileKey === key ? activeHunkTarget.hunkIndex : null}
+                        onActiveHunkChange={(hunkIndex) => {
+                          const position = hunkTargets.findIndex((target) =>
+                            target.fileKey === key && target.hunkIndex === hunkIndex);
+                          if (position >= 0) navigateToHunk(position);
+                        }}
                         layout={viewMode}
                         repositoryRoot={repository.root}
                         importedComments={importedComments}
@@ -2597,6 +2658,8 @@ function DiffFileView({
   file,
   fileIndex,
   continuous = false,
+  activeHunk,
+  onActiveHunkChange,
   layout,
   repositoryRoot,
   importedComments,
@@ -2611,6 +2674,8 @@ function DiffFileView({
   file: DiffFile;
   fileIndex: number;
   continuous?: boolean;
+  activeHunk: number | null;
+  onActiveHunkChange: (hunkIndex: number) => void;
   layout: "unified" | "split";
   repositoryRoot: string;
   importedComments: ImportedComment[];
@@ -2622,28 +2687,22 @@ function DiffFileView({
   onOpenAskTurn: (anchor: Anchor) => void;
   onConvertAskTurn: (turn: AskTurn) => void;
 }) {
-  const [activeHunk, setActiveHunk] = useState(0);
-  useEffect(() => {
-    if (activeHunk === 0) return;
-    document.getElementById(`review-queue-active-hunk-${fileIndex}-${activeHunk}`)?.scrollIntoView({
-      block: "nearest",
-      behavior: "smooth",
-    });
-  }, [activeHunk, fileIndex]);
   if (file.is_binary) {
     return <div className="code binary-state"><b>Binary file changed</b><p>The pinned Git patch is retained, but binary content is not rendered as text.</p></div>;
   }
   return (
     <div className={continuous ? "code continuous-code" : "code"} role="region" aria-label="Code diff" tabIndex={0}>
-      <nav className="hunk-navigation" aria-label="Hunk navigation">
-        <button disabled={activeHunk <= 0} onClick={() => setActiveHunk((value) => Math.max(0, value - 1))}>Previous hunk</button>
-        <span>{file.hunks.length ? `${activeHunk + 1} / ${file.hunks.length}` : "No hunks"}</span>
-        <button disabled={activeHunk >= file.hunks.length - 1} onClick={() => setActiveHunk((value) => Math.min(file.hunks.length - 1, value + 1))}>Next hunk</button>
-        <span className="muted">Use Full file to expand context.</span>
-      </nav>
+      {!continuous && (
+        <nav className="hunk-navigation" aria-label="Hunk navigation">
+          <button disabled={activeHunk === null || activeHunk <= 0} onClick={() => onActiveHunkChange(Math.max(0, (activeHunk ?? 0) - 1))}>Previous hunk</button>
+          <span>{file.hunks.length && activeHunk !== null ? `${activeHunk + 1} / ${file.hunks.length}` : "No hunks"}</span>
+          <button disabled={activeHunk === null || activeHunk >= file.hunks.length - 1} onClick={() => onActiveHunkChange(Math.min(file.hunks.length - 1, (activeHunk ?? 0) + 1))}>Next hunk</button>
+          <span className="muted">Use Full file to expand context.</span>
+        </nav>
+      )}
       {file.hunks.map((hunk, index) => (
         <div
-          id={index === activeHunk ? `review-queue-active-hunk-${fileIndex}-${index}` : undefined}
+          id={`review-queue-hunk-${fileIndex}-${index}`}
           className={index === activeHunk ? "active-hunk" : ""}
           key={`${hunk.old_start}:${hunk.new_start}:${index}`}
         >
