@@ -1,0 +1,2 @@
+Immutable GitHub review acceptance fixture.
+This pull request is disposable and exists only to validate Review Queue publication.
