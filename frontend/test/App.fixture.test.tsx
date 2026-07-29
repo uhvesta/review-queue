@@ -277,6 +277,62 @@ describe("fixture-backed reviewer recovery", () => {
     expect(within(publishDialog).getByText("1 threaded reply published.")).toBeVisible();
   });
 
+  it("does not let a late decision from a replaced GitHub round enable publishing", async () => {
+    let resolveOldDecision: ((decision: "approve" | "request_changes" | null) => void) | undefined;
+    let getDecision = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      const oldRoundId = "round-github-expired-tokens";
+      const oldRound = await api.getRound(oldRoundId);
+      const refreshedRound = {
+        ...oldRound,
+        id: "round-github-expired-tokens-refreshed",
+        manifest_hash: "f".repeat(64),
+      };
+      getDecision = vi.fn((roundId: string) => {
+        if (roundId === oldRoundId) {
+          return new Promise<"approve" | "request_changes" | null>((resolve) => {
+            resolveOldDecision = resolve;
+          });
+        }
+        return Promise.resolve(null);
+      });
+      return {
+        ...api,
+        getRoundDecision: getDecision,
+        refreshGithubComments: async (roundId: string) => {
+          const result = await api.refreshGithubComments(
+            roundId === refreshedRound.id ? oldRoundId : roundId,
+          );
+          return {
+            ...result,
+            staleness: {
+              ...result.staleness,
+              observed_head_sha: "e".repeat(64),
+            },
+          };
+        },
+        refreshGithubRound: vi.fn().mockResolvedValue({
+          outcome: "superseded",
+          round: refreshedRound,
+        }),
+        openGithubPullRequest: (roundId: string) =>
+          api.openGithubPullRequest(roundId === refreshedRound.id ? oldRoundId : roundId),
+        listFormalComments: (roundId: string) =>
+          roundId === refreshedRound.id ? Promise.resolve([]) : api.listFormalComments(roundId),
+      };
+    });
+
+    await openReview(githubTitle);
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh into new round" }));
+    await waitFor(() => expect(getDecision).toHaveBeenCalledWith("round-github-expired-tokens-refreshed"));
+
+    resolveOldDecision?.("approve");
+    await Promise.resolve();
+
+    expect(screen.getByRole("button", { name: "Publish review" })).toBeDisabled();
+  });
+
   it("keeps a cancelled prompt cancelled when its already-started poll resolves late", async () => {
     type PollResult = Awaited<ReturnType<(typeof import("../src/api.fixture"))["pollCopilotPrompt"]>>;
     let resolvePoll: ((result: PollResult) => void) | undefined;
@@ -343,7 +399,15 @@ describe("fixture-backed reviewer recovery", () => {
     expect(alert).toHaveTextContent("Reconnect the fixture machine and retry.");
   });
 
-  it("gives a cached machine round the same queue actions and opens its immutable review", async () => {
+  it("gives a cached machine round the same queue actions and rematerializes its remote source", async () => {
+    let materialize = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      materialize = vi.fn((...args: Parameters<typeof api.materializeMachineRound>) =>
+        api.materializeMachineRound(...args));
+      return { ...api, materializeMachineRound: materialize };
+    });
+
     await renderFixtureApp();
 
     expect(screen.getByRole("option", { name: "Fixture Build Machine" })).toBeInTheDocument();
@@ -363,8 +427,13 @@ describe("fixture-backed reviewer recovery", () => {
     expect(within(card).getByRole("button", { name: "Copy feedback prompt" })).toBeVisible();
     expect(within(card).getByRole("button", { name: "Complete" })).toBeVisible();
     expect(within(card).getByRole("button", { name: "Delete" })).toBeVisible();
+    const refreshSource = within(card).getByRole("button", { name: "Refresh remote source" });
 
-    fireEvent.click(within(card).getByRole("button", { name: "Open review" }));
+    fireEvent.click(refreshSource);
+    await waitFor(() => expect(materialize).toHaveBeenCalledWith(
+      "machine-fixture-buildbox",
+      "item-cache-eviction",
+    ));
     expect((await screen.findAllByRole("region", { name: "Code diff" })).length).toBeGreaterThan(0);
   });
 

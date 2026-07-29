@@ -304,6 +304,7 @@ export function App() {
       />
       {selected ? (
         <Reviewer
+          key={selected.id}
           round={selected}
           onBack={() => setSelected(null)}
           onDetails={() => setModal("details")}
@@ -608,7 +609,28 @@ function MachineQueue({
           onReproduce={onReproduce}
           onCopyFeedback={onCopyFeedback}
           onShowOld={onShowOld}
-          onRefreshGithub={() => void refreshIndex()}
+          onRefreshGithub={(round) => void run(async () => {
+            const metadata = round.source_metadata;
+            if (metadata?.kind !== "machine" || metadata.machine_id !== localStatus.machine.id) {
+              throw {
+                code: "machine_source_metadata_required",
+                message: "This cached round is not bound to the selected machine.",
+                data_safety: "No cached round or remote source was changed.",
+                next_step: "Open the machine that originally supplied this round, then retry.",
+              } satisfies CommandError;
+            }
+            const next = await fetchMachineIndex(localStatus.machine.id);
+            setIndex(next);
+            const result = await materializeMachineRound(
+              localStatus.machine.id,
+              metadata.source_item_id,
+            );
+            const statuses = await onChanged();
+            setLocalStatus(
+              statuses.find((item) => item.machine.id === localStatus.machine.id) ?? localStatus,
+            );
+            await onOpen(result.round);
+          })}
         />
         <section className="queue-column machine-items">
           <h2>REMOTE INDEX ({uncachedItems.length})</h2>
@@ -1250,9 +1272,10 @@ function Reviewer({
     setCoreDiffError(null);
     setDiff(null);
     setSelectedKey("");
+    setGithubFiles([]);
     const load = usesGithubMirror
       ? openGithubPullRequest(round.id).then((opened) => {
-          setGithubFiles(opened.files);
+          if (!cancelled) setGithubFiles(opened.files);
           return githubFilesToDiff(round, opened.files);
         })
       : materializeRoundDiff(round.id);
@@ -1276,6 +1299,11 @@ function Reviewer({
   useEffect(() => {
     let cancelled = false;
     setActionFailure(null);
+    setViewed(new Set());
+    setGithubDecision(null);
+    setImportedComments([]);
+    setStaleness(null);
+    setPublishAttempt(null);
     listViewedFiles(round.id)
       .then((viewedFiles) => {
         if (cancelled) return;
@@ -1287,16 +1315,15 @@ function Reviewer({
         }
       });
     if (!hasUpstreamDiscussion && !canPublish) {
-      setGithubDecision(null);
-      setImportedComments([]);
-      setStaleness(null);
       return () => {
         cancelled = true;
       };
     }
     if (canPublish) {
       getRoundDecision(round.id)
-        .then(setGithubDecision)
+        .then((decision) => {
+          if (!cancelled) setGithubDecision(decision);
+        })
         .catch((problem) => {
           if (!cancelled) {
             setActionFailure({ error: toCommandError(problem), recovery: { kind: "load_decision" } });
@@ -1323,6 +1350,8 @@ function Reviewer({
 
   useEffect(() => {
     let cancelled = false;
+    setFormalComments([]);
+    setInlineAskTurns([]);
     Promise.all([
       listFormalComments(round.id),
       currentConversation(round.id),
