@@ -165,6 +165,7 @@ export APPLE_SIGNING_IDENTITY="$identity"
 
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 npm --prefix "$repo_root/frontend" ci
+npm --prefix "$repo_root/frontend" test
 npm --prefix "$repo_root/frontend" run build
 cargo fmt --manifest-path "$repo_root/Cargo.toml" --all -- --check
 cargo test --manifest-path "$repo_root/Cargo.toml" --workspace --locked
