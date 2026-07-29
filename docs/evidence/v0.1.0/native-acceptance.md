@@ -195,9 +195,18 @@ two-repository `release-acceptance` round and verified:
 - Full file mode while Unified remains the selected layout tab; and
 - formal decisions and Chat remaining visually separate from inline `/ask`.
 
+The same current bundle was then signed with the available Developer ID
+identity and relaunched as a fresh process. Queue Home remained usable while
+connection health resolved asynchronously; PR read became enabled without a
+browser flow. Application settings then showed Copilot existing-sign-in,
+PR-read, and PR-publish all connected as `uhvesta`, the configured public
+Client ID `Ov23li9NHgxO6prQz5f7`, and a healthy capability-scoped Keychain.
+No credential value was read, copied, logged, or moved outside Keychain.
+
 Retained current-tree screenshots:
 
 - `difit-current-queue.jpeg`
 - `difit-current-reviewer.jpeg`
 - `difit-current-split.jpeg`
 - `difit-current-full-file.jpeg`
+- `current-signed-auth-persisted.jpeg`
