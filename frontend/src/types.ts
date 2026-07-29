@@ -171,6 +171,12 @@ export interface GithubPullRequestMetadata {
   web_url?: string | null;
 }
 
+/** Read-only GitHub PR intake result. It is re-resolved before queueing. */
+export interface GithubPullRequestIntakePreview {
+  locator: { host: string; owner: string; repository: string; pull_number: number };
+  metadata: GithubPullRequestMetadata;
+}
+
 export interface GithubMaterializedFile {
   path: string;
   status: string;

@@ -47,6 +47,44 @@ afterEach(() => {
 beforeEach(() => setViewport(1024));
 
 describe("fixture-backed reviewer recovery", () => {
+  it("resolves a GitHub PR read-only before an explicit, exact confirmation queues it", async () => {
+    let resolvePullRequest = vi.fn();
+    let confirmPullRequest = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      const expected = await api.previewGithubPullRequest("https://github.com/acme-widgets/auth-service/pull/777");
+      resolvePullRequest = vi.fn().mockResolvedValue(expected);
+      confirmPullRequest = vi.fn((...args: Parameters<typeof api.confirmGithubPullRequest>) =>
+        api.confirmGithubPullRequest(...args));
+      return {
+        ...api,
+        previewGithubPullRequest: resolvePullRequest,
+        confirmGithubPullRequest: confirmPullRequest,
+      };
+    });
+
+    await renderFixtureApp();
+    fireEvent.click(screen.getByRole("button", { name: "Review PR" }));
+    const dialog = await screen.findByRole("dialog", { name: "Review pull request" });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "GitHub pull request URL" }), {
+      target: { value: "https://github.com/acme-widgets/auth-service/pull/777" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Resolve pull request" }));
+
+    await waitFor(() => expect(resolvePullRequest).toHaveBeenCalledWith("https://github.com/acme-widgets/auth-service/pull/777"));
+    expect(confirmPullRequest).not.toHaveBeenCalled();
+    expect(await within(dialog).findByRole("region", { name: "Pull request preview" })).toHaveTextContent("acme-widgets/auth-service#777");
+    expect(within(dialog).getByText("Head SHA")).toBeVisible();
+    expect(within(dialog).queryByText(/Resolve shows read-only metadata only/i)).not.toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Confirm and add to queue" }));
+    await waitFor(() => expect(confirmPullRequest).toHaveBeenCalledTimes(1));
+    expect(confirmPullRequest.mock.calls[0][0]).toMatchObject({
+      locator: { host: "github.com", owner: "acme-widgets", repository: "auth-service", pull_number: 777 },
+      metadata: { head_sha: expect.any(String), base_sha: expect.any(String), state: "open", is_draft: false },
+    });
+  });
+
   it("records an explicitly selected originating session in both capture preview and submission without injecting into it", async () => {
     let preflight = vi.fn();
     let submit = vi.fn();

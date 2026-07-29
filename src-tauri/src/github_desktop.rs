@@ -147,14 +147,66 @@ pub struct GithubCommentRefreshResult {
     pub staleness: StalenessStatus,
 }
 
+/// A read-only, metadata-only PR intake preview. It deliberately has no
+/// round ID or persistence token: a second read validates it before queueing.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubPullRequestIntakePreview {
+    pub locator: GithubPullRequestLocator,
+    pub metadata: GithubPullRequestMetadata,
+}
+
 impl<C: CredentialSource, A: GithubApi> GithubDesktop<C, A> {
-    fn queue(&mut self, store: &mut Store, url: &str) -> Result<SubmitLocalResult, CommandError> {
+    fn preview(&mut self, url: &str) -> Result<GithubPullRequestIntakePreview, CommandError> {
         let credential = self.credentials.credential(Capability::PrRead)?;
         let mut adapter = GithubAdapter::new(CredentialedTransport {
             api: &mut self.api,
             token: &credential.access_token,
         });
         let payload = adapter.queue_from_url(url)?;
+        Ok(GithubPullRequestIntakePreview {
+            locator: payload.locator,
+            metadata: payload.metadata,
+        })
+    }
+
+    fn queue(&mut self, store: &mut Store, url: &str) -> Result<SubmitLocalResult, CommandError> {
+        // The token-free CLI's `pr add` is already its explicit action, so it
+        // retains its one-step command contract. The desktop UI uses preview
+        // and confirm_queue below.
+        let credential = self.credentials.credential(Capability::PrRead)?;
+        let payload = {
+            let mut adapter = GithubAdapter::new(CredentialedTransport {
+                api: &mut self.api,
+                token: &credential.access_token,
+            });
+            adapter.queue_from_url(url)?
+        };
+        self.persist_queue(store, payload)
+    }
+
+    fn confirm_queue(
+        &mut self,
+        store: &mut Store,
+        preview: &GithubPullRequestIntakePreview,
+    ) -> Result<SubmitLocalResult, CommandError> {
+        // Re-resolve immediately before the only local write. The preview is
+        // intentionally not persisted, so closing the dialog creates nothing.
+        let confirmed = self.preview(&pull_request_url(&preview.locator))?;
+        ensure_intake_preview_current(preview, &confirmed)?;
+        let payload = GithubQueuePayload {
+            locator: confirmed.locator,
+            metadata: confirmed.metadata,
+            source_materialized: false,
+        };
+        self.persist_queue(store, payload)
+    }
+
+    fn persist_queue(
+        &mut self,
+        store: &mut Store,
+        payload: GithubQueuePayload,
+    ) -> Result<SubmitLocalResult, CommandError> {
         let submission = submission(&payload);
         let result = store.submit(submission)?;
         let (outcome, round, superseded_round_id) = submission_result(result);
@@ -446,6 +498,12 @@ pub struct QueuePullRequestRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfirmQueuePullRequestRequest {
+    pub preview: GithubPullRequestIntakePreview,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GithubPublishCommandRequest {
     pub attempt_id: String,
     pub confirmation: Confirmation,
@@ -474,6 +532,24 @@ pub fn github_queue_pull_request(
     let mut desktop = system_desktop()?;
     let mut store = state.0.lock().map_err(|_| state_unavailable())?;
     desktop.queue(&mut store, &request.url)
+}
+
+#[tauri::command]
+pub fn github_preview_pull_request(
+    request: QueuePullRequestRequest,
+) -> Result<GithubPullRequestIntakePreview, CommandError> {
+    let mut desktop = system_desktop()?;
+    desktop.preview(&request.url)
+}
+
+#[tauri::command]
+pub fn github_confirm_queue_pull_request(
+    request: ConfirmQueuePullRequestRequest,
+    state: State<'_, AppState>,
+) -> Result<SubmitLocalResult, CommandError> {
+    let mut desktop = system_desktop()?;
+    let mut store = state.0.lock().map_err(|_| state_unavailable())?;
+    desktop.confirm_queue(&mut store, &request.preview)
 }
 
 #[tauri::command]
@@ -694,6 +770,40 @@ fn ensure_fresh_open(
             "No GitHub review was published and local drafts are preserved.",
             "Refresh to create a superseding round before publishing.",
             "github_round_stale",
+        ));
+    }
+    Ok(())
+}
+
+fn pull_request_url(locator: &GithubPullRequestLocator) -> String {
+    format!(
+        "https://{}/{}/{}/pull/{}",
+        locator.host, locator.owner, locator.repository, locator.pull_number
+    )
+}
+
+fn ensure_intake_preview_current(
+    preview: &GithubPullRequestIntakePreview,
+    confirmed: &GithubPullRequestIntakePreview,
+) -> Result<(), DomainError> {
+    let preview_identity_matches_locator = preview.metadata.host == preview.locator.host
+        && preview.metadata.owner == preview.locator.owner
+        && preview.metadata.repository == preview.locator.repository
+        && preview.metadata.pull_number == preview.locator.pull_number;
+    if !preview_identity_matches_locator || preview.locator != confirmed.locator {
+        return Err(DomainError::actionable(
+            "The pull request identity changed after the preview.",
+            "No local queue item, source cache, or GitHub write was created.",
+            "Resolve the pull request again and confirm the exact owner, repository, and number.",
+            "github_intake_identity_changed",
+        ));
+    }
+    if preview.metadata != confirmed.metadata {
+        return Err(DomainError::actionable(
+            "The pull request changed after the preview.",
+            "No local queue item, source cache, or GitHub write was created.",
+            "Resolve it again and confirm the latest base, head, title, and state.",
+            "github_intake_preview_stale",
         ));
     }
     Ok(())
@@ -1680,6 +1790,48 @@ mod tests {
                 .unwrap()
                 .contains("secret")
         );
+    }
+
+    #[test]
+    fn intake_preview_creates_no_round_and_confirm_rechecks_the_exact_metadata() {
+        let mut store = Store::in_memory().unwrap();
+        let mut desktop = desktop();
+
+        let preview = desktop
+            .preview("https://github.com/o/r/pull/1")
+            .unwrap();
+        assert_eq!(desktop.api.metadata_reads, 1);
+        assert_eq!(desktop.api.file_reads, 0);
+        assert_eq!(desktop.api.comment_reads, 0);
+        assert!(store.list(None, true).unwrap().is_empty());
+
+        let queued = desktop.confirm_queue(&mut store, &preview).unwrap();
+        assert_eq!(desktop.api.metadata_reads, 2);
+        assert_eq!(store.list(None, true).unwrap().len(), 1);
+        assert_eq!(queued.round.manifest.repositories[0].head_sha, "head-a");
+
+        let stale_preview = desktop
+            .preview("https://github.com/o/r/pull/2")
+            .unwrap();
+        desktop.api.head = "head-b".into();
+        let error = desktop
+            .confirm_queue(&mut store, &stale_preview)
+            .unwrap_err();
+        assert_eq!(error.code, "github_intake_preview_stale");
+        assert_eq!(store.list(None, true).unwrap().len(), 1);
+        assert_eq!(desktop.api.file_reads, 0);
+        assert_eq!(desktop.api.publish_writes, 0);
+        assert_eq!(desktop.api.reply_writes, 0);
+
+        let mut mismatched_identity = desktop
+            .preview("https://github.com/o/r/pull/3")
+            .unwrap();
+        mismatched_identity.metadata.repository = "different-repository".into();
+        let error = desktop
+            .confirm_queue(&mut store, &mismatched_identity)
+            .unwrap_err();
+        assert_eq!(error.code, "github_intake_identity_changed");
+        assert_eq!(store.list(None, true).unwrap().len(), 1);
     }
 
     #[test]

@@ -53,7 +53,8 @@ import {
   startDeviceFlow,
   submitLocal,
   removeMachine,
-  queueGithubPullRequest,
+  previewGithubPullRequest,
+  confirmGithubPullRequest,
   publishGithub,
   startCopilotSession,
   sendCopilotPrompt,
@@ -92,6 +93,7 @@ import type {
   CopilotCapabilityGroup,
   SessionOption,
   GithubMaterializedFile,
+  GithubPullRequestIntakePreview,
   GithubPublishAttempt,
   ImportedComment,
   PreparedFeedbackPrompt,
@@ -713,13 +715,26 @@ function AddGithubPullRequestDialog({
   const [url, setUrl] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<CommandError | null>(null);
+  const [preview, setPreview] = useState<GithubPullRequestIntakePreview | null>(null);
   const dialog = useDialogFocus(onClose);
-  const submit = async (event: React.FormEvent) => {
+  const resolve = async (event: React.FormEvent) => {
     event.preventDefault();
     setWorking(true);
     setError(null);
     try {
-      const result = await queueGithubPullRequest(url);
+      setPreview(await previewGithubPullRequest(url));
+    } catch (problem) {
+      setError(toCommandError(problem));
+    } finally {
+      setWorking(false);
+    }
+  };
+  const confirm = async () => {
+    if (!preview) return;
+    setWorking(true);
+    setError(null);
+    try {
+      const result = await confirmGithubPullRequest(preview);
       await onAdded(result.round);
     } catch (problem) {
       setError(toCommandError(problem));
@@ -731,13 +746,34 @@ function AddGithubPullRequestDialog({
     <div className="modal-backdrop">
       <section {...dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby="add-pr-title">
         <header><h2 id="add-pr-title">Review pull request</h2><button aria-label="Close" onClick={onClose}>×</button></header>
-        <form className="form" onSubmit={(event) => void submit(event)}>
+        <form className="form" onSubmit={(event) => void resolve(event)}>
           {error && <ErrorPanel error={error} />}
           <label>GitHub pull request URL
-            <input required type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://github.com/owner/repo/pull/42" autoFocus />
+            <input required type="url" value={url} onChange={(event) => { setUrl(event.target.value); setPreview(null); }} placeholder="https://github.com/owner/repo/pull/42" autoFocus />
           </label>
-          <p className="notice">Adding resolves metadata and creates a local queue item. Complete file blobs and comments are pulled only when you explicitly open the review.</p>
-          <footer><button type="button" onClick={onClose}>Cancel</button><button className="primary" disabled={working}>{working ? "Resolving…" : "Add to GitHub queue"}</button></footer>
+          {preview ? (
+            <section className="preflight" aria-label="Pull request preview">
+              <b>Confirm pull request</b>
+              <p><span>Identity</span><span>{preview.metadata.host}/{preview.metadata.owner}/{preview.metadata.repository}#{preview.metadata.pull_number}</span></p>
+              <p><span>Title</span><span>{preview.metadata.title}</span></p>
+              <p><span>Base SHA</span><span><code>{preview.metadata.base_sha}</code></span></p>
+              <p><span>Head SHA</span><span><code>{preview.metadata.head_sha}</code></span></p>
+              <p><span>State</span><span>{preview.metadata.state} · {preview.metadata.is_draft ? "draft" : "not draft"}</span></p>
+              {preview.metadata.web_url && <p><span>GitHub URL</span><span><a href={preview.metadata.web_url} target="_blank" rel="noreferrer">Open pull request</a></span></p>}
+            </section>
+          ) : (
+            <p className="notice">Resolve shows read-only metadata only. It creates no queue item and does not pull files or comments.</p>
+          )}
+          <p className="notice">Confirmation resolves the pull request again. If its identity or metadata changed, no queue item is created; resolve it again before confirming. Complete file blobs and comments are pulled only when you explicitly open the review.</p>
+          <footer>
+            <button type="button" onClick={onClose}>Cancel</button>
+            {preview ? (
+              <>
+                <button type="submit" disabled={working}>{working ? "Resolving…" : "Resolve again"}</button>
+                <button className="primary" type="button" disabled={working} onClick={() => void confirm()}>{working ? "Confirming…" : "Confirm and add to queue"}</button>
+              </>
+            ) : <button className="primary" disabled={working}>{working ? "Resolving…" : "Resolve pull request"}</button>}
+          </footer>
         </form>
       </section>
     </div>

@@ -27,6 +27,7 @@ import type {
   MachineIndexResult,
   MachineStatus,
   GithubOpenedPullRequest,
+  GithubPullRequestIntakePreview,
   GithubPublishAttempt,
   GithubCommentRefreshResult,
   CopilotCapabilities,
@@ -142,6 +143,18 @@ export async function materializeMachineRound(
 
 export async function queueGithubPullRequest(url: string): Promise<SubmissionOutcome> {
   return invoke("github_queue_pull_request", { request: { url } });
+}
+
+export async function previewGithubPullRequest(
+  url: string,
+): Promise<GithubPullRequestIntakePreview> {
+  return invoke("github_preview_pull_request", { request: { url } });
+}
+
+export async function confirmGithubPullRequest(
+  preview: GithubPullRequestIntakePreview,
+): Promise<SubmissionOutcome> {
+  return invoke("github_confirm_queue_pull_request", { request: { preview } });
 }
 
 export async function openGithubPullRequest(roundId: string): Promise<GithubOpenedPullRequest> {
