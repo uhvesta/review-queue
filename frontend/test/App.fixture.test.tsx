@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const paginationTitle = "Fix pagination cursor drift across core-api and web-frontend";
@@ -199,14 +199,20 @@ describe("fixture-backed reviewer recovery", () => {
     let clearChat = vi.fn();
     let startSession = vi.fn();
     let sendPrompt = vi.fn();
+    let releaseSend = () => {};
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
     vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
       const api = await importOriginal<typeof import("../src/api.fixture")>();
       clearChat = vi.fn((...args: Parameters<typeof api.clearCopilotChat>) =>
         api.clearCopilotChat(...args));
       startSession = vi.fn((...args: Parameters<typeof api.startCopilotSession>) =>
         api.startCopilotSession(...args));
-      sendPrompt = vi.fn((...args: Parameters<typeof api.sendCopilotPrompt>) =>
-        api.sendCopilotPrompt(...args));
+      sendPrompt = vi.fn(async (...args: Parameters<typeof api.sendCopilotPrompt>) => {
+        await sendGate;
+        return api.sendCopilotPrompt(...args);
+      });
       return {
         ...api,
         clearCopilotChat: clearChat,
@@ -225,12 +231,56 @@ describe("fixture-backed reviewer recovery", () => {
     expect(startSession).not.toHaveBeenCalled();
     expect(sendPrompt).not.toHaveBeenCalled();
 
-    fireEvent.click(retry);
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+    expect(retry).toBeDisabled();
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1));
+    releaseSend();
     expect(await screen.findByRole("button", { name: /cancel/i })).toBeVisible();
     expect(clearChat).toHaveBeenCalledTimes(1);
     expect(startSession).toHaveBeenCalledTimes(1);
     expect(sendPrompt).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("combobox", { name: /previous chats/i })).toBeVisible();
+  });
+
+  it("submits a rapid double Send once and disables prompt controls before the API resolves", async () => {
+    let sendPrompt = vi.fn();
+    let releaseSend = () => {};
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      sendPrompt = vi.fn(async (...args: Parameters<typeof api.sendCopilotPrompt>) => {
+        await sendGate;
+        return api.sendCopilotPrompt(...args);
+      });
+      return { ...api, sendCopilotPrompt: sendPrompt };
+    });
+
+    await openReview("Add retry backoff to sync worker");
+    await openChat();
+    fireEvent.click(await screen.findByRole("button", { name: "Start Copilot" }));
+    const input = await screen.findByRole("textbox", { name: "Ask a follow-up" });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Could this retry twice?" } });
+    const send = screen.getByRole("button", { name: "Send" });
+    await waitFor(() => expect(send).toBeEnabled());
+
+    act(() => {
+      send.click();
+      send.click();
+    });
+
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+    expect(send).toBeDisabled();
+    expect(input).toBeDisabled();
+
+    releaseSend();
+    expect(await screen.findByRole("button", { name: "Cancel" })).toBeVisible();
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
   });
 
   it("keeps archived Previous chats permanently read-only, including interrupted turns", async () => {

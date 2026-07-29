@@ -1962,6 +1962,8 @@ function ChatSheet({
   const [prompt, setPrompt] = useState("");
   const [streamingTurnId, setStreamingTurnId] = useState<string | null>(null);
   const cancelledTurnIds = useRef(new Set<string>());
+  const promptSubmissionInFlight = useRef(false);
+  const [submittingPrompt, setSubmittingPrompt] = useState(false);
   const [starting, setStarting] = useState(false);
   const [authLabel, setAuthLabel] = useState("");
   const [capabilities, setCapabilities] = useState<CopilotCapabilities | null>(null);
@@ -2083,7 +2085,9 @@ function ChatSheet({
     event.preventDefault();
     if (readOnly || !active || !sessionId) return;
     const text = retry?.prompt ?? prompt.trim();
-    if (!text) return;
+    if (!text || promptSubmissionInFlight.current) return;
+    promptSubmissionInFlight.current = true;
+    setSubmittingPrompt(true);
     setError(null);
     try {
       const turn = await sendCopilotPrompt(
@@ -2100,6 +2104,9 @@ function ChatSheet({
       void pollUntilDone(turn.id, active);
     } catch (problem) {
       setError(toCommandError(problem));
+    } finally {
+      promptSubmissionInFlight.current = false;
+      setSubmittingPrompt(false);
     }
   };
 
@@ -2112,7 +2119,10 @@ function ChatSheet({
       || turn.conversation_id !== active.id
       || starting
       || streamingTurnId
+      || promptSubmissionInFlight.current
     ) return;
+    promptSubmissionInFlight.current = true;
+    setSubmittingPrompt(true);
     setStarting(true);
     setError(null);
     try {
@@ -2143,6 +2153,8 @@ function ChatSheet({
     } catch (problem) {
       setError(toCommandError(problem));
     } finally {
+      promptSubmissionInFlight.current = false;
+      setSubmittingPrompt(false);
       setStarting(false);
     }
   };
@@ -2311,7 +2323,7 @@ function ChatSheet({
               <p className="danger-text">
                 {turn.failure_reason}{" "}
                 <button
-                  disabled={!canRetryTurn(turn) || starting || Boolean(streamingTurnId)}
+                  disabled={!canRetryTurn(turn) || starting || submittingPrompt || Boolean(streamingTurnId)}
                   title={retryTitle(turn)}
                   onClick={(event) => {
                     if (historyOnly || !sessionId) void retryInFreshChat(turn);
@@ -2324,7 +2336,7 @@ function ChatSheet({
             )}
             {(turn.state === "cancelled" || turn.state === "interrupted") && !turn.failure_reason && (
               <button
-                disabled={!canRetryTurn(turn) || starting || Boolean(streamingTurnId)}
+                disabled={!canRetryTurn(turn) || starting || submittingPrompt || Boolean(streamingTurnId)}
                 title={retryTitle(turn)}
                 onClick={(event) => {
                   if (historyOnly || !sessionId) void retryInFreshChat(turn);
@@ -2340,7 +2352,7 @@ function ChatSheet({
       </div>
       <form onSubmit={(event) => void send(event)}>
         <input
-          disabled={historyOnly || !sessionId || Boolean(streamingTurnId)}
+          disabled={historyOnly || !sessionId || submittingPrompt || Boolean(streamingTurnId)}
           aria-label="Ask a follow-up"
           placeholder={inputReason}
           value={prompt}
@@ -2359,7 +2371,7 @@ function ChatSheet({
             });
           }}>Cancel</button>
         ) : (
-          <button disabled={historyOnly || !sessionId || !prompt.trim()} title={inputReason}>Send</button>
+          <button disabled={historyOnly || !sessionId || submittingPrompt || !prompt.trim()} title={inputReason}>Send</button>
         )}
       </form>
     </aside>
