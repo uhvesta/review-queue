@@ -214,6 +214,29 @@ describe("fixture-backed reviewer recovery", () => {
     await waitFor(() => expect(createComment).toHaveBeenCalledTimes(1));
     expect(createComment.mock.calls[0][3]).toBe("thread-1");
     expect(await within(drawer).findByText("I added coverage for revoked tokens too.")).toBeVisible();
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close formal feedback" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await screen.findByRole("heading", { name: "Queue Home" });
+    const reopenedCard = screen.getByText(githubTitle).closest("article");
+    if (!reopenedCard) throw new Error("The GitHub review card did not remain queued after recording approval.");
+    fireEvent.click(within(reopenedCard).getByRole("button", { name: "Open review" }));
+    await screen.findAllByRole("region", { name: "Code diff" });
+    const publish = screen.getByRole("button", { name: "Publish review" });
+    await waitFor(() => expect(publish).toBeEnabled());
+    fireEvent.click(publish);
+
+    const publishDialog = await screen.findByRole("alertdialog", { name: "Publish GitHub review?" });
+    expect(within(publishDialog).getByText("Review write").closest("p")).toHaveTextContent("APPROVE · 0 comments");
+    expect(within(publishDialog).getByText("Threaded reply writes").closest("p")).toHaveTextContent("1");
+    expect(within(publishDialog).getByText("I added coverage for revoked tokens too.")).toBeVisible();
+    expect(publishDialog.querySelector(".safe-copy")).toHaveTextContent(
+      "one GitHub review write plus 1 threaded reply write",
+    );
+
+    fireEvent.click(within(publishDialog).getByRole("button", { name: "Publish APPROVE" }));
+    expect(await within(publishDialog).findByText(/Published once as GitHub review/i)).toBeVisible();
+    expect(within(publishDialog).getByText("1 threaded reply published.")).toBeVisible();
   });
 
   it("keeps a cancelled prompt cancelled when its already-started poll resolves late", async () => {

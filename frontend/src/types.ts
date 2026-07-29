@@ -217,6 +217,7 @@ export interface GithubPublishAttempt {
   };
   request: {
     idempotency_key: string;
+    target: GithubPullRequestMetadata;
     decision: "approve" | "request_changes";
     event: "approve" | "request_changes";
     comments: Array<{
@@ -228,6 +229,22 @@ export interface GithubPublishAttempt {
       anchor?: Anchor | null;
     }>;
   };
+  replies: Array<{
+    id: string;
+    round_id: string;
+    request: {
+      idempotency_key: string;
+      target: GithubPullRequestMetadata;
+      formal_comment_id: string;
+      formal_revision: number;
+      upstream_comment_id: number;
+      body: string;
+    };
+    status: "prepared" | "posting" | "completed" | "unknown";
+    comment_id?: string | null;
+    created_at: string;
+    completed_at?: string | null;
+  }>;
   status: "prepared" | "posting" | "completed" | "unknown";
   review_id?: string | null;
   created_at: string;

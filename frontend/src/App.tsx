@@ -3595,6 +3595,7 @@ function GithubPublishDialog({
   const [error, setError] = useState<CommandError | null>(null);
   const target = attempt.preview.target;
   const completed = attempt.status === "completed";
+  const replyWrites = attempt.replies ?? [];
   const dialog = useDialogFocus(onClose);
   return (
     <div className="modal-backdrop">
@@ -3602,17 +3603,34 @@ function GithubPublishDialog({
         <header><h2 id="publish-title">Publish GitHub review?</h2><button aria-label="Close" onClick={onClose}>×</button></header>
         <div className="detail-grid">
           <p><b>Target</b> {target.owner}/{target.repository} #{target.pull_number} at <code>{shortSha(target.head_sha)}</code></p>
-          <p><b>Event</b> {attempt.preview.event.toUpperCase()}</p>
-          <p><b>Formal comments</b> {attempt.request.comments.length}</p>
+          <p><b>Review write</b> {attempt.preview.event.toUpperCase()} · {attempt.request.comments.length} comment{attempt.request.comments.length === 1 ? "" : "s"}</p>
           {attempt.request.comments.map((comment) => (
             <article className="formal-comment" key={comment.formal_comment_id}>
               <small>{comment.disposition.replaceAll("_", " ")}{comment.fallback_reference ? ` · ${comment.fallback_reference}` : ""}</small>
               <p>{comment.body}</p>
             </article>
           ))}
-          <p className="safe-copy">Only the formal decision and comments shown above will be published. `/ask` chats and imported comments are excluded.</p>
+          <p><b>Threaded reply writes</b> {replyWrites.length}</p>
+          {replyWrites.map((reply) => (
+            <article className="formal-comment github-reply-preview" key={reply.id}>
+              <small>reply to imported GitHub comment {reply.request.upstream_comment_id} · formal revision {reply.request.formal_revision}</small>
+              <p>{reply.request.body}</p>
+            </article>
+          ))}
+          <p className="safe-copy">
+            This confirmation performs one GitHub review write plus {replyWrites.length} threaded reply write{replyWrites.length === 1 ? "" : "s"}.
+            Only the formal decision, review comments, and replies shown above are included. `/ask` chats and imported comments are excluded.
+          </p>
           {completed && <p className="status good">Published once as GitHub review {attempt.review_id}.</p>}
+          {completed && replyWrites.length > 0 && (
+            <p className="status good">
+              {replyWrites.filter((reply) => reply.status === "completed").length} threaded repl{replyWrites.length === 1 ? "y" : "ies"} published.
+            </p>
+          )}
           {attempt.status === "unknown" && <p className="danger-text">The publish outcome is unknown. Inspect the pull request before trying anything else.</p>}
+          {replyWrites.some((reply) => reply.status === "unknown") && (
+            <p className="danger-text">A threaded reply has an unknown outcome. Inspect that GitHub thread before retrying.</p>
+          )}
           {error && <ErrorPanel error={error} />}
           <div className="dialog-actions">
             <button onClick={onClose} autoFocus>{completed ? "Done" : "Cancel"}</button>
