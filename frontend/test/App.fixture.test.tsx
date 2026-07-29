@@ -47,6 +47,49 @@ afterEach(() => {
 beforeEach(() => setViewport(1024));
 
 describe("fixture-backed reviewer recovery", () => {
+  it("records an explicitly selected originating session in both capture preview and submission without injecting into it", async () => {
+    let preflight = vi.fn();
+    let submit = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      preflight = vi.fn((...args: Parameters<typeof api.preflightLocal>) => api.preflightLocal(...args));
+      submit = vi.fn((...args: Parameters<typeof api.submitLocal>) => api.submitLocal(...args));
+      return { ...api, preflightLocal: preflight, submitLocal: submit };
+    });
+
+    await renderFixtureApp();
+    fireEvent.click(screen.getByRole("button", { name: "Submit local" }));
+    const dialog = await screen.findByRole("dialog", { name: "Submit local review" });
+    const workspace = within(dialog).getByRole("textbox", { name: "Workspace path" });
+    fireEvent.change(workspace, { target: { value: "/home/build/workspaces/web-platform" } });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "Topic (stable)" }), { target: { value: "origin-route-fixture" } });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "Title" }), { target: { value: "Capture route provenance" } });
+
+    const session = await within(dialog).findByRole("combobox", { name: "Originating session" });
+    await waitFor(() => expect(session).toHaveValue("route-fixture-1"));
+    expect(within(dialog).getByText(/Review Queue never queues, interrupts, types, or injects/i)).toBeVisible();
+    expect(within(dialog).getByText(/Original cwd/i).closest("p")).toHaveTextContent("/home/build/workspaces/web-platform");
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Preview repositories" }));
+    await waitFor(() => expect(preflight).toHaveBeenCalledTimes(1));
+    expect(preflight.mock.calls[0][0]).toMatchObject({ originRouteId: "route-fixture-1" });
+    await within(dialog).findByRole("region", { name: "Detected repositories" });
+
+    fireEvent.change(session, { target: { value: "route-fixture-2" } });
+    expect(within(dialog).getByText("Selection or form changed. Preview again before capture.")).toBeVisible();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Preview repositories" }));
+    await waitFor(() => expect(preflight).toHaveBeenCalledTimes(2));
+    expect(preflight.mock.calls[1][0]).toMatchObject({ originRouteId: "route-fixture-2" });
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Capture snapshot" })).toBeEnabled());
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Capture snapshot" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    expect(submit.mock.calls[0][0]).toMatchObject({
+      originRouteId: "route-fixture-2",
+      preflightToken: expect.any(String),
+    });
+  });
+
   it("keeps the immutable GitHub diff visible when initial comment refresh fails, then retries explicitly", async () => {
     let refreshComments = vi.fn();
     vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
@@ -147,7 +190,7 @@ describe("fixture-backed reviewer recovery", () => {
     });
 
     await openReview(githubTitle);
-    const tokenFile = screen.getByText("token_errors.ts").closest("button");
+    const tokenFile = (await screen.findByText("token_errors.ts")).closest("button");
     if (!tokenFile) throw new Error("The token error source file was not present in the file tree.");
     fireEvent.click(tokenFile);
 

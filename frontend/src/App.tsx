@@ -2963,11 +2963,68 @@ function SubmitLocalDialog({
   const [preflightFresh, setPreflightFresh] = useState(false);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<CommandError | null>(null);
+  const [routes, setRoutes] = useState<AgentRoute[]>([]);
+  const [routesLoading, setRoutesLoading] = useState(true);
+  const [routeLoadError, setRouteLoadError] = useState<CommandError | null>(null);
+  const [originRouteId, setOriginRouteId] = useState<string | null>(null);
+  const [routeSelectionTouched, setRouteSelectionTouched] = useState(false);
   const dialog = useDialogFocus(onClose);
 
   const invalidatePreflight = () => setPreflightFresh(false);
   const update = (field: keyof ReviewBrief, value: string) => {
     setBrief((current) => ({ ...current, [field]: value }));
+    invalidatePreflight();
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setRoutesLoading(true);
+    listAgentRoutes()
+      .then((items) => {
+        if (cancelled) return;
+        setRoutes(items);
+        setRouteLoadError(null);
+      })
+      .catch((problem) => {
+        if (!cancelled) setRouteLoadError(toCommandError(problem));
+      })
+      .finally(() => {
+        if (!cancelled) setRoutesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (routeSelectionTouched || originRouteId || !workspacePath.trim()) return;
+    const workspace = workspacePath.trim().replace(/\/+$/, "");
+    if (!workspace) return;
+    const matchingActiveRoutes = routes.filter((route) => {
+      const cwd = route.provenance?.original_cwd?.replace(/\/+$/, "");
+      return route.status.toLowerCase() === "active" && Boolean(cwd) && (cwd === workspace || cwd?.startsWith(`${workspace}/`));
+    });
+    // Do not guess between sessions. A single live route whose saved cwd is
+    // inside the workspace is the only safe automatic provenance choice.
+    if (matchingActiveRoutes.length === 1) {
+      setOriginRouteId(matchingActiveRoutes[0].id);
+      invalidatePreflight();
+    }
+  }, [originRouteId, routeSelectionTouched, routes, workspacePath]);
+
+  const selectedRoute = routes.find((route) => route.id === originRouteId) ?? null;
+  const updateWorkspacePath = (value: string) => {
+    setWorkspacePath(value);
+    setPreflight(null);
+    setParticipating(new Set());
+    // An automatic selection is only safe for the workspace it matched.
+    // Preserve a deliberate manual choice, but re-evaluate any inferred one.
+    if (!routeSelectionTouched) setOriginRouteId(null);
+    invalidatePreflight();
+  };
+  const selectOriginRoute = (value: string) => {
+    setRouteSelectionTouched(true);
+    setOriginRouteId(value || null);
     invalidatePreflight();
   };
 
@@ -2979,6 +3036,7 @@ function SubmitLocalDialog({
       workspacePath,
       topic,
       brief,
+      originRouteId,
       participatingRepositoryIds: [...participating],
       preflightToken: preflightFresh ? preflight?.preflightToken ?? null : null,
     };
@@ -2999,11 +3057,13 @@ function SubmitLocalDialog({
         workspacePath,
         topic,
         brief,
+        originRouteId,
         participatingRepositoryIds: participating.size ? [...participating] : [],
         preflightToken: null,
       });
       setPreflight(next);
       setParticipating(new Set(next.participatingRepositoryIds));
+      setOriginRouteId(next.originRouteId ?? null);
       setPreflightFresh(true);
     } catch (problem) {
       setError(toCommandError(problem));
@@ -3017,13 +3077,33 @@ function SubmitLocalDialog({
       <section {...dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby="submit-title">
         <header><h2 id="submit-title">Submit local review</h2><button onClick={onClose} aria-label="Close">×</button></header>
         <form className="form" onSubmit={submit}>
-          <label>Workspace path<input value={workspacePath} onChange={(event) => { setWorkspacePath(event.target.value); setPreflight(null); setParticipating(new Set()); invalidatePreflight(); }} required autoFocus /></label>
+          <label>Workspace path<input value={workspacePath} onChange={(event) => updateWorkspacePath(event.target.value)} required autoFocus /></label>
           <label>Topic (stable)<input value={topic} onChange={(event) => { setTopic(event.target.value); invalidatePreflight(); }} required /></label>
           <label>Title<input value={brief.title} onChange={(event) => update("title", event.target.value)} required /></label>
           <label>What<textarea value={brief.what} onChange={(event) => update("what", event.target.value)} /></label>
           <label>Why<textarea value={brief.why} onChange={(event) => update("why", event.target.value)} /></label>
           <label>Approach / Alternatives<textarea value={brief.approach_alternatives} onChange={(event) => update("approach_alternatives", event.target.value)} /></label>
           <label>Testing<textarea value={brief.testing} onChange={(event) => update("testing", event.target.value)} /></label>
+          <label>
+            Originating session (optional)
+            <select
+              aria-label="Originating session"
+              value={originRouteId ?? ""}
+              onChange={(event) => selectOriginRoute(event.target.value)}
+              disabled={routesLoading}
+            >
+              <option value="">No originating session selected</option>
+              {routes.map((route) => (
+                <option key={route.id} value={route.id}>
+                  {route.agent_id} · {route.status} · {route.session_id ?? "no session"}
+                </option>
+              ))}
+            </select>
+          </label>
+          {routesLoading && <p className="notice">Loading saved agent-session provenance…</p>}
+          {routeLoadError && <p className="notice">Agent-session provenance is unavailable. You can still capture without selecting a session.</p>}
+          {selectedRoute && <AgentRouteDetails route={selectedRoute} />}
+          <p className="safe-copy">This records provenance only. Review Queue never queues, interrupts, types, or injects a prompt into an agent session.</p>
           <div>
             <button type="button" onClick={() => void preview()} disabled={checking || !workspacePath || !topic || !brief.title}>
               {checking ? "Checking…" : "Preview repositories"}
