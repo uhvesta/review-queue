@@ -329,6 +329,30 @@ describe("fixture-backed reviewer recovery", () => {
     fireEvent.click(within(card).getByRole("button", { name: "Open review" }));
     expect((await screen.findAllByRole("region", { name: "Code diff" })).length).toBeGreaterThan(0);
   });
+
+  it("renders source actions and approval behavior from the persisted adapter contract, not queue collection", async () => {
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      const moveGithubRoundToLocalQueue = (round: Awaited<ReturnType<typeof api.getRound>>) =>
+        round.brief.title === githubTitle ? { ...round, collection: "local" as const } : round;
+      return {
+        ...api,
+        listRounds: async (...args: Parameters<typeof api.listRounds>) =>
+          (await api.listRounds(...args)).map(moveGithubRoundToLocalQueue),
+        getRound: async (...args: Parameters<typeof api.getRound>) =>
+          moveGithubRoundToLocalQueue(await api.getRound(...args)),
+      };
+    });
+
+    await openReview(githubTitle);
+    expect(screen.getByRole("group", { name: "GitHub review actions" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh comments" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Check head" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await screen.findByRole("heading", { name: "Queue Home" });
+    expect(screen.queryByRole("alertdialog", { name: /Approve and purge/i })).not.toBeInTheDocument();
+  });
 });
 
 describe("responsive reviewer escape hatches", () => {

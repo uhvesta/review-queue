@@ -229,7 +229,7 @@ pass. `npm run build` re-verified clean after each fix.
 This section separates the retained historical migration checks from checks
 run against the **current working tree**.
 
-- `cd frontend && npm test` passed: 2 files, 15 tests.
+- `cd frontend && npm test` passed: 2 files, 17 tests.
 - `cd frontend && npm run build` and `npx vite build --mode fixture` passed.
 - The in-app browser fixture passed at 1280px, 1024px, and 560px. Files and
   Chat remained reachable, continuous diffs rendered at non-zero width, and

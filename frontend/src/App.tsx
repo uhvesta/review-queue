@@ -95,6 +95,7 @@ import type {
   GithubPublishAttempt,
   ImportedComment,
   PreparedFeedbackPrompt,
+  SourceCapability,
   UpdateCheck,
 } from "./types";
 import {
@@ -605,7 +606,7 @@ function MachineQueue({
           onReproduce={onReproduce}
           onCopyFeedback={onCopyFeedback}
           onShowOld={onShowOld}
-          onRefreshGithub={() => {}}
+          onRefreshGithub={() => void refreshIndex()}
         />
         <section className="queue-column machine-items">
           <h2>REMOTE INDEX ({uncachedItems.length})</h2>
@@ -1014,7 +1015,13 @@ function QueueColumn({
                   <button onClick={() => onCopyFeedback(round)}>Copy feedback prompt</button>
                   <button onClick={onShowOld}>Show completed / old topic rounds</button>
                   {!readOnly && <button onClick={() => onComplete(round)}>Complete</button>}
-                  {round.collection === "github" && !readOnly && <button onClick={() => onRefreshGithub(round)}>Refresh remote PR</button>}
+                  {supportsCapability(round, "remote_refresh") && !readOnly && (
+                    <button onClick={() => onRefreshGithub(round)}>
+                      {round.source_adapter.adapter_id === "github_pull_request_mirror"
+                        ? "Refresh remote PR"
+                        : "Refresh remote source"}
+                    </button>
+                  )}
                   {!readOnly && <button onClick={() => onMove(round, 0)}>Move to top</button>}
                   {!readOnly && <button onClick={() => onMove(round, bottomRank)}>Move to bottom</button>}
                   <button className="danger-text" onClick={() => onDelete(round)}>Delete</button>
@@ -1085,6 +1092,11 @@ function Reviewer({
     : round.lifecycle === "completed"
       ? "Completed — Requeue to review again"
       : "";
+  const canPublish = supportsCapability(round, "publish");
+  const hasUpstreamDiscussion = supportsCapability(round, "upstream_discussion");
+  const canRefreshRemote = supportsCapability(round, "remote_refresh");
+  const usesGithubMirror = round.source_adapter.adapter_id === "github_pull_request_mirror";
+  const purgesOnApproval = round.source_adapter.approval === "purge_round";
 
   const loadViewedState = async () => {
     const viewedFiles = await listViewedFiles(round.id);
@@ -1201,7 +1213,7 @@ function Reviewer({
     setCoreDiffError(null);
     setDiff(null);
     setSelectedKey("");
-    const load = round.collection === "github"
+    const load = usesGithubMirror
       ? openGithubPullRequest(round.id).then((opened) => {
           setGithubFiles(opened.files);
           return githubFilesToDiff(round, opened.files);
@@ -1222,7 +1234,7 @@ function Reviewer({
     return () => {
       cancelled = true;
     };
-  }, [diffLoadVersion, round.id]);
+  }, [diffLoadVersion, round.id, usesGithubMirror]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1237,7 +1249,7 @@ function Reviewer({
           setActionFailure({ error: toCommandError(problem), recovery: { kind: "load_viewed" } });
         }
       });
-    if (round.collection !== "github") {
+    if (!hasUpstreamDiscussion && !canPublish) {
       setGithubDecision(null);
       setImportedComments([]);
       setStaleness(null);
@@ -1245,28 +1257,32 @@ function Reviewer({
         cancelled = true;
       };
     }
-    getRoundDecision(round.id)
-      .then(setGithubDecision)
-      .catch((problem) => {
-        if (!cancelled) {
-          setActionFailure({ error: toCommandError(problem), recovery: { kind: "load_decision" } });
-        }
-      });
-    refreshGithubComments(round.id)
-      .then((result) => {
-        if (cancelled) return;
-        setImportedComments(result.imported);
-        setStaleness(result.staleness);
-      })
-      .catch((problem) => {
-        if (!cancelled) {
-          setActionFailure({ error: toCommandError(problem), recovery: { kind: "refresh_comments" } });
-        }
-      });
+    if (canPublish) {
+      getRoundDecision(round.id)
+        .then(setGithubDecision)
+        .catch((problem) => {
+          if (!cancelled) {
+            setActionFailure({ error: toCommandError(problem), recovery: { kind: "load_decision" } });
+          }
+        });
+    }
+    if (hasUpstreamDiscussion) {
+      refreshGithubComments(round.id)
+        .then((result) => {
+          if (cancelled) return;
+          setImportedComments(result.imported);
+          setStaleness(result.staleness);
+        })
+        .catch((problem) => {
+          if (!cancelled) {
+            setActionFailure({ error: toCommandError(problem), recovery: { kind: "refresh_comments" } });
+          }
+        });
+    }
     return () => {
       cancelled = true;
     };
-  }, [round.collection, round.id]);
+  }, [canPublish, hasUpstreamDiscussion, round.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1401,28 +1417,34 @@ function Reviewer({
 
   return (
     <main className="reviewer">
-      <header className={`review-header ${round.collection === "github" ? "github-review-header" : ""}`}>
+      <header className={`review-header ${canPublish || hasUpstreamDiscussion ? "github-review-header" : ""}`}>
         <button className="back" onClick={onBack}>← Queue Home</button>
         <div className="review-identity">
           <b>{round.manifest.topic}</b>
           <span> · {round.manifest.repositories.length} repositories @ {shortSha(round.manifest_hash)}</span>
         </div>
         <button onClick={onDetails}>Details</button>
-        {round.collection === "github" && (
+        {(hasUpstreamDiscussion || canPublish || (canRefreshRemote && usesGithubMirror)) && (
           <div className="review-header-actions" role="group" aria-label="GitHub review actions">
-            <button
-              disabled={githubWorking}
-              onClick={() => void runReviewerAction({ kind: "refresh_comments" }, refreshComments, true)}
-            >Refresh comments</button>
-            <button
-              disabled={githubWorking}
-              onClick={() => void runReviewerAction({ kind: "check_head" }, checkHead, true)}
-            >Check head</button>
-            <button
-              disabled={githubWorking || readOnly || !githubDecision}
-              title={!githubDecision ? "Record Approve or Request changes before publishing" : readOnly ? reason : "Preview the exact GitHub review request"}
-              onClick={() => void runReviewerAction({ kind: "prepare_publish" }, preparePublish, true)}
-            >Publish review</button>
+            {hasUpstreamDiscussion && (
+              <button
+                disabled={githubWorking}
+                onClick={() => void runReviewerAction({ kind: "refresh_comments" }, refreshComments, true)}
+              >Refresh comments</button>
+            )}
+            {canRefreshRemote && usesGithubMirror && (
+              <button
+                disabled={githubWorking}
+                onClick={() => void runReviewerAction({ kind: "check_head" }, checkHead, true)}
+              >Check head</button>
+            )}
+            {canPublish && (
+              <button
+                disabled={githubWorking || readOnly || !githubDecision}
+                title={!githubDecision ? "Record Approve or Request changes before publishing" : readOnly ? reason : "Preview the exact GitHub review request"}
+                onClick={() => void runReviewerAction({ kind: "prepare_publish" }, preparePublish, true)}
+              >Publish review</button>
+            )}
           </div>
         )}
       </header>
@@ -1433,7 +1455,7 @@ function Reviewer({
           <button onClick={() => setActionFailure(null)}>Dismiss</button>
         </div>
       )}
-      {(round.collection === "github" || roundFormalComments.length > 0) && (
+      {(hasUpstreamDiscussion || roundFormalComments.length > 0) && (
         <section className="upstream-discussion">
           {staleness && staleness.pinned_head_sha !== staleness.observed_head_sha && (
             <p className="danger-text">
@@ -1693,8 +1715,8 @@ function Reviewer({
             <button
               className="approve"
               disabled={readOnly}
-              title={readOnly ? reason : round.collection === "local" ? "Approval purges this local round after confirmation" : "Records a local decision; it does not publish or deliver"}
-              onClick={() => round.collection === "local" ? onPurge("approve_local") : onApproveRemote()}
+              title={readOnly ? reason : purgesOnApproval ? "Approval purges this local round after confirmation" : "Records a local decision; it does not publish or deliver"}
+              onClick={() => purgesOnApproval ? onPurge("approve_local") : onApproveRemote()}
             >
               Approve
             </button>
@@ -3703,6 +3725,10 @@ function ErrorBanner({ error, onDismiss }: { error: CommandError; onDismiss: () 
 
 function isActive(round: ReviewRound) {
   return round.lifecycle !== "completed" && !round.superseded_by;
+}
+
+function supportsCapability(round: ReviewRound, capability: SourceCapability) {
+  return round.source_adapter.capabilities.capabilities.includes(capability);
 }
 
 function displayLifecycle(lifecycle: ReviewRound["lifecycle"]) {

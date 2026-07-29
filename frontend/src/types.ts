@@ -1,5 +1,19 @@
 export type Collection = "local" | "github" | "machine";
 export type Lifecycle = "queued" | "changes_requested" | "completed";
+export type SourceCapability =
+  | "originating_agent"
+  | "acp_delivery"
+  | "publish"
+  | "upstream_discussion"
+  | "remote_refresh";
+
+export interface SourceAdapterContract {
+  adapter_id: string;
+  capabilities: {
+    capabilities: SourceCapability[];
+  };
+  approval: "purge_round" | "record_decision";
+}
 
 export interface UpdateCheck {
   available: boolean;
@@ -67,6 +81,7 @@ export interface ReviewRound {
   created_at: string;
   origin_route_id?: string | null;
   origin_route?: AgentRoute | null;
+  source_adapter: SourceAdapterContract;
   source_metadata?:
     | {
         kind: "machine";
