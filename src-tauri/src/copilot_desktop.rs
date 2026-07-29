@@ -1204,6 +1204,7 @@ mod tests {
                     head_sha: "head-sha-1".into(),
                     remote_fingerprint: None,
                     object_checksum: "tree-sha-1".into(),
+                    capture_metadata: None,
                 }],
                 before_fingerprint: "before-1".into(),
                 after_fingerprint: "after-1".into(),

@@ -770,6 +770,7 @@ mod tests {
                     head_sha: "head".into(),
                     remote_fingerprint: None,
                     object_checksum: "checksum".into(),
+                    capture_metadata: None,
                 }],
                 before_fingerprint: "before".into(),
                 after_fingerprint: "after".into(),

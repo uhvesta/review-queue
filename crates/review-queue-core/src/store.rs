@@ -2836,6 +2836,7 @@ mod tests {
                     head_sha: head.into(),
                     remote_fingerprint: None,
                     object_checksum: String::new(),
+                    capture_metadata: None,
                 }],
                 before_fingerprint: "before".into(),
                 after_fingerprint: "after".into(),

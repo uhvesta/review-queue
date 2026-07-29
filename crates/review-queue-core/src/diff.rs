@@ -540,6 +540,7 @@ mod tests {
                     head_sha: one_head,
                     remote_fingerprint: None,
                     object_checksum: String::new(),
+                    capture_metadata: None,
                 },
                 RepositorySnapshot {
                     repository_id: "two".into(),
@@ -549,6 +550,7 @@ mod tests {
                     head_sha: two_head,
                     remote_fingerprint: None,
                     object_checksum: String::new(),
+                    capture_metadata: None,
                 },
             ],
         };

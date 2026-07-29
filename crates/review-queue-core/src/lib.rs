@@ -57,6 +57,80 @@ pub struct RepositorySnapshot {
     pub remote_fingerprint: Option<String>,
     #[serde(default)]
     pub object_checksum: String,
+    /// Versioned capture inventory and reconstruction data. Legacy and
+    /// externally imported snapshots remain valid without it.
+    #[serde(default)]
+    pub capture_metadata: Option<Box<RepositoryCaptureMetadata>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RepositoryCaptureMetadata {
+    /// Full ref name that `base_sha` resolved from at capture time.
+    #[serde(default)]
+    pub base_ref: String,
+    #[serde(default)]
+    pub inclusions: RepositoryInclusions,
+    #[serde(default)]
+    pub exclusions: Vec<RepositoryExclusion>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub object_checksums: RepositoryObjectChecksums,
+    #[serde(default)]
+    pub materialization: RepositoryMaterializationRecipe,
+}
+
+/// Paths folded into the immutable review commit. Binary paths may also
+/// appear in one of the tracked/untracked lists.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RepositoryInclusions {
+    #[serde(default)]
+    pub tracked_paths: Vec<String>,
+    #[serde(default)]
+    pub untracked_paths: Vec<String>,
+    #[serde(default)]
+    pub deleted_paths: Vec<String>,
+    #[serde(default)]
+    pub binary_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RepositoryExclusion {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RepositoryObjectChecksums {
+    #[serde(default)]
+    pub object_format: String,
+    #[serde(default)]
+    pub base_commit: String,
+    #[serde(default)]
+    pub base_tree: String,
+    #[serde(default)]
+    pub head_commit: String,
+    #[serde(default)]
+    pub head_tree: String,
+}
+
+/// Declarative, shell-free recipe for reconstructing the exact pinned Git
+/// object. The source root may move, but the required commit/tree identities
+/// make branch movement or worktree contents irrelevant.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RepositoryMaterializationRecipe {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub source_repository_root: String,
+    #[serde(default)]
+    pub required_commit: String,
+    #[serde(default)]
+    pub required_tree: String,
+    #[serde(default)]
+    pub object_format: String,
+    #[serde(default)]
+    pub checkout_detached: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -398,5 +472,20 @@ mod identity_tests {
             created_at: Utc::now(),
         };
         assert_eq!(local_topic_identity(&manifest), "workspace-abc:parser-v2");
+    }
+
+    #[test]
+    fn legacy_repository_snapshot_defaults_capture_metadata() {
+        let snapshot: RepositorySnapshot = serde_json::from_value(serde_json::json!({
+            "repository_id": "app",
+            "root": "app",
+            "branch": "main",
+            "base_sha": "base",
+            "head_sha": "head",
+            "remote_fingerprint": null,
+            "object_checksum": "tree"
+        }))
+        .unwrap();
+        assert_eq!(snapshot.capture_metadata, None);
     }
 }

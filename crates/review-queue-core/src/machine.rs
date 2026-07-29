@@ -1341,15 +1341,28 @@ pub fn preview_cached_git_reproduction(
             source: format!("cached-machine-git-pack:{}", repository.repository_id),
             destination: target.to_string_lossy().into_owned(),
             head_sha: repository.head_sha.clone(),
+            object_checksum: repository.object_checksum.clone(),
+            capture_metadata: repository.capture_metadata.clone(),
         });
     }
     repositories.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    let warnings = repositories
+        .iter()
+        .flat_map(|repository| {
+            repository
+                .capture_metadata
+                .as_deref()
+                .into_iter()
+                .flat_map(|metadata| metadata.warnings.iter().cloned())
+        })
+        .collect();
     Ok(ReproductionPreview {
         destination: destination.to_string_lossy().into_owned(),
         command_bundle: cached_git_command_bundle(snapshot, destination, &repositories)?,
         agent_working_directory: destination.to_string_lossy().into_owned(),
         launch_guidance: "After the cached Git packs are restored, start a fresh agent session in this working directory, then submit the prepared feedback prompt manually.".into(),
         repositories,
+        warnings,
     })
 }
 
@@ -1464,6 +1477,7 @@ pub fn reproduce_cached_git_snapshot(
         command_bundle: preview.command_bundle,
         agent_working_directory: preview.agent_working_directory,
         launch_guidance: preview.launch_guidance,
+        warnings: preview.warnings,
     })
 }
 
@@ -2102,6 +2116,7 @@ mod tests {
                 head_sha: "head".into(),
                 remote_fingerprint: None,
                 object_checksum: "checksum".into(),
+                capture_metadata: None,
             }],
             before_fingerprint: "before".into(),
             after_fingerprint: "after".into(),
@@ -2281,6 +2296,7 @@ mod tests {
                     head_sha: "head".into(),
                     remote_fingerprint: None,
                     object_checksum: "head".into(),
+                    capture_metadata: None,
                 }],
                 before_fingerprint: "base".into(),
                 after_fingerprint: "head".into(),

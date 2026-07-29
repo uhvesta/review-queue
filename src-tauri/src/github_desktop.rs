@@ -654,6 +654,7 @@ fn manifest(payload: &GithubQueuePayload) -> WorkspaceManifest {
             head_sha: metadata.head_sha.clone(),
             remote_fingerprint: metadata.web_url.clone(),
             object_checksum: metadata.head_sha.clone(),
+            capture_metadata: None,
         }],
         before_fingerprint: metadata.base_sha.clone(),
         after_fingerprint: metadata.head_sha.clone(),

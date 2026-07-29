@@ -30,6 +30,15 @@ real indexes, and commits SQLite. A database or index-finalization failure
 drops the database transaction and restores every safely-owned ref plus the
 exact original staging indexes.
 
+Each repository snapshot keeps its workspace-relative root, branch and base
+ref/SHA, pinned head commit, object format, base/head tree identities, and a
+declarative detached-checkout recipe. Capture inventories tracked, untracked,
+deleted, and binary inclusions; Git-ignored paths are recorded as explicit
+exclusions with diagnostics. These additions are versioned and optional when
+deserializing older manifests. Reproduction preview exposes the inventory and
+warnings, validates recipe consistency, and verifies the saved tree identity
+before creating a destination.
+
 The CLI performs no Git capture. It sends a token-free preflight request and
 then the bound capture request to the already-running desktop socket, so there
 is no post-capture handoff from CLI to desktop. For capture only, the socket

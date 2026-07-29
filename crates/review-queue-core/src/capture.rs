@@ -18,7 +18,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use crate::{DomainError, RepositorySnapshot, ReviewBrief, WorkspaceManifest};
+use crate::{
+    DomainError, RepositoryCaptureMetadata, RepositoryExclusion, RepositoryInclusions,
+    RepositoryMaterializationRecipe, RepositoryObjectChecksums, RepositorySnapshot, ReviewBrief,
+    WorkspaceManifest,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CaptureRequest {
@@ -60,6 +64,12 @@ pub struct PreflightRepository {
     pub status: String,
     pub has_changes: bool,
     pub participating: bool,
+    #[serde(default)]
+    pub inclusions: RepositoryInclusions,
+    #[serde(default)]
+    pub exclusions: Vec<RepositoryExclusion>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -165,6 +175,7 @@ pub fn preflight(request: &CaptureRequest) -> Result<Preflight, DomainError> {
             )
         })?;
         let status = git(&root, ["status", "--porcelain=v1", "--untracked-files=all"])?;
+        let (inclusions, exclusions, warnings) = capture_inventory(&root)?;
         // An unchanged repository does not create a commit, so its author
         // configuration is irrelevant to this submission.
         if !status.is_empty() {
@@ -188,6 +199,9 @@ pub fn preflight(request: &CaptureRequest) -> Result<Preflight, DomainError> {
             has_changes: !status.is_empty(),
             status,
             participating: false,
+            inclusions,
+            exclusions,
+            warnings,
         });
     }
     result.sort_by(|a, b| a.repository_id.cmp(&b.repository_id));
@@ -512,20 +526,135 @@ fn snapshot(
     repo: &PreflightRepository,
     head_sha: String,
 ) -> Result<RepositorySnapshot, DomainError> {
-    let object_checksum = git(&repo.root, ["rev-parse", &format!("{head_sha}^{{tree}}")])?;
+    let base_tree = git(
+        &repo.root,
+        ["rev-parse", &format!("{}^{{tree}}", repo.head_sha)],
+    )?;
+    let head_tree = git(&repo.root, ["rev-parse", &format!("{head_sha}^{{tree}}")])?;
+    let object_format =
+        git(&repo.root, ["rev-parse", "--show-object-format"]).unwrap_or_else(|_| {
+            if head_sha.len() == 64 {
+                "sha256".into()
+            } else {
+                "sha1".into()
+            }
+        });
+    let relative_root = repository_id(workspace, &repo.root)?;
     let remote_fingerprint = git(&repo.root, ["remote", "get-url", "origin"])
         .ok()
         .filter(|s| !s.is_empty())
         .map(|s| digest(s.as_bytes()));
     Ok(RepositorySnapshot {
         repository_id: repo.repository_id.clone(),
-        root: repository_id(workspace, &repo.root)?,
+        root: relative_root.clone(),
         branch: repo.branch.clone(),
         base_sha: repo.head_sha.clone(),
-        head_sha,
+        head_sha: head_sha.clone(),
         remote_fingerprint,
-        object_checksum,
+        object_checksum: head_tree.clone(),
+        capture_metadata: Some(Box::new(RepositoryCaptureMetadata {
+            base_ref: format!("refs/heads/{}", repo.branch),
+            inclusions: repo.inclusions.clone(),
+            exclusions: repo.exclusions.clone(),
+            warnings: repo.warnings.clone(),
+            object_checksums: RepositoryObjectChecksums {
+                object_format: object_format.clone(),
+                base_commit: repo.head_sha.clone(),
+                base_tree,
+                head_commit: head_sha.clone(),
+                head_tree: head_tree.clone(),
+            },
+            materialization: RepositoryMaterializationRecipe {
+                schema_version: 1,
+                source_repository_root: relative_root,
+                required_commit: head_sha,
+                required_tree: head_tree,
+                object_format,
+                checkout_detached: true,
+            },
+        })),
     })
+}
+
+fn capture_inventory(
+    root: &Path,
+) -> Result<(RepositoryInclusions, Vec<RepositoryExclusion>, Vec<String>), DomainError> {
+    let tracked_paths = git_nul_paths(
+        root,
+        [
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMRTUXB",
+            "HEAD",
+        ],
+    )?;
+    let deleted_paths = git_nul_paths(
+        root,
+        ["diff", "--name-only", "-z", "--diff-filter=D", "HEAD"],
+    )?;
+    let untracked_paths =
+        git_nul_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let ignored_paths = git_nul_paths(
+        root,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    let mut binary_paths = tracked_paths
+        .iter()
+        .chain(untracked_paths.iter())
+        .filter_map(|path| {
+            fs::read(root.join(path))
+                .ok()
+                .filter(|bytes| bytes.contains(&0))
+                .map(|_| path.clone())
+        })
+        .collect::<Vec<_>>();
+    binary_paths.sort();
+    binary_paths.dedup();
+    let exclusions = ignored_paths
+        .iter()
+        .map(|path| RepositoryExclusion {
+            path: path.clone(),
+            reason: "git_ignored".into(),
+        })
+        .collect::<Vec<_>>();
+    let warnings = (!ignored_paths.is_empty())
+        .then(|| {
+            format!(
+                "{} Git-ignored path(s) were excluded from capture.",
+                ignored_paths.len()
+            )
+        })
+        .into_iter()
+        .collect();
+    Ok((
+        RepositoryInclusions {
+            tracked_paths,
+            untracked_paths,
+            deleted_paths,
+            binary_paths,
+        },
+        exclusions,
+        warnings,
+    ))
+}
+
+fn git_nul_paths<const N: usize>(root: &Path, args: [&str; N]) -> Result<Vec<String>, DomainError> {
+    let bytes = run_git_bytes(root, None, args)?;
+    let mut paths = bytes
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 fn sync_index_to_head(repo: &PreflightRepository) -> Result<(), DomainError> {
@@ -552,6 +681,15 @@ fn run_git<const N: usize>(
     index: Option<&Path>,
     args: [&str; N],
 ) -> Result<String, DomainError> {
+    run_git_bytes(root, index, args)
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim_end().to_owned())
+}
+
+fn run_git_bytes<const N: usize>(
+    root: &Path,
+    index: Option<&Path>,
+    args: [&str; N],
+) -> Result<Vec<u8>, DomainError> {
     let mut command = Command::new("git");
     command.arg("-C").arg(root).args(args);
     if let Some(index) = index {
@@ -567,9 +705,7 @@ fn run_git<const N: usize>(
         )
     })?;
     if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout)
-            .trim_end()
-            .to_owned());
+        return Ok(output.stdout);
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     Err(error(
@@ -711,7 +847,10 @@ mod tests {
         fs::write(app.join("initial.txt"), "edited\n").unwrap();
         run(&app, &["add", "initial.txt"]);
         fs::write(app.join("untracked.txt"), "new\n").unwrap();
-        fs::write(parser.join("initial.txt"), "edited\n").unwrap();
+        fs::write(app.join("binary.bin"), [0, 1, 2, 3]).unwrap();
+        fs::write(app.join(".git/info/exclude"), "ignored.log\n").unwrap();
+        fs::write(app.join("ignored.log"), "excluded\n").unwrap();
+        fs::remove_file(parser.join("initial.txt")).unwrap();
         let manifest = capture(&request(workspace.path())).unwrap();
         assert_eq!(manifest.repositories.len(), 2);
         assert!(
@@ -729,6 +868,49 @@ mod tests {
         // deletion from a stale index.
         assert!(output(&app, &["status", "--porcelain"]).is_empty());
         assert_eq!(output(&app, &["show", "HEAD:untracked.txt"]), "new");
+        let app_snapshot = manifest
+            .repositories
+            .iter()
+            .find(|repository| repository.repository_id == "app")
+            .unwrap();
+        let app_metadata = app_snapshot.capture_metadata.as_deref().unwrap();
+        assert_eq!(
+            app_metadata.base_ref,
+            format!("refs/heads/{}", app_snapshot.branch)
+        );
+        assert_eq!(app_metadata.inclusions.tracked_paths, vec!["initial.txt"]);
+        assert_eq!(
+            app_metadata.inclusions.untracked_paths,
+            vec!["binary.bin", "untracked.txt"]
+        );
+        assert_eq!(app_metadata.inclusions.binary_paths, vec!["binary.bin"]);
+        assert_eq!(
+            app_metadata.exclusions,
+            vec![RepositoryExclusion {
+                path: "ignored.log".into(),
+                reason: "git_ignored".into(),
+            }]
+        );
+        assert!(!app_metadata.warnings.is_empty());
+        assert_eq!(
+            app_metadata.object_checksums.head_tree,
+            app_snapshot.object_checksum
+        );
+        assert_eq!(
+            app_metadata.materialization.required_commit,
+            app_snapshot.head_sha
+        );
+        assert!(app_metadata.materialization.checkout_detached);
+        let parser_metadata = manifest
+            .repositories
+            .iter()
+            .find(|repository| repository.repository_id == "packages/parser")
+            .and_then(|repository| repository.capture_metadata.as_deref())
+            .unwrap();
+        assert_eq!(
+            parser_metadata.inclusions.deleted_paths,
+            vec!["initial.txt"]
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DomainError, RepositorySnapshot, WorkspaceManifest};
+use crate::{DomainError, RepositoryCaptureMetadata, RepositorySnapshot, WorkspaceManifest};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReproductionRepository {
@@ -22,6 +22,13 @@ pub struct ReproductionRepository {
     pub source: String,
     pub destination: String,
     pub head_sha: String,
+    /// Expected tree identity verified before any destination is created.
+    #[serde(default)]
+    pub object_checksum: String,
+    /// Capture inventory, exclusions, diagnostics, and declarative recipe are
+    /// surfaced in preview instead of being hidden in the stored manifest.
+    #[serde(default)]
+    pub capture_metadata: Option<Box<RepositoryCaptureMetadata>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -36,6 +43,8 @@ pub struct ReproductionPreview {
     /// Explicitly manual launch guidance. The bundle reconstructs and enters
     /// the environment but never starts or prompts an agent.
     pub launch_guidance: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -45,6 +54,8 @@ pub struct ReproductionResult {
     pub command_bundle: String,
     pub agent_working_directory: String,
     pub launch_guidance: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Computes a reconstruction plan without touching either source or target.
@@ -54,12 +65,23 @@ pub fn preview(
 ) -> Result<ReproductionPreview, DomainError> {
     let destination = absolute(destination.as_ref())?;
     let repositories = plan_repositories(manifest, &destination)?;
+    let warnings = repositories
+        .iter()
+        .flat_map(|repository| {
+            repository
+                .capture_metadata
+                .as_deref()
+                .into_iter()
+                .flat_map(|metadata| metadata.warnings.iter().cloned())
+        })
+        .collect();
     Ok(ReproductionPreview {
         destination: destination.to_string_lossy().into_owned(),
         command_bundle: command_bundle(&destination, &repositories),
         agent_working_directory: destination.to_string_lossy().into_owned(),
         launch_guidance: "After the setup bundle completes, start a fresh agent session in this working directory, then submit the prepared feedback prompt manually.".into(),
         repositories,
+        warnings,
     })
 }
 
@@ -128,6 +150,7 @@ pub fn materialize(
         command_bundle: preview.command_bundle,
         agent_working_directory: preview.agent_working_directory,
         launch_guidance: preview.launch_guidance,
+        warnings: preview.warnings,
     })
 }
 
@@ -164,6 +187,8 @@ fn plan_repositories(
                 .into_owned(),
             destination: target.to_string_lossy().into_owned(),
             head_sha: snapshot.head_sha.clone(),
+            object_checksum: snapshot.object_checksum.clone(),
+            capture_metadata: snapshot.capture_metadata.clone(),
         });
     }
     result.sort_by(|a, b| a.repository_id.cmp(&b.repository_id));
@@ -193,11 +218,40 @@ fn validate_snapshot(
             "reproduction_invalid_manifest",
         ));
     }
+    validate_capture_metadata(snapshot)?;
     let relative = repository_relative_path(snapshot, workspace_root)?;
     let target = destination.join(relative);
     if !destinations.insert(target) {
         return Err(error(
             "The review manifest maps multiple repositories to one destination.",
+            "No directories, source files, or Git refs were changed.",
+            "Capture the workspace again before reproducing it.",
+            "reproduction_invalid_manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capture_metadata(snapshot: &RepositorySnapshot) -> Result<(), DomainError> {
+    let Some(metadata) = snapshot.capture_metadata.as_deref() else {
+        return Ok(());
+    };
+    let checksums = &metadata.object_checksums;
+    let recipe = &metadata.materialization;
+    let invalid = metadata.base_ref.trim().is_empty()
+        || checksums.base_commit != snapshot.base_sha
+        || checksums.head_commit != snapshot.head_sha
+        || (!snapshot.object_checksum.is_empty()
+            && checksums.head_tree != snapshot.object_checksum)
+        || recipe.schema_version == 0
+        || recipe.source_repository_root != snapshot.root
+        || recipe.required_commit != snapshot.head_sha
+        || recipe.required_tree != checksums.head_tree
+        || recipe.object_format != checksums.object_format
+        || !recipe.checkout_detached;
+    if invalid {
+        return Err(error(
+            "The review manifest contains an inconsistent materialization recipe.",
             "No directories, source files, or Git refs were changed.",
             "Capture the workspace again before reproducing it.",
             "reproduction_invalid_manifest",
@@ -298,7 +352,68 @@ fn verify_source(repository: &ReproductionRepository) -> Result<(), DomainError>
             &format!("{}^{{commit}}", repository.head_sha),
         ],
         source,
-    )
+    )?;
+    if !repository.object_checksum.trim().is_empty() {
+        let actual_tree = git_stdout(
+            Some(source),
+            ["rev-parse", &format!("{}^{{tree}}", repository.head_sha)],
+            source,
+        )?;
+        if actual_tree != repository.object_checksum {
+            return Err(error(
+                &format!(
+                    "The saved tree for repository '{}' no longer matches its manifest checksum.",
+                    repository.repository_id
+                ),
+                "No reproduction destination was created and the source repository was unchanged.",
+                "Restore the captured Git objects or capture the workspace again.",
+                "reproduction_object_mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_stdout<const N: usize>(
+    cwd: Option<&Path>,
+    args: [&str; N],
+    context: &Path,
+) -> Result<String, DomainError> {
+    let mut command = Command::new("git");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(args)
+        .output()
+        .map_err(|e| {
+            error(
+                &format!("Could not run Git for '{}': {e}", context.display()),
+                "No source files or Git refs were changed.",
+                "Install Git or repair the local repository, then retry.",
+                "git_unavailable",
+            )
+        })?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(error(
+        &format!(
+            "Git could not reproduce '{}': {}",
+            context.display(),
+            if detail.is_empty() {
+                "unknown Git error"
+            } else {
+                &detail
+            }
+        ),
+        "Source files and source Git refs were not changed.",
+        "Restore the captured Git objects and retry with an empty destination.",
+        "reproduction_git_failed",
+    ))
 }
 
 fn run_git<const N: usize>(
@@ -412,7 +527,11 @@ fn error(what: &str, safety: &str, next: &str, code: &str) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::{materialize, preview};
-    use crate::{RepositorySnapshot, WorkspaceManifest};
+    use crate::{
+        RepositoryCaptureMetadata, RepositoryExclusion, RepositoryInclusions,
+        RepositoryMaterializationRecipe, RepositoryObjectChecksums, RepositorySnapshot,
+        WorkspaceManifest,
+    };
     use chrono::Utc;
     use std::{fs, path::Path, process::Command};
     use tempfile::TempDir;
@@ -447,20 +566,25 @@ mod tests {
             topic: "topic".into(),
             repositories: repos
                 .into_iter()
-                .map(|(relative, sha)| RepositorySnapshot {
-                    repository_id: if relative.is_empty() {
-                        ".".into()
-                    } else {
-                        relative.into()
-                    },
-                    // This is intentionally relative: `capture::snapshot` stores
-                    // manifest roots in exactly this portable form.
-                    root: if relative.is_empty() { "." } else { relative }.into(),
-                    branch: "main".into(),
-                    base_sha: sha.clone(),
-                    head_sha: sha,
-                    remote_fingerprint: None,
-                    object_checksum: "objects".into(),
+                .map(|(relative, sha)| {
+                    let root = workspace.join(relative);
+                    let tree = git(&root, &["rev-parse", &format!("{sha}^{{tree}}")]);
+                    RepositorySnapshot {
+                        repository_id: if relative.is_empty() {
+                            ".".into()
+                        } else {
+                            relative.into()
+                        },
+                        // This is intentionally relative: `capture::snapshot`
+                        // stores manifest roots in exactly this portable form.
+                        root: if relative.is_empty() { "." } else { relative }.into(),
+                        branch: "main".into(),
+                        base_sha: sha.clone(),
+                        head_sha: sha,
+                        remote_fingerprint: None,
+                        object_checksum: tree,
+                        capture_metadata: None,
+                    }
                 })
                 .collect(),
             before_fingerprint: "before".into(),
@@ -529,6 +653,66 @@ mod tests {
             .status()
             .unwrap();
         assert!(!detached.success());
+    }
+
+    #[test]
+    fn preview_surfaces_capture_diagnostics_and_materialization_verifies_objects() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let sha = repository(&workspace.join("one"), "one.txt");
+        let mut manifest = manifest(&workspace, vec![("one", sha.clone())]);
+        let snapshot = &mut manifest.repositories[0];
+        let tree = snapshot.object_checksum.clone();
+        let object_format = git(
+            &workspace.join("one"),
+            &["rev-parse", "--show-object-format"],
+        );
+        snapshot.capture_metadata = Some(Box::new(RepositoryCaptureMetadata {
+            base_ref: "refs/heads/main".into(),
+            inclusions: RepositoryInclusions {
+                tracked_paths: vec!["one.txt".into()],
+                untracked_paths: vec!["new.txt".into()],
+                deleted_paths: vec!["old.txt".into()],
+                binary_paths: vec!["asset.bin".into()],
+            },
+            exclusions: vec![RepositoryExclusion {
+                path: "ignored.log".into(),
+                reason: "git_ignored".into(),
+            }],
+            warnings: vec!["1 Git-ignored path(s) were excluded from capture.".into()],
+            object_checksums: RepositoryObjectChecksums {
+                object_format: object_format.clone(),
+                base_commit: sha.clone(),
+                base_tree: tree.clone(),
+                head_commit: sha.clone(),
+                head_tree: tree.clone(),
+            },
+            materialization: RepositoryMaterializationRecipe {
+                schema_version: 1,
+                source_repository_root: "one".into(),
+                required_commit: sha,
+                required_tree: tree,
+                object_format,
+                checkout_detached: true,
+            },
+        }));
+        let target = temp.path().join("preview");
+        let preview = preview(&manifest, &target).unwrap();
+        let metadata = preview.repositories[0].capture_metadata.as_deref().unwrap();
+        assert_eq!(metadata.inclusions.untracked_paths, vec!["new.txt"]);
+        assert_eq!(metadata.exclusions[0].path, "ignored.log");
+        assert_eq!(preview.warnings, metadata.warnings);
+
+        let mut invalid = manifest;
+        invalid.repositories[0].object_checksum = "0000000000000000000000000000000000000000".into();
+        let invalid_metadata = invalid.repositories[0].capture_metadata.as_mut().unwrap();
+        invalid_metadata.object_checksums.head_tree =
+            "0000000000000000000000000000000000000000".into();
+        invalid_metadata.materialization.required_tree =
+            "0000000000000000000000000000000000000000".into();
+        let error = materialize(&invalid, &target, true).unwrap_err();
+        assert_eq!(error.error.code, "reproduction_object_mismatch");
+        assert!(!target.exists());
     }
     #[test]
     fn rejects_non_empty_destination_without_touching_it() {
