@@ -1414,6 +1414,21 @@ function Reviewer({
       document.getElementById(target.elementId)?.scrollIntoView({ block: "center", behavior: "smooth" });
     });
   };
+  const navigateDiffModeTabs = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const modes = ["unified", "split"] as const;
+    const current = viewMode === "split" ? 1 : 0;
+    let next = current;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (current + modes.length - 1) % modes.length;
+    else if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (current + 1) % modes.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = modes.length - 1;
+    else return;
+    event.preventDefault();
+    setViewMode(modes[next]);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`diff-view-${modes[next]}`)?.focus();
+    });
+  };
 
   const toggleDiffFileCollapsed = (key: string) => {
     setCollapsedFiles((current) => {
@@ -1546,11 +1561,15 @@ function Reviewer({
           <span>Files</span>
         </button>
         <button className="icon-button" aria-label="Settings" onClick={onSettings}>⚙</button>
-        <div className="view-modes toolbar-view-modes" role="group" aria-label="Diff view">
+        <div className="view-modes toolbar-view-modes" role="tablist" aria-label="Diff view" onKeyDown={navigateDiffModeTabs}>
           {(["unified", "split"] as const).map((mode) => (
             <button
+              id={`diff-view-${mode}`}
+              role="tab"
               className={viewMode === mode ? "selected-mode" : ""}
-              aria-pressed={viewMode === mode}
+              aria-selected={viewMode === mode}
+              aria-controls="review-diff-panel"
+              tabIndex={viewMode === mode || (viewMode === "file" && mode === "unified") ? 0 : -1}
               key={mode}
               onClick={() => setViewMode(mode)}
             >
@@ -1623,7 +1642,7 @@ function Reviewer({
             }}
           />
         </aside>
-        <section className="diff snapshot-pane" aria-label="Immutable diff">
+        <section className="diff snapshot-pane" id="review-diff-panel" role="tabpanel" aria-label="Immutable diff">
           <div className="diff-head">
             <div className="diff-head-title">
               <b>{selected?.path ?? "Immutable review snapshot"}</b>

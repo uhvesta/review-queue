@@ -401,6 +401,21 @@ describe("responsive reviewer escape hatches", () => {
 });
 
 describe("diff anchor selection", () => {
+  it("uses roving keyboard focus for Unified and Split diff tabs", async () => {
+    await openPaginationReview();
+
+    const unified = screen.getByRole("tab", { name: "unified" });
+    const split = screen.getByRole("tab", { name: "split" });
+    expect(unified).toHaveAttribute("aria-selected", "true");
+    expect(unified).toHaveAttribute("tabindex", "0");
+    expect(split).toHaveAttribute("tabindex", "-1");
+
+    fireEvent.keyDown(unified, { key: "ArrowRight" });
+    await waitFor(() => expect(split).toHaveAttribute("aria-selected", "true"));
+    expect(split).toHaveAttribute("tabindex", "0");
+    expect(document.activeElement).toBe(split);
+  });
+
   it("navigates hunks across the entire continuous multi-file review", async () => {
     await openPaginationReview();
 
@@ -439,7 +454,7 @@ describe("diff anchor selection", () => {
     });
 
     await openReview("Add retry backoff to sync worker");
-    fireEvent.click(screen.getByRole("button", { name: /split/i }));
+    fireEvent.click(screen.getByRole("tab", { name: /split/i }));
 
     const leftLine = screen.getAllByRole("button", { name: /select .* left line/i })[0];
     expect(leftLine).toBeDefined();
