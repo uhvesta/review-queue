@@ -1096,45 +1096,64 @@ fn poll_public(
     }
 }
 
-#[tauri::command]
-pub fn connection_status() -> ConnectionHealth {
-    ConnectionService::production().health()
+async fn run_connection_operation<T, F>(operation: F) -> Result<T, ConnectionCommandError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ConnectionCommandError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|_| ConnectionCommandError {
+            code: "connection_operation_interrupted".into(),
+            message: "The credential operation ended before Review Queue received a result.".into(),
+            data_safety: "No review snapshot, comment, or SQLite record was changed.".into(),
+            next_step: "Retry connection from Application settings.".into(),
+        })?
 }
 
 #[tauri::command]
-pub fn retry_connection() -> ConnectionHealth {
-    ConnectionService::production().health()
+pub async fn connection_status() -> Result<ConnectionHealth, ConnectionCommandError> {
+    run_connection_operation(|| Ok(ConnectionService::production().health())).await
 }
 
 #[tauri::command]
-pub fn disconnect_capability(
+pub async fn retry_connection() -> Result<ConnectionHealth, ConnectionCommandError> {
+    run_connection_operation(|| Ok(ConnectionService::production().health())).await
+}
+
+#[tauri::command]
+pub async fn disconnect_capability(
     request: DisconnectCapabilityRequest,
 ) -> Result<ConnectionHealth, ConnectionCommandError> {
-    ConnectionService::production().disconnect(request)
+    run_connection_operation(move || ConnectionService::production().disconnect(request)).await
 }
 
 #[tauri::command]
-pub fn start_device_flow(
+pub async fn start_device_flow(
     request: StartDeviceFlowRequest,
 ) -> Result<DeviceFlowPublicState, ConnectionCommandError> {
-    ConnectionService::production().start_device_flow(request)
+    run_connection_operation(move || ConnectionService::production().start_device_flow(request))
+        .await
 }
 
 #[tauri::command]
-pub fn cancel_device_flow() -> Result<ConnectionHealth, ConnectionCommandError> {
-    ConnectionService::production().cancel_device_flow()
+pub async fn cancel_device_flow() -> Result<ConnectionHealth, ConnectionCommandError> {
+    run_connection_operation(|| ConnectionService::production().cancel_device_flow()).await
 }
 
 #[tauri::command]
-pub fn complete_device_flow() -> Result<DeviceFlowPollPublicResult, ConnectionCommandError> {
-    ConnectionService::production().complete_device_flow()
+pub async fn complete_device_flow() -> Result<DeviceFlowPollPublicResult, ConnectionCommandError> {
+    run_connection_operation(|| ConnectionService::production().complete_device_flow()).await
 }
 
 #[tauri::command]
-pub fn set_public_client_id(
+pub async fn set_public_client_id(
     request: ChangePublicClientIdRequest,
 ) -> Result<ChangePublicClientIdResult, ConnectionCommandError> {
-    ConnectionService::production().change_public_client_id(request)
+    run_connection_operation(move || {
+        ConnectionService::production().change_public_client_id(request)
+    })
+    .await
 }
 
 #[cfg(test)]
