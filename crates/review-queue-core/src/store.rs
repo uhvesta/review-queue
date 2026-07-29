@@ -3864,6 +3864,52 @@ mod tests {
     }
 
     #[test]
+    fn stale_conversation_options_are_preserved_until_an_explicit_session_replaces_them() {
+        let mut store = Store::in_memory().unwrap();
+        let round = match store.submit(submission("stale-options", "a")).unwrap() {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
+        };
+        let stale = DiscoveredSessionOption {
+            key: "context_window".into(),
+            label: "Context window".into(),
+            kind: SessionOptionKind::Select,
+            values: vec!["managed_80".into()],
+            selected: Some("managed_80".into()),
+            supported: true,
+            unavailable_reason: None,
+        };
+        let chat = store
+            .active_conversation(&round.id, vec![stale.clone()])
+            .unwrap();
+        let unavailable = DiscoveredSessionOption {
+            key: "context_window".into(),
+            label: "Context window".into(),
+            kind: SessionOptionKind::Select,
+            values: vec![],
+            selected: None,
+            supported: false,
+            unavailable_reason: Some(
+                "The installed SDK does not expose a discoverable context-window catalog.".into(),
+            ),
+        };
+
+        let reopened = store
+            .active_conversation(&round.id, vec![unavailable.clone()])
+            .unwrap();
+        assert_eq!(reopened.options, vec![stale]);
+
+        let reset = store
+            .mark_conversation_provider_started(
+                &chat.id,
+                "Copilot via existing CLI sign-in",
+                std::slice::from_ref(&unavailable),
+            )
+            .unwrap();
+        assert_eq!(reset.options, vec![unavailable]);
+    }
+
+    #[test]
     fn completed_or_superseded_round_rejects_new_prompts() {
         let mut store = Store::in_memory().unwrap();
         let round = match store.submit(submission("old", "a")).unwrap() {

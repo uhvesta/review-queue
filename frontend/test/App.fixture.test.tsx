@@ -607,4 +607,61 @@ describe("diff anchor selection", () => {
       end_line: expect.any(Number),
     });
   });
+
+  it("discloses a stale Copilot option and only drops it after an explicit zero-prompt reset", async () => {
+    let startSession = vi.fn();
+    let sendPrompt = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      startSession = vi.fn((...args: Parameters<typeof api.startCopilotSession>) =>
+        api.startCopilotSession(...args));
+      sendPrompt = vi.fn((...args: Parameters<typeof api.sendCopilotPrompt>) =>
+        api.sendCopilotPrompt(...args));
+      return {
+        ...api,
+        activeConversation: async (...args: Parameters<typeof api.activeConversation>) => {
+          const conversation = await api.activeConversation(...args);
+          return {
+            ...conversation,
+            options: [
+              ...conversation.options.filter((option) => option.key !== "context_window"),
+              {
+                key: "context_window",
+                label: "Context window",
+                kind: "select" as const,
+                values: ["managed_80"],
+                selected: "managed_80",
+                supported: true,
+                unavailable_reason: null,
+              },
+            ],
+          };
+        },
+        startCopilotSession: startSession,
+        sendCopilotPrompt: sendPrompt,
+      };
+    });
+
+    await openReview("Add retry backoff to sync worker");
+    await openChat();
+
+    const warning = await screen.findByRole("alert");
+    expect(within(warning).getByText("Unavailable saved Copilot options")).toBeVisible();
+    expect(within(warning).getByText("context_window=managed_80")).toBeVisible();
+    expect(within(warning).getByText(/will not be sent/i)).toBeVisible();
+    expect(sendPrompt).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "Reset unavailable options and start Copilot",
+    }));
+
+    await waitFor(() => expect(startSession).toHaveBeenCalledTimes(1));
+    expect(startSession.mock.calls[0][2]).not.toHaveProperty("context_window");
+    expect(sendPrompt).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByRole("button", {
+        name: "Reset unavailable options and start Copilot",
+      })).not.toBeInTheDocument();
+    });
+  });
 });

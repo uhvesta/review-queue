@@ -794,7 +794,7 @@ fn selected_options(
             return Err(conflict(
                 "copilot_option_value_unavailable",
                 "The selected Copilot option is not available.",
-                "Choose a value advertised by the current Copilot CLI.",
+                "Explicitly reset unavailable saved options, then start with values advertised by the current Copilot CLI.",
             ));
         }
         selected.insert(key, value);
@@ -1755,6 +1755,28 @@ mod tests {
             ])),
             Err(CopilotTransportError::ProviderRejected)
         );
+    }
+
+    #[test]
+    fn stale_persisted_option_requires_explicit_reset_before_session_start() {
+        let capabilities = AcpCliTransport::discovered_capabilities(&[
+            github_copilot_sdk::Model {
+                id: "sdk-model".into(),
+                name: "SDK model".into(),
+                ..Default::default()
+            },
+        ]);
+        let stale = selected_options(
+            &capabilities,
+            BTreeMap::from([("context_window".into(), "managed_80".into())]),
+        )
+        .unwrap_err();
+        assert_eq!(stale.code, "copilot_option_value_unavailable");
+        assert!(stale.next_step.contains("Explicitly reset"));
+
+        let reset = selected_options(&capabilities, BTreeMap::new()).unwrap();
+        assert_eq!(reset.get("model").map(String::as_str), Some("sdk-model"));
+        assert!(!reset.contains_key("context_window"));
     }
 
     #[test]

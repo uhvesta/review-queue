@@ -1032,6 +1032,28 @@ button:disabled {
   border-radius: 4px;
   font-size: 11px;
 }
+.option-unavailable {
+  display: block;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 20px;
+}
+.stale-options {
+  margin: 10px 14px 0;
+  padding: 10px;
+  border: 1px solid #9b7a45;
+  border-left: 3px solid #d29922;
+  border-radius: 6px;
+  background: #2a2418;
+  color: #eacb88;
+  font-size: 11px;
+}
+.stale-options p {
+  margin: 5px 0;
+}
+.stale-options code {
+  color: #ffe3a3;
+}
 .messages {
   padding: 14px;
   overflow: auto;

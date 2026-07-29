@@ -90,6 +90,7 @@ import type {
   MachineEndpoint,
   MachineIndexResult,
   MachineStatus,
+  CopilotCapabilities,
   CopilotCapabilityGroup,
   SessionOption,
   GithubMaterializedFile,
@@ -1962,6 +1963,7 @@ function ChatSheet({
   const cancelledTurnIds = useRef(new Set<string>());
   const [starting, setStarting] = useState(false);
   const [authLabel, setAuthLabel] = useState("");
+  const [capabilities, setCapabilities] = useState<CopilotCapabilities | null>(null);
 
   useEffect(() => {
     if (!shown || turns.some((turn) => turn.conversation_id !== shown.id)) return;
@@ -1984,6 +1986,7 @@ function ChatSheet({
         setActive(current);
         setPrevious(history);
         setOptionValues({});
+        setCapabilities(null);
         setAuthLabel(current?.provider_session_label ?? "");
         const transcript = current ?? history[0] ?? null;
         if (transcript) await loadConversation(transcript);
@@ -2002,6 +2005,7 @@ function ChatSheet({
       ]);
       setActive(current);
       setPrevious(history);
+      setCapabilities(capabilities);
       setAuthLabel(current.provider_session_label ?? "");
       setOptionValues(Object.fromEntries(current.options.filter((option) => option.selected).map((option) => [option.key, option.selected as string])));
       await loadConversation(current);
@@ -2033,12 +2037,12 @@ function ChatSheet({
     }
   };
 
-  const startSession = async () => {
+  const startSession = async (requestedOptions = optionValues) => {
     if (!active) return;
     setStarting(true);
     setError(null);
     try {
-      const session = await startCopilotSession(round.id, active.id, optionValues);
+      const session = await startCopilotSession(round.id, active.id, requestedOptions);
       setSessionId(session.sessionId);
       setOptionValues(session.activeOptions);
       setAuthLabel(`${session.authSource === "existing_cli_sign_in_read_only" ? "existing Copilot CLI sign-in" : "app OAuth"}${session.account ? ` · ${session.account}` : ""}`);
@@ -2136,6 +2140,16 @@ function ChatSheet({
 
   const providerLost = !sessionId && turns.length > 0 && shown?.id === active?.id;
   const historyOnly = shown?.id !== active?.id || shown?.session_state === "history_only" || providerLost || readOnly;
+  const currentConversationShown = shown?.id === active?.id;
+  const displayedOptions = currentConversationShown && capabilities
+    ? capabilitySessionOptions(capabilities.option_groups)
+    : shown?.options ?? [];
+  const unavailableSelections = !sessionId && currentConversationShown && capabilities
+    ? unavailableCopilotOptionSelections(capabilities.option_groups, optionValues)
+    : [];
+  const availableOptionValues = capabilities
+    ? availableCopilotOptionValues(capabilities.option_groups, optionValues)
+    : optionValues;
   const inputReason = readOnly
     ? readOnlyReason
     : historyOnly
@@ -2184,48 +2198,74 @@ function ChatSheet({
           Clear chat
         </button>
         {!sessionId && !historyOnly && (
-          <button className="primary" disabled={starting || !active} onClick={() => void startSession()}>
-            {starting ? "Starting…" : "Start Copilot"}
+          <button
+            className="primary"
+            disabled={starting || !active}
+            onClick={() => void startSession(unavailableSelections.length ? availableOptionValues : optionValues)}
+          >
+            {starting
+              ? "Starting…"
+              : unavailableSelections.length
+                ? "Reset unavailable options and start Copilot"
+                : "Start Copilot"}
           </button>
         )}
       </div>
-      {shown?.options.length ? (
+      {unavailableSelections.length > 0 && (
+        <div className="stale-options" role="alert">
+          <b>Unavailable saved Copilot options</b>
+          {unavailableSelections.map((selection) => (
+            <p key={selection.key}>
+              <code>{selection.key}={selection.value}</code> · {selection.reason}
+            </p>
+          ))}
+          <small>
+            These saved values will not be sent. Resetting starts with the current advertised
+            options and sends zero prompts.
+          </small>
+        </div>
+      )}
+      {displayedOptions.length ? (
         <div className="options">
-          {shown.options.map((option) => (
+          {displayedOptions.map((option) => (
             <label key={option.key}>
               {option.label}
-              <select
-                disabled={!option.supported || historyOnly}
-                value={optionValues[option.key] ?? option.selected ?? ""}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  const conversationId = active?.id;
-                  if (!conversationId) return;
-                  if (!sessionId) {
-                    setOptionValues((current) => ({ ...current, [option.key]: value }));
-                    return;
-                  }
-                  void changeCopilotOption(round.id, conversationId, option.key, value)
-                    .then((result) => {
-                      if (result.effect === "requires_fresh_session") {
-                        setOptionValues((current) => ({ ...current, [option.key]: value }));
-                        setError({
-                          code: "copilot_fresh_session_required",
-                          message: `${option.label} requires a fresh Copilot session.`,
-                          data_safety: "The current session and transcript were preserved.",
-                          next_step: "Choose Clear chat, then select the option before starting the new session.",
-                        });
-                      } else {
-                        setOptionValues(result.active_option_stamp);
-                      }
-                    })
-                    .catch((problem) => setError(toCommandError(problem)));
-                }}
-              >
-                {(option.values.length ? option.values : [option.selected ?? ""]).map((value) => (
-                  <option key={value}>{value}</option>
-                ))}
-              </select>
+              {option.supported ? (
+                <select
+                  disabled={historyOnly}
+                  value={optionValues[option.key] ?? option.selected ?? ""}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    const conversationId = active?.id;
+                    if (!conversationId) return;
+                    if (!sessionId) {
+                      setOptionValues((current) => ({ ...current, [option.key]: value }));
+                      return;
+                    }
+                    void changeCopilotOption(round.id, conversationId, option.key, value)
+                      .then((result) => {
+                        if (result.effect === "requires_fresh_session") {
+                          setOptionValues((current) => ({ ...current, [option.key]: value }));
+                          setError({
+                            code: "copilot_fresh_session_required",
+                            message: `${option.label} requires a fresh Copilot session.`,
+                            data_safety: "The current session and transcript were preserved.",
+                            next_step: "Choose Clear chat, then select the option before starting the new session.",
+                          });
+                        } else {
+                          setOptionValues(result.active_option_stamp);
+                        }
+                      })
+                      .catch((problem) => setError(toCommandError(problem)));
+                  }}
+                >
+                  {option.values.map((value) => (
+                    <option key={value}>{value}</option>
+                  ))}
+                </select>
+              ) : (
+                <span className="option-unavailable">Unavailable</span>
+              )}
               {!option.supported && <small>{option.unavailable_reason}</small>}
             </label>
           ))}
@@ -4064,6 +4104,51 @@ function capabilitySessionOptions(groups: CopilotCapabilityGroup[]): SessionOpti
     supported: group.supported,
     unavailable_reason: group.unsupported_reason ?? null,
   }));
+}
+
+interface UnavailableCopilotOptionSelection {
+  key: string;
+  value: string;
+  reason: string;
+}
+
+function unavailableCopilotOptionSelections(
+  groups: CopilotCapabilityGroup[],
+  requested: Record<string, string>,
+): UnavailableCopilotOptionSelection[] {
+  return Object.entries(requested).flatMap(([key, value]) => {
+    const group = groups.find((candidate) => candidate.key === key);
+    if (!group) {
+      return [{ key, value, reason: "The current Copilot runtime did not advertise this option." }];
+    }
+    if (!group.supported) {
+      return [{
+        key,
+        value,
+        reason: group.unsupported_reason ?? "The current Copilot runtime reports this option as unsupported.",
+      }];
+    }
+    if (!group.choices.some((choice) => choice.value === value)) {
+      return [{
+        key,
+        value,
+        reason: `The current Copilot runtime did not advertise this ${group.label} value.`,
+      }];
+    }
+    return [];
+  });
+}
+
+function availableCopilotOptionValues(
+  groups: CopilotCapabilityGroup[],
+  requested: Record<string, string>,
+): Record<string, string> {
+  const unavailable = new Set(
+    unavailableCopilotOptionSelections(groups, requested).map((selection) => selection.key),
+  );
+  return Object.fromEntries(
+    Object.entries(requested).filter(([key]) => !unavailable.has(key)),
+  );
 }
 
 function toCommandError(problem: unknown): CommandError {

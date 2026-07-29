@@ -42,6 +42,16 @@ These unsupported groups remain explicit capability metadata with an
 explanation. A future SDK/CLI discovery RPC can populate them without changing
 the open-ended option-group contract.
 
+Conversation history retains the exact option stamp that was valid when it was
+recorded. If a current, empty conversation also predates this discovery
+contract, the UI compares its saved selections with fresh capability metadata,
+shows every unavailable key/value and the provider reason, and refuses to pass
+those values through silently. The user can explicitly reset only the
+unavailable selections and start with the runtime-advertised defaults. That
+action creates a session but sends zero prompts; a successful start replaces
+the current conversation's saved option metadata while archived transcripts
+remain unchanged.
+
 For an existing Copilot CLI sign-in, the desktop checks only installed CLI and
 Keychain metadata before selecting the SDK's official logged-in-user path. It
 never reads, displays, or transmits the existing CLI credential. The SDK/CLI
