@@ -106,6 +106,41 @@ if [[ "$channel" == "stable" && "$allow_dirty" -eq 1 ]]; then
   exit 64
 fi
 
+dmg_name="Review-Queue-${version}-universal-${channel}.dmg"
+zip_name="Review-Queue-${version}-universal-${channel}.app.zip"
+updater_name="Review-Queue-${version}-universal-${channel}.app.tar.gz"
+updater_signature_name="${updater_name}.sig"
+checksums_name="SHA256SUMS"
+sbom_name="Review-Queue-${version}.cdx.json"
+notarization_name="Review-Queue-${version}.notarization.json"
+release_output_names=(
+  "$dmg_name"
+  "$zip_name"
+  "$updater_name"
+  "$updater_signature_name"
+  "latest.json"
+  "$checksums_name"
+  "$sbom_name"
+  "$notarization_name"
+)
+
+ensure_release_output_is_new() {
+  if [[ -L "$output_dir" || ( -e "$output_dir" && ! -d "$output_dir" ) ]]; then
+    echo "release output path is not a directory: $output_dir" >&2
+    exit 1
+  fi
+  for artifact_name in "${release_output_names[@]}"; do
+    if [[ -e "$output_dir/$artifact_name" || -L "$output_dir/$artifact_name" ]]; then
+      echo "release build refused: refusing to overwrite existing artifact: $output_dir/$artifact_name" >&2
+      exit 1
+    fi
+  done
+}
+
+# A rerun must never erase an earlier candidate, notarization record, or
+# updater manifest. Check before expensive signing and again before writing.
+ensure_release_output_is_new
+
 if [[ "$allow_dirty" -eq 0 && -n "$(git -C "$repo_root" status --porcelain)" ]]; then
   echo "release build refused: the Git worktree is dirty (use --allow-dirty only for an intentional local candidate)" >&2
   exit 1
@@ -266,9 +301,7 @@ xcrun stapler staple "$app_path"
 xcrun stapler validate "$app_path"
 
 mkdir -p "$output_dir"
-dmg_name="Review-Queue-${version}-universal-${channel}.dmg"
-zip_name="Review-Queue-${version}-universal-${channel}.app.zip"
-updater_name="Review-Queue-${version}-universal-${channel}.app.tar.gz"
+ensure_release_output_is_new
 dmg_path="$output_dir/$dmg_name"
 zip_path="$output_dir/$zip_name"
 updater_path="$output_dir/$updater_name"
@@ -282,19 +315,9 @@ staging_dir="$release_tmp/dmg"
 mkdir -p "$staging_dir"
 ditto "$app_path" "$staging_dir/Review Queue.app"
 ln -s /Applications "$staging_dir/Applications"
-rm -f \
-  "$dmg_path" \
-  "$zip_path" \
-  "$updater_path" \
-  "$updater_signature_path" \
-  "$latest_json_path" \
-  "$checksums_path" \
-  "$sbom_path" \
-  "$notarization_path"
 hdiutil create \
   -volname "Review Queue" \
   -srcfolder "$staging_dir" \
-  -ov \
   -format UDZO \
   "$dmg_path"
 codesign --force --timestamp --sign "$identity" "$dmg_path"

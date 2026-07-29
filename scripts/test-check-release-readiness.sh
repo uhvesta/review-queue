@@ -217,4 +217,27 @@ GIT_STUB_MODE=mismatched-head assert_release_fails_with \
   "stable release tag v0.1.0 does not point to HEAD" \
   --release-tag v0.1.0
 
+# A release rerun must not silently delete an earlier artifact before signing
+# credentials or Git state are consulted.
+occupied_output="$release_fixture/occupied-output"
+mkdir -p "$occupied_output"
+: > "$occupied_output/Review-Queue-0.1.0-universal-candidate.dmg"
+if output="$(
+  "$release_fixture/scripts/release-macos.sh" \
+    --profile unused \
+    --version 0.1.0 \
+    --channel candidate \
+    --release-tag candidate-test \
+    --output "$occupied_output" \
+    --allow-dirty 2>&1
+)"; then
+  fail "release entrypoint overwrote an existing artifact"
+fi
+[[ "$output" == *"refusing to overwrite existing artifact"* ]] || {
+  printf '%s\n' "$output" >&2
+  fail "release entrypoint did not reject the existing artifact"
+}
+[[ -f "$occupied_output/Review-Queue-0.1.0-universal-candidate.dmg" ]] ||
+  fail "release entrypoint removed the existing artifact"
+
 echo "check-release-readiness fixture tests passed"
