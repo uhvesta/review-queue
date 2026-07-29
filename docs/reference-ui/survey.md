@@ -45,6 +45,22 @@ Patterns deliberately rejected by the clean-slate specification:
 | [Continue chat](https://docs.continue.dev/ide-extensions/chat/how-it-works) | Continue official documentation; Apache-2.0 project | Selected-code context, streamed responses, explicit new-session action, visible model selection | Anchored `/ask`, streamed durable turns, Clear chat, capability-discovered options |
 | [Aider](https://aider.chat/docs/usage/commands.html) | Aider official documentation; Apache-2.0 project | Clear separation between ask and edit modes, interrupt/cancel semantics, explicit model switching and chat clearing | `/ask` never mutates code, visible cancel/retry, honest per-turn option stamps |
 | [opencode](https://opencode.ai/docs/) | Official opencode documentation; MIT project | Session-oriented chat and explicit model/provider selection | Previous chats, history-only transcripts, session and auth source in the chat header |
+| [difit](https://github.com/yoshiko-pg/difit) (as vendored in the archived `cmux-localreview` project at `vendor/difit`, commit `bc9ebc360c30a3020c14f1b733ceb82c1b665e48`) | yoshiko-pg, MIT — `Copyright (c) 2025 @yoshiko-pg/difit`, see `vendor/difit/LICENSE` in the archived repo | GitHub-dark color palette (exact token values), toolbar layout order (identity, sidebar toggle, settings, split/unified, viewed progress, revision identity), file-list density (filter, per-file +/-, status glyphs, Viewed toggle), sticky per-file diff header, distinct blue-accented `/ask` card vs. green formal-comment card, 4em line-number gutter and dense code-row geometry | Review Queue reviewer toolbar, file list, diff header/row styling, and Queue Home card density (`frontend/src/styles.css` `--color-*` tokens, `frontend/src/App.tsx` toolbar/file-list/diff-head markup) |
+
+Unlike the other rows above, the difit reference contributed exact **token
+values** (hex colors, gutter width) in addition to layout/interaction
+patterns, because the goal for this pass was close visual parity with the
+retained `legacy-reviewer.jpeg`/`legacy-queue-home.jpeg` screenshots (which
+are themselves screenshots of a `cmux-localreview` build using this same
+vendored difit). No difit source file was copied into this repository —
+every line of `frontend/src/App.tsx` and `frontend/src/styles.css` is
+original code written for Review Queue's own component/state model; only
+the numeric color/spacing values and the layout ordering were reproduced by
+hand. difit's MIT license permits copying its code outright, but doing so
+was unnecessary and out of scope here since Review Queue's data model,
+Tauri command boundary, and every interactive component are structurally
+different from difit's — see `frontend/src/api.ts` for the closed set of
+backend calls every restyled control routes through.
 
 ## Resulting interaction rules
 
