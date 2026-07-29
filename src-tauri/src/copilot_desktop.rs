@@ -1569,12 +1569,11 @@ mod tests {
         let frames_before_option = active_adapter.transport().frames.len();
         let completed_option = store.promptable_conversation(&first.id, &first_chat.id);
         if completed_option.is_ok() {
-            active_adapter.change_option("reasoning_effort", "low").unwrap();
+            active_adapter
+                .change_option("reasoning_effort", "low")
+                .unwrap();
         }
-        assert_eq!(
-            completed_option.unwrap_err().error.code,
-            "round_read_only"
-        );
+        assert_eq!(completed_option.unwrap_err().error.code, "round_read_only");
         assert_eq!(
             active_adapter.transport().frames.len(),
             frames_before_option,
