@@ -12,3 +12,7 @@ npm run dev
 ```
 
 `npm run build` type-checks and produces a static build. The UI is isolated under `frontend/` so it can be iterated on independently, but it is not standalone in the sense of having its own data layer — `src/api.ts` is the single, closed set of calls into the Rust/Tauri backend.
+
+### Fixture mode (visual QA only)
+
+`npm run dev:fixture` runs the same UI against `src/api.fixture.ts`, a dev-only, hand-written, in-memory fixture backend with the same function names and signatures as `src/api.ts`, covering multiple review rounds, a multi-repository diff, formal comments, an `/ask` chat history, and a connected machine. It is useful for visually QA'ing layout and styling changes (e.g. against retained legacy screenshots) or driving interaction states in a plain browser when a real Tauri backend isn't available. It is **never** used by the production Tauri build or by plain `npm run dev`/`npm run build`: the Vite config only wires the `./api` import to the fixture module when explicitly run with `--mode fixture`, and `src/api.ts`/`src/App.tsx` are untouched by it.
