@@ -1626,13 +1626,13 @@ function Reviewer({
           <span>Files</span>
         </button>
         <button className="icon-button" aria-label="Settings" onClick={onSettings}>⚙</button>
-        <div className="view-modes toolbar-view-modes" role="tablist" aria-label="Diff view" onKeyDown={navigateDiffModeTabs}>
+        <div className="view-modes toolbar-view-modes" role="tablist" aria-label="Diff layout" onKeyDown={navigateDiffModeTabs}>
           {(["unified", "split"] as const).map((mode) => (
             <button
               id={`diff-view-${mode}`}
               role="tab"
-              className={viewMode === mode ? "selected-mode" : ""}
-              aria-selected={viewMode === mode}
+              className={viewMode === mode || (viewMode === "file" && mode === "unified") ? "selected-mode" : ""}
+              aria-selected={viewMode === mode || (viewMode === "file" && mode === "unified")}
               aria-controls="review-diff-panel"
               tabIndex={viewMode === mode || (viewMode === "file" && mode === "unified") ? 0 : -1}
               key={mode}
@@ -2878,6 +2878,10 @@ function DiffHunkView({
     start: number;
     end: number;
   } | null>(null);
+  const [keyboardLine, setKeyboardLine] = useState<{
+    side: "LEFT" | "RIGHT";
+    index: number;
+  } | null>(null);
   let oldLine = hunk.old_start;
   let newLine = hunk.new_start;
   const numberedLines = hunk.lines.map((line, index) => ({
@@ -3003,6 +3007,44 @@ function DiffHunkView({
         }
       : { side, start: index, end: index });
   };
+  const splitRows = layout === "split"
+    ? pairSplitLines(hunk.lines, hunk.old_start, hunk.new_start)
+    : [];
+  const initialSplitTarget = defaultSide === "RIGHT"
+    ? splitRows.find((row) => row.right)?.right ?? splitRows.find((row) => row.left)?.left ?? null
+    : splitRows.find((row) => row.left)?.left ?? splitRows.find((row) => row.right)?.right ?? null;
+  const initialSplitSide = splitRows.some((row) => row.right === initialSplitTarget)
+    ? "RIGHT"
+    : "LEFT";
+  const isKeyboardTabStop = (
+    side: "LEFT" | "RIGHT",
+    index: number,
+    initial: boolean,
+  ) => keyboardLine
+    ? keyboardLine.side === side && keyboardLine.index === index
+    : selection
+      ? selection.side === side && selection.start === index
+      : initial;
+  const moveKeyboardLine = (
+    event: React.KeyboardEvent<HTMLDivElement>,
+  ) => {
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return false;
+    const lines = Array.from(
+      event.currentTarget.closest(".diff-hunk")?.querySelectorAll<HTMLElement>("[data-selectable-diff-line='true']")
+        ?? [],
+    );
+    const current = lines.indexOf(event.currentTarget);
+    const delta = event.key === "ArrowUp" || event.key === "ArrowLeft" ? -1 : 1;
+    const next = lines[Math.max(0, Math.min(current + delta, lines.length - 1))];
+    if (!next || next === event.currentTarget) return true;
+    event.preventDefault();
+    setKeyboardLine({
+      side: next.dataset.diffSide as "LEFT" | "RIGHT",
+      index: Number(next.dataset.diffIndex),
+    });
+    next.focus();
+    return true;
+  };
   const splitCell = (
     side: "LEFT" | "RIGHT",
     entry: ReturnType<typeof pairSplitLines>[number]["left"],
@@ -3020,10 +3062,21 @@ function DiffHunkView({
       <div
         className={`code-line split-diff-cell ${entry.line.type} ${selected ? "selected-code-line" : ""}`}
         role={sideAvailable ? "button" : undefined}
-        tabIndex={sideAvailable ? 0 : undefined}
+        tabIndex={sideAvailable
+          ? (isKeyboardTabStop(
+              side,
+              entry.index,
+              side === initialSplitSide && entry === initialSplitTarget,
+            ) ? 0 : -1)
+          : undefined}
+        data-selectable-diff-line={sideAvailable ? "true" : undefined}
+        data-diff-side={sideAvailable ? side : undefined}
+        data-diff-index={sideAvailable ? entry.index : undefined}
         aria-label={sideAvailable ? `Select ${sidePath} ${side.toLowerCase()} line ${entry.number}` : undefined}
+        onFocus={sideAvailable ? () => setKeyboardLine({ side, index: entry.index }) : undefined}
         onClick={sideAvailable ? (event) => selectLine(side, entry.index, event.shiftKey) : undefined}
         onKeyDown={sideAvailable ? (event) => {
+          if (moveKeyboardLine(event)) return;
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             selectLine(side, entry.index, event.shiftKey);
@@ -3068,12 +3121,17 @@ function DiffHunkView({
                 <div
                   className={`code-line ${line.type} ${selected ? "selected-code-line" : ""}`}
                   role="button"
-                  tabIndex={0}
+                  tabIndex={isKeyboardTabStop(lineSide, index, index === 0) ? 0 : -1}
+                  data-selectable-diff-line="true"
+                  data-diff-side={lineSide}
+                  data-diff-index={index}
                   aria-label={`Select ${linePath} ${lineSide.toLowerCase()} line ${lineSide === "RIGHT" ? newNumber ?? oldNumber : oldNumber ?? newNumber}`}
+                  onFocus={() => setKeyboardLine({ side: lineSide, index })}
                   onClick={(event) => {
                     selectLine(lineSide, index, event.shiftKey);
                   }}
                   onKeyDown={(event) => {
+                    if (moveKeyboardLine(event)) return;
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
                       selectLine(lineSide, index, event.shiftKey);
@@ -3088,7 +3146,7 @@ function DiffHunkView({
               </Fragment>
             );
           })
-        : pairSplitLines(hunk.lines, hunk.old_start, hunk.new_start).map((row, index) => (
+        : splitRows.map((row, index) => (
             <Fragment key={index}>
               <div className="split-diff-row">
                 {splitCell("LEFT", row.left)}

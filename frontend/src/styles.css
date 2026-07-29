@@ -7,6 +7,7 @@
   --color-text-secondary: #8b949e;
   --color-text-muted: #6e7681;
   --color-accent: #238636;
+  --color-success: #2ea043;
   --color-success-text: #56d364;
   --color-danger: #da3633;
   --color-danger-text: #ff7b72;
@@ -1579,11 +1580,12 @@ button:disabled {
 }
 .split-diff-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr);
+  min-width: 720px;
 }
 .split-diff-cell {
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 .split-diff-row > .split-diff-cell:first-child {
   border-right: 1px solid var(--color-border);

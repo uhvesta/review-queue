@@ -521,6 +521,25 @@ describe("diff anchor selection", () => {
     await waitFor(() => expect(split).toHaveAttribute("aria-selected", "true"));
     expect(split).toHaveAttribute("tabindex", "0");
     expect(document.activeElement).toBe(split);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Full file" })[0]);
+    await waitFor(() => expect(unified).toHaveAttribute("aria-selected", "true"));
+    expect(split).toHaveAttribute("aria-selected", "false");
+  });
+
+  it("uses one keyboard tab stop per hunk and arrow-key navigation between lines", async () => {
+    await openReview("Add retry backoff to sync worker");
+
+    const hunk = document.querySelector<HTMLElement>(".diff-hunk");
+    if (!hunk) throw new Error("The fixture diff hunk was not rendered.");
+    const lines = within(hunk).getAllByRole("button", { name: /select .* line/i });
+    expect(lines.filter((line) => line.getAttribute("tabindex") === "0")).toHaveLength(1);
+
+    lines[0].focus();
+    fireEvent.keyDown(lines[0], { key: "ArrowDown" });
+    expect(document.activeElement).toBe(lines[1]);
+    expect(lines[1]).toHaveAttribute("tabindex", "0");
+    expect(lines[0]).toHaveAttribute("tabindex", "-1");
   });
 
   it("navigates hunks across the entire continuous multi-file review", async () => {
