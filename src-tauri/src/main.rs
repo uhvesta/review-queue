@@ -61,6 +61,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::application_version,
             commands::discover_local,
             commands::open_keychain_access,
             commands::preflight_local,

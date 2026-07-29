@@ -19,9 +19,14 @@ use review_queue_core::{
     store::{DeliveryHistoryEntry, Store, SubmissionResult},
 };
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 pub struct AppState(pub Arc<Mutex<Store>>);
+
+#[tauri::command]
+pub fn application_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
 
 #[derive(Debug, Serialize)]
 pub struct CommandError {
