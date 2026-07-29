@@ -167,8 +167,37 @@ Retained evidence:
 - `difit-native-reviewer.png`
 - `difit-native-reviewer-560.png`
 
-The frontend fixture suite also passes 9/9 tests, including interrupted
-`/ask` retry into a fresh explicitly started chat, cancellation versus a late
-poll result, machine failures/cached rounds, responsive controls, and
-repository-tree behavior. Browser-fixture screenshots at 1280px, 1024px, and
-560px are retained alongside the native images.
+That retained packaged-app run used the then-current 9/9 fixture suite. The
+current suite is 22/22 and additionally covers refreshed-round state
+isolation, cached-machine rematerialization, PR-intake confirmation, global
+hunk navigation, inline conversations, and keyboard diff navigation.
+Browser-fixture screenshots at 1280px, 1024px, and 560px are retained
+alongside the native images.
+
+## Current-tree native difit and Keychain responsiveness follow-up
+
+The current tree was rebuilt as an arm64 debug `.app`, deep ad-hoc signed, and
+launched against the retained native database. This remains a no-op UI check,
+not production release evidence. The first launch exposed that a Keychain ACL
+wait could hold a synchronous connection-health command on the Tauri main
+thread. Credential and connection operations now run on Tauri's blocking
+runtime: the Keychain remains the only credential store, but an ACL wait no
+longer freezes Queue Home or the reviewer.
+
+The rebuilt app became accessibility-responsive in about three seconds while
+the ad-hoc credential check remained unresolved. It reopened the persisted
+two-repository `release-acceptance` round and verified:
+
+- the current compact Queue Home and source rail;
+- continuous multi-file review with inline formal and `/ask` conversations;
+- Unified/Split roving tabs and global cross-file hunk navigation;
+- Split rendering with an explicit horizontally scrollable minimum width;
+- Full file mode while Unified remains the selected layout tab; and
+- formal decisions and Chat remaining visually separate from inline `/ask`.
+
+Retained current-tree screenshots:
+
+- `difit-current-queue.jpeg`
+- `difit-current-reviewer.jpeg`
+- `difit-current-split.jpeg`
+- `difit-current-full-file.jpeg`
