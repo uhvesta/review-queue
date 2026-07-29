@@ -131,10 +131,17 @@ release evidence remains historical.
     headers. Selecting a path in the tree expands and scrolls to that file
     without changing immutable snapshot, hunk-action, or Viewed semantics.
 
-A hunk `/ask` click still records the pending anchor without automatically
-opening a collapsed Chat pane. The labelled Chat control makes the pending
-anchor reachable at every supported width; automatically opening Chat remains
-an optional follow-up rather than a correctness gate.
+A hunk `/ask` click records the pending anchor and opens Chat, including when
+the responsive sheet was collapsed. The labelled Chat control remains
+available at every supported width so the anchored question can be dismissed
+or reopened without losing context.
+
+14. **Viewport-safe dialogs and hidden panes:** generic dialogs now cap their
+    height to the current viewport, scroll internally, and retain a sticky
+    close header, so the 560px window minimum does not strand footer actions.
+    Collapsed Files is removed from rendering and the accessibility tree at
+    every width. Queue-card keyboard reorder shortcuts run only while the card
+    surface itself is focused, not from nested review/action controls.
 
 ### Second pass: fixture harness + live browser verification
 
@@ -229,7 +236,7 @@ pass. `npm run build` re-verified clean after each fix.
 This section separates the retained historical migration checks from checks
 run against the **current working tree**.
 
-- `cd frontend && npm test` passed: 2 files, 22 tests.
+- `cd frontend && npm test` passed: 2 files, 33 tests.
 - `cd frontend && npm run build` and `npx vite build --mode fixture` passed.
 - The in-app browser fixture passed at 1280px, 1024px, and 560px. Files and
   Chat remained reachable, continuous diffs rendered at non-zero width, and
@@ -265,7 +272,7 @@ configured 560px minimum; production notarization remains a separate gate.
 | --- | --- |
 | 1280px | Queue Home actions remain available; reviewer shows Files, diff, and Chat; select/filter/collapse a nested file-tree path; switch Unified, Split, and Full file; mark a file Viewed; open and close Settings with keyboard focus returning to its trigger. |
 | 1024px | Open a review with Chat initially collapsed; use the labelled Chat control to open and close it, confirm `aria-expanded` follows state, then verify an `/ask` anchor is visible after opening Chat. Confirm Files remains selectable and no pane/action is clipped. |
-| 560px | Start with Files collapsed; use Open files to reveal the file tree, select a different file, and close it again. Open Chat, exercise the wrapping decision actions, and verify both panes/actions remain reachable by keyboard without horizontal clipping. |
+| 560px | Start with Files collapsed; use Open files to reveal the file tree, select a different file, and close it again. Open Chat, exercise the wrapping decision actions, open a long generic dialog and reach its footer by scrolling, and verify panes/actions remain keyboard-reachable without horizontal clipping. |
 | Packaged app | Open wide, drag to the configured 560px minimum, reopen the persisted multi-repository round, and perform a no-op review (no Submit/Publish). This confirms Tauri window behavior without mutating source or remote state. |
 
 ## Historical behavioral regressions checked
@@ -279,8 +286,9 @@ configured 560px minimum; production notarization remains a separate gate.
   diff-header button call the same handler) rather than risking two paths
   drifting apart.
 - The original migration record reports focus trapping, Escape, and focus
-  restore across nine dialogs/drawers. This follow-up re-exercised only the
-  Settings dialog focus return; it did not rerun that full historical matrix.
+  restore across nine dialogs/drawers. This follow-up re-exercised Settings
+  focus return plus the long Submit dialog's 560px scroll and focus wrap; it
+  did not rerun that full historical matrix.
 - Repo-qualified identity (`fileKey(repository_id, path)`) preserved in every
   touched key/callback — no multi-repo filename collisions introduced.
 - No new `invoke()` calls, no new credential handling, no lifecycle/decision/

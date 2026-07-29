@@ -5,6 +5,7 @@ import {
   approveRemote,
   clearCopilotChat,
   cancelDeviceFlow,
+  cachedGithubRound,
   completeDeviceFlow,
   copilotCapabilities,
   completeRound,
@@ -116,6 +117,7 @@ type ReviewerRecovery =
   | { kind: "load_inline_state" }
   | { kind: "set_viewed"; repositoryId: string; path: string; viewed: boolean }
   | { kind: "load_decision" }
+  | { kind: "load_cached_github" }
   | { kind: "refresh_comments" }
   | { kind: "check_head" }
   | { kind: "prepare_publish" }
@@ -1014,6 +1016,7 @@ function QueueColumn({
             className={`queue-card ${readOnly ? "old-round" : ""}`}
             key={round.id}
             tabIndex={0}
+            aria-keyshortcuts={readOnly ? undefined : "Alt+ArrowUp Alt+ArrowDown Alt+Home Alt+End"}
             aria-label={readOnly ? round.brief.title : `${round.brief.title}. Press Alt+Arrow Up/Down, Alt+Home, or Alt+End to reorder.`}
             onDragOver={(event) => {
               if (draggedId && !readOnly) event.preventDefault();
@@ -1027,11 +1030,16 @@ function QueueColumn({
               setDraggedId(null);
             }}
             onKeyDown={(event) => {
-              if (readOnly || !event.altKey) return;
-              if (event.key === "ArrowUp") onMove(round, Math.max(0, round.rank - 1));
-              if (event.key === "ArrowDown") onMove(round, round.rank + 1);
-              if (event.key === "Home") onMove(round, 0);
-              if (event.key === "End") onMove(round, bottomRank);
+              if (event.target !== event.currentTarget || readOnly || !event.altKey) return;
+              let rank: number;
+              if (event.key === "ArrowUp") rank = Math.max(0, round.rank - 1);
+              else if (event.key === "ArrowDown") rank = round.rank + 1;
+              else if (event.key === "Home") rank = 0;
+              else if (event.key === "End") rank = bottomRank;
+              else return;
+              event.preventDefault();
+              event.stopPropagation();
+              onMove(round, rank);
             }}
           >
             <div className="card-title">
@@ -1191,6 +1199,11 @@ function Reviewer({
   const loadGithubDecision = async () => {
     setGithubDecision(await getRoundDecision(round.id));
   };
+  const loadCachedGithubState = async () => {
+    const cached = await cachedGithubRound(round.id);
+    setImportedComments(cached.imported_comments);
+    setStaleness(cached.last_staleness ?? null);
+  };
   const refreshComments = async () => {
     const result = await refreshGithubComments(round.id);
     setImportedComments(result.imported);
@@ -1239,6 +1252,9 @@ function Reviewer({
         break;
       case "load_decision":
         await runReviewerAction(recovery, loadGithubDecision);
+        break;
+      case "load_cached_github":
+        await runReviewerAction(recovery, loadCachedGithubState);
         break;
       case "refresh_comments":
         await runReviewerAction(recovery, refreshComments, true);
@@ -1334,15 +1350,15 @@ function Reviewer({
         });
     }
     if (hasUpstreamDiscussion) {
-      refreshGithubComments(round.id)
-        .then((result) => {
+      cachedGithubRound(round.id)
+        .then((cached) => {
           if (cancelled) return;
-          setImportedComments(result.imported);
-          setStaleness(result.staleness);
+          setImportedComments(cached.imported_comments);
+          setStaleness(cached.last_staleness ?? null);
         })
         .catch((problem) => {
           if (!cancelled) {
-            setActionFailure({ error: toCommandError(problem), recovery: { kind: "refresh_comments" } });
+            setActionFailure({ error: toCommandError(problem), recovery: { kind: "load_cached_github" } });
           }
         });
     }
@@ -1688,7 +1704,12 @@ function Reviewer({
         <span className="revision-pill" title={`Manifest ${round.manifest_hash}`}>{shortSha(round.manifest_hash)}</span>
       </div>
       <div className={`workspace snapshot-workspace ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${chatOpen ? "chat-open" : "chat-collapsed"}`}>
-        <aside className="files" id="review-files">
+        <aside
+          className="files"
+          id="review-files"
+          hidden={sidebarCollapsed}
+          aria-hidden={sidebarCollapsed}
+        >
           <div className="pane-title">Repositories</div>
           <div className="files-summary">
             <span>{totalFiles} file{totalFiles === 1 ? "" : "s"} changed</span>
@@ -3391,7 +3412,7 @@ function SubmitLocalDialog({
       <section {...dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby="submit-title">
         <header><h2 id="submit-title">Submit local review</h2><button onClick={onClose} aria-label="Close">×</button></header>
         <form className="form" onSubmit={submit}>
-          <label>Workspace path<input value={workspacePath} onChange={(event) => updateWorkspacePath(event.target.value)} required autoFocus /></label>
+          <label>Workspace path<input value={workspacePath} onChange={(event) => updateWorkspacePath(event.target.value)} required autoFocus data-dialog-initial-focus /></label>
           <label>Topic (stable)<input value={topic} onChange={(event) => { setTopic(event.target.value); invalidatePreflight(); }} required /></label>
           <label>Title<input value={brief.title} onChange={(event) => update("title", event.target.value)} required /></label>
           <label>What<textarea value={brief.what} onChange={(event) => update("what", event.target.value)} /></label>

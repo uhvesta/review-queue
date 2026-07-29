@@ -27,6 +27,7 @@ import type {
   MachineIndexResult,
   MachineStatus,
   GithubOpenedPullRequest,
+  GithubCachedRound,
   GithubPullRequestIntakePreview,
   GithubPublishAttempt,
   GithubCommentRefreshResult,
@@ -163,6 +164,10 @@ export async function confirmGithubPullRequest(
 
 export async function openGithubPullRequest(roundId: string): Promise<GithubOpenedPullRequest> {
   return invoke("github_open_pull_request", { roundId });
+}
+
+export async function cachedGithubRound(roundId: string): Promise<GithubCachedRound> {
+  return invoke("github_cached_round", { roundId });
 }
 
 export async function refreshGithubComments(roundId: string): Promise<GithubCommentRefreshResult> {

@@ -1,9 +1,11 @@
+import { readFileSync } from "node:fs";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const paginationTitle = "Fix pagination cursor drift across core-api and web-frontend";
 const githubTitle = "Improve error messages for expired tokens";
 const completedTitle = "Rename legacy config module path constant";
+const styles = readFileSync("src/styles.css", "utf8");
 const recoverableError = {
   code: "fixture_recoverable_error",
   message: "The requested review update could not be completed.",
@@ -11,8 +13,9 @@ const recoverableError = {
   next_step: "Retry the explicit review action.",
 };
 
-function setViewport(width: number) {
+function setViewport(width: number, height = 720) {
   Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+  Object.defineProperty(window, "innerHeight", { configurable: true, value: height });
   window.dispatchEvent(new Event("resize"));
 }
 
@@ -89,6 +92,66 @@ describe("fixture-backed reviewer recovery", () => {
     expect(await within(dialog).findByText("Review Queue 0.1.0-fixture")).toBeVisible();
     expect(checkForUpdate).not.toHaveBeenCalled();
     expect(within(dialog).getByRole("button", { name: "Check for updates" })).toBeVisible();
+  });
+
+  it("only reorders from the focused queue-card surface and prevents browser shortcut behavior", async () => {
+    let moveRound = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      moveRound = vi.fn().mockResolvedValue(undefined);
+      return { ...api, moveRound };
+    });
+
+    await renderFixtureApp();
+    const card = screen.getByText(paginationTitle).closest("article");
+    if (!card) throw new Error("The fixture pagination review card was not rendered.");
+    const open = within(card).getByRole("button", { name: "Open review" });
+
+    open.focus();
+    expect(fireEvent.keyDown(open, { key: "ArrowDown", altKey: true })).toBe(true);
+    expect(moveRound).not.toHaveBeenCalled();
+
+    card.focus();
+    expect(fireEvent.keyDown(card, { key: "ArrowDown", altKey: true })).toBe(false);
+    await waitFor(() => expect(moveRound).toHaveBeenCalledTimes(1));
+    expect(moveRound).toHaveBeenCalledWith(expect.any(String), expect.any(Number));
+  });
+
+  it("offers an explicit switch from app OAuth back to the existing CLI sign-in", async () => {
+    let selectExisting = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      const health = await api.connectionStatus();
+      health.copilot = {
+        ...health.copilot,
+        state: "connected",
+        source: "app_owned_oauth",
+        account: "fixture-app-account",
+      };
+      selectExisting = vi.fn().mockResolvedValue({
+        ...health,
+        copilot: {
+          ...health.copilot,
+          source: "existing_copilot_cli",
+          account: health.cli.account,
+        },
+      });
+      return {
+        ...api,
+        connectionStatus: vi.fn().mockResolvedValue(health),
+        selectExistingCopilotCli: selectExisting,
+      };
+    });
+
+    await renderFixtureApp();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const dialog = await screen.findByRole("dialog", { name: "Application settings" });
+    const useExisting = within(dialog).getByRole("button", { name: "Use existing CLI sign-in" });
+
+    fireEvent.click(useExisting);
+
+    await waitFor(() => expect(selectExisting).toHaveBeenCalledTimes(1));
+    expect(within(dialog).getByRole("button", { name: "Stop using existing sign-in" })).toBeVisible();
   });
 
   it("resolves a GitHub PR read-only before an explicit, exact confirmation queues it", async () => {
@@ -172,27 +235,41 @@ describe("fixture-backed reviewer recovery", () => {
     });
   });
 
-  it("keeps the immutable GitHub diff visible when initial comment refresh fails, then retries explicitly", async () => {
+  it("opens cached GitHub review state without an implicit refresh, then refreshes only on click", async () => {
+    let cachedRound = vi.fn();
     let refreshComments = vi.fn();
     vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
       const api = await importOriginal<typeof import("../src/api.fixture")>();
-      refreshComments = vi.fn()
-        .mockRejectedValueOnce(recoverableError)
-        .mockImplementation(api.refreshGithubComments);
-      return { ...api, refreshGithubComments: refreshComments };
+      cachedRound = vi.fn(async (...args: Parameters<typeof api.cachedGithubRound>) => {
+        const cached = await api.cachedGithubRound(...args);
+        return {
+          ...cached,
+          last_staleness: {
+            ...cached.last_staleness!,
+            observed_head_sha: "e".repeat(64),
+          },
+        };
+      });
+      refreshComments = vi.fn(api.refreshGithubComments);
+      return {
+        ...api,
+        cachedGithubRound: cachedRound,
+        refreshGithubComments: refreshComments,
+      };
     });
 
     await openReview(githubTitle);
 
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent(recoverableError.message);
+    await waitFor(() => expect(cachedRound).toHaveBeenCalledTimes(1));
+    expect(refreshComments).not.toHaveBeenCalled();
     expect(screen.getAllByRole("region", { name: "Code diff" }).length).toBeGreaterThan(0);
-    expect(screen.getByRole("button", { name: "Dismiss" })).toBeVisible();
+    expect(screen.getByText(/Nice fix — can we also cover the "revoked" case/i)).toBeVisible();
+    expect(screen.getByText(/Head moved from/i)).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(refreshComments).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
-    expect(screen.getAllByRole("region", { name: "Code diff" }).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh comments" }));
+    await waitFor(() => expect(refreshComments).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText(/Head moved from/i)).not.toBeInTheDocument());
+    expect(screen.getByText(/Nice fix — can we also cover the "revoked" case/i)).toBeVisible();
   });
 
   it("keeps the immutable diff visible and retries a failed Viewed update", async () => {
@@ -546,6 +623,20 @@ describe("fixture-backed reviewer recovery", () => {
       return {
         ...api,
         getRoundDecision: getDecision,
+        cachedGithubRound: async (roundId: string) => {
+          const result = await api.cachedGithubRound(
+            roundId === refreshedRound.id ? oldRoundId : roundId,
+          );
+          return roundId === oldRoundId
+            ? {
+                ...result,
+                last_staleness: {
+                  ...result.last_staleness!,
+                  observed_head_sha: "e".repeat(64),
+                },
+              }
+            : { ...result, round_id: refreshedRound.id };
+        },
         refreshGithubComments: async (roundId: string) => {
           const result = await api.refreshGithubComments(
             roundId === refreshedRound.id ? oldRoundId : roundId,
@@ -709,6 +800,38 @@ describe("fixture-backed reviewer recovery", () => {
 });
 
 describe("responsive reviewer escape hatches", () => {
+  it("keeps a long generic dialog scrollable and keyboard-contained at the 560px minimum", async () => {
+    setViewport(560, 720);
+    await renderFixtureApp();
+    const trigger = screen.getByRole("button", { name: "Submit local" });
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const dialog = await screen.findByRole("dialog", { name: "Submit local review" });
+    const backdrop = dialog.parentElement;
+    if (!backdrop) throw new Error("The submit dialog backdrop was not rendered.");
+    expect(backdrop).toHaveClass("modal-backdrop");
+    const backdropRule = styles.match(/\.modal-backdrop\s*\{[^}]*\}/g)
+      ?.find((rule) => rule.includes("overflow-y"));
+    const modalRule = styles.match(/\.modal\s*\{[^}]*\}/)?.[0];
+    expect(backdropRule).toContain("overflow-y: auto");
+    expect(modalRule).toContain("max-height: calc(100dvh - 40px)");
+    expect(modalRule).toContain("overflow-y: auto");
+
+    const workspace = within(dialog).getByRole("textbox", { name: "Workspace path" });
+    await waitFor(() => expect(document.activeElement).toBe(workspace));
+    expect(within(dialog).getByRole("button", { name: "Preview repositories" })).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "Capture snapshot" })).toBeInTheDocument();
+
+    const close = within(dialog).getByRole("button", { name: "Close" });
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    cancel.focus();
+    fireEvent.keyDown(cancel, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+    fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(cancel);
+  });
+
   it("keeps narrow source-rail and GitHub reviewer actions named and discoverable", async () => {
     setViewport(560);
     await renderFixtureApp();
@@ -751,6 +874,32 @@ describe("responsive reviewer escape hatches", () => {
     fireEvent.click(files);
     expect(screen.getByRole("button", { name: "Close files" })).toHaveAttribute("aria-expanded", "true");
   });
+
+  it.each([1024, 1280])(
+    "removes collapsed Files from rendering and the accessibility tree at %ipx",
+    async (width) => {
+      setViewport(width);
+      await openPaginationReview();
+
+      const files = document.getElementById("review-files");
+      if (!(files instanceof HTMLElement)) throw new Error("The reviewer Files pane was not rendered.");
+      const filter = within(files).getByPlaceholderText("Filter paths");
+      const close = screen.getByRole("button", { name: "Close files" });
+      close.focus();
+      fireEvent.click(close);
+
+      expect(files).toHaveAttribute("hidden");
+      expect(files).toHaveAttribute("aria-hidden", "true");
+      expect(filter).not.toBeVisible();
+      expect(document.activeElement).toBe(close);
+      expect(close).toHaveAccessibleName("Open files");
+
+      fireEvent.click(close);
+      expect(files).not.toHaveAttribute("hidden");
+      expect(files).toHaveAttribute("aria-hidden", "false");
+      expect(filter).toBeVisible();
+    },
+  );
 });
 
 describe("diff anchor selection", () => {
@@ -766,7 +915,7 @@ describe("diff anchor selection", () => {
     fireEvent.keyDown(unified, { key: "ArrowRight" });
     await waitFor(() => expect(split).toHaveAttribute("aria-selected", "true"));
     expect(split).toHaveAttribute("tabindex", "0");
-    expect(document.activeElement).toBe(split);
+    await waitFor(() => expect(document.activeElement).toBe(split));
 
     fireEvent.click(screen.getAllByRole("button", { name: "Full file" })[0]);
     await waitFor(() => expect(unified).toHaveAttribute("aria-selected", "true"));

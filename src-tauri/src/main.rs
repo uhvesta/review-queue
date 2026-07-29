@@ -129,6 +129,7 @@ fn main() {
             github_desktop::github_preview_pull_request,
             github_desktop::github_confirm_queue_pull_request,
             github_desktop::github_open_pull_request,
+            github_desktop::github_cached_round,
             github_desktop::github_refresh_comments,
             github_desktop::github_check_staleness,
             github_desktop::github_refresh_round,

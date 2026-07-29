@@ -199,6 +199,14 @@ export interface GithubOpenedPullRequest {
   files: GithubMaterializedFile[];
 }
 
+export interface GithubCachedRound {
+  round_id: string;
+  payload: GithubOpenedPullRequest["payload"];
+  files: GithubMaterializedFile[];
+  imported_comments: ImportedComment[];
+  last_staleness?: GithubStalenessStatus | null;
+}
+
 export interface ImportedComment {
   id: string;
   thread_id: string;

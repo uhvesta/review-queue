@@ -23,7 +23,8 @@ use review_queue_core::{
     github::{
         GithubAdapter, GithubMaterializedFile, GithubOpenedPullRequest, GithubPublishAttempt,
         GithubPublishReceipt, GithubPublishRequest, GithubPublishStatus, GithubPullRequestLocator,
-        GithubQueuePayload, GithubReplyReceipt, GithubReplyRequest, GithubTransport,
+        GithubQueuePayload, GithubReplyReceipt, GithubReplyRequest, GithubRoundState,
+        GithubTransport,
     },
     store::{Store, SubmissionResult},
 };
@@ -223,7 +224,6 @@ impl<C: CredentialSource, A: GithubApi> GithubDesktop<C, A> {
         store: &Store,
         round_id: &str,
     ) -> Result<GithubOpenedPullRequest, CommandError> {
-        let credential = self.credentials.credential(Capability::PrRead)?;
         let state = store.github_round(round_id)?;
         if state.payload.source_materialized && !state.files.is_empty() {
             return Ok(GithubOpenedPullRequest {
@@ -231,6 +231,7 @@ impl<C: CredentialSource, A: GithubApi> GithubDesktop<C, A> {
                 files: state.files,
             });
         }
+        let credential = self.credentials.credential(Capability::PrRead)?;
         let mut adapter = GithubAdapter::new(CredentialedTransport {
             api: &mut self.api,
             token: &credential.access_token,
@@ -251,6 +252,10 @@ impl<C: CredentialSource, A: GithubApi> GithubDesktop<C, A> {
         // Persist the materialized marker only after all file reads succeed.
         store.save_github_round(round_id, &opened.payload)?;
         Ok(opened)
+    }
+
+    fn cached_round(store: &Store, round_id: &str) -> Result<GithubRoundState, CommandError> {
+        store.github_round(round_id).map_err(Into::into)
     }
 
     fn refresh_comments(
@@ -560,6 +565,15 @@ pub fn github_open_pull_request(
     let mut desktop = system_desktop()?;
     let store = state.0.lock().map_err(|_| state_unavailable())?;
     desktop.open(&store, &round_id)
+}
+
+#[tauri::command]
+pub fn github_cached_round(
+    round_id: String,
+    state: State<'_, AppState>,
+) -> Result<GithubRoundState, CommandError> {
+    let store = state.0.lock().map_err(|_| state_unavailable())?;
+    GithubDesktop::<KeychainCredentialSource, RestGithubApi>::cached_round(&store, &round_id)
 }
 
 #[tauri::command]
@@ -1773,14 +1787,36 @@ mod tests {
                 && base_sha == "base"
                 && head_sha == "head-a"
         ));
-        desktop.open(&store, &queued.round.id).unwrap();
-        desktop.open(&store, &queued.round.id).unwrap();
+        let first_open = desktop.open(&store, &queued.round.id).unwrap();
         assert_eq!(desktop.api.file_reads, 1);
         assert_eq!(desktop.api.metadata_reads, 2);
         assert_eq!(
             desktop.api.tokens,
             vec!["read-secret", "read-secret", "read-secret"]
         );
+        assert_eq!(
+            desktop.credentials.reads.borrow().as_slice(),
+            &[Capability::PrRead, Capability::PrRead]
+        );
+
+        let mut restarted_without_credentials = GithubDesktop {
+            credentials: FakeCredentials::default(),
+            api: FakeApi::default(),
+        };
+        let cached_open = restarted_without_credentials
+            .open(&store, &queued.round.id)
+            .unwrap();
+        assert_eq!(cached_open, first_open);
+        assert!(
+            restarted_without_credentials
+                .credentials
+                .reads
+                .borrow()
+                .is_empty()
+        );
+        assert_eq!(restarted_without_credentials.api.metadata_reads, 0);
+        assert_eq!(restarted_without_credentials.api.file_reads, 0);
+        assert_eq!(restarted_without_credentials.api.comment_reads, 0);
         assert!(matches!(
             store.github_round(&queued.round.id).unwrap().last_staleness,
             Some(ref status) if !status.is_stale() && status.observed_head_sha == "head-a"
@@ -1853,6 +1889,13 @@ mod tests {
         let first = desktop.refresh_comments(&store, &queued.round.id).unwrap();
         assert!(!first.staleness.is_stale());
         assert_eq!(first.imported, desktop.api.imported_comments);
+        assert_eq!(desktop.api.metadata_reads, 2);
+        assert_eq!(desktop.api.comment_reads, 1);
+        let cached =
+            GithubDesktop::<FakeCredentials, FakeApi>::cached_round(&store, &queued.round.id)
+                .unwrap();
+        assert_eq!(cached.imported_comments, first.imported);
+        assert_eq!(cached.last_staleness, Some(first.staleness.clone()));
         assert_eq!(
             store.formal_comments(&queued.round.id).unwrap(),
             vec![draft.clone()]
@@ -1863,6 +1906,8 @@ mod tests {
         desktop.api.head = "head-b".into();
         let stale = desktop.refresh_comments(&store, &queued.round.id).unwrap();
         assert!(stale.staleness.is_stale());
+        assert_eq!(desktop.api.metadata_reads, 3);
+        assert_eq!(desktop.api.comment_reads, 2);
         assert_eq!(
             store.formal_comments(&queued.round.id).unwrap(),
             vec![draft]
