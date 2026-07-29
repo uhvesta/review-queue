@@ -116,6 +116,7 @@ fn create_fixture(collection: Collection, persistent_store: bool) -> Fixture {
             manifest,
             origin_route: None,
             source_metadata: None,
+            source_adapter: None,
         })
         .expect("submit fixture round");
     let round = match result {

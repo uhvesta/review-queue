@@ -579,12 +579,13 @@ pub fn approve_local(
     require_confirmation(&id, &confirmation, "approve-local")?;
     let store = state.0.lock().map_err(|_| unavailable())?;
     let round = store.round(&id)?;
-    if round.collection != Collection::Local {
+    if round.source_adapter.approval != review_queue_core::adapters::ApprovalDisposition::PurgeRound
+    {
         return Err(CommandError {
             code: "local_approval_only".into(),
-            message: "Only locally captured rounds can be approved from this command.".into(),
+            message: "This review source records a decision instead of purging on approval.".into(),
             data_safety: "No review state was changed.".into(),
-            next_step: "Use the connected provider's approval flow for this round.".into(),
+            next_step: "Use the source's decision action for this round.".into(),
         });
     }
     store.approve_local(&id).map_err(Into::into)

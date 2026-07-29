@@ -275,6 +275,10 @@ pub struct Submission {
     /// Source-specific provenance kept with the immutable review round.
     #[serde(default)]
     pub source_metadata: Option<SourceMetadata>,
+    /// Optional only at ingress so older token-free clients keep working.
+    /// Store resolves and persists the matching legacy declaration.
+    #[serde(default)]
+    pub source_adapter: Option<adapters::SourceAdapterContract>,
 }
 
 /// Canonical stable identity shared by every local ingestion surface.
@@ -335,6 +339,10 @@ pub struct Round {
     pub origin_route: Option<AgentRoute>,
     #[serde(default)]
     pub source_metadata: Option<SourceMetadata>,
+    /// Durable source declaration. Reviewer actions must consult this rather
+    /// than infer behavior from the queue collection.
+    #[serde(default)]
+    pub source_adapter: adapters::SourceAdapterContract,
 }
 
 /// A formal draft is intentionally separate from an AskTurn. Only these

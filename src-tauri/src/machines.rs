@@ -357,6 +357,7 @@ pub fn materialize_machine_round(
             cursor,
             cached_at: now,
         }),
+        source_adapter: None,
     };
     let mut store = state.0.lock().map_err(|_| state_unavailable())?;
     let outcome = store.submit(submission)?;

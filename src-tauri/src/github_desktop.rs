@@ -267,6 +267,7 @@ impl<C: CredentialSource, A: GithubApi> GithubDesktop<C, A> {
             manifest: manifest(&payload),
             origin_route: None,
             source_metadata: Some(github_source_metadata(&payload, Some(status.clone()))),
+            source_adapter: None,
         })?;
         let (outcome, round, superseded_round_id) = submission_result(result);
         store.save_github_round(&round.id, &payload)?;
@@ -620,6 +621,7 @@ fn submission(payload: &GithubQueuePayload) -> Submission {
         manifest: manifest(payload),
         origin_route: None,
         source_metadata: Some(github_source_metadata(payload, None)),
+        source_adapter: None,
     }
 }
 

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Anchor, Decision, DomainError};
+use crate::{Anchor, Collection, Decision, DomainError};
 
 /// Actions a source can truthfully expose to the common reviewer.  The UI
 /// consumes this declaration instead of branching on a source implementation.
@@ -15,7 +15,10 @@ use crate::{Anchor, Decision, DomainError};
 #[serde(rename_all = "snake_case")]
 pub enum SourceCapability {
     OriginatingAgent,
-    ManualFeedbackHandoff,
+    /// Formal feedback can be handed back to the originating agent. This is
+    /// deliberately a source capability, not a queue-collection heuristic.
+    #[serde(rename = "acp_delivery", alias = "manual_feedback_handoff")]
+    AcpDelivery,
     Publish,
     UpstreamDiscussion,
     RemoteRefresh,
@@ -52,6 +55,10 @@ impl CapabilitySet {
 pub struct SourceAdapterContract {
     pub adapter_id: String,
     pub capabilities: CapabilitySet,
+    /// Approval is source-owned: a local immutable snapshot is purged after
+    /// confirmation, while upstream-backed sources retain a local decision.
+    #[serde(default)]
+    pub approval: ApprovalDisposition,
 }
 
 impl SourceAdapterContract {
@@ -60,6 +67,77 @@ impl SourceAdapterContract {
         self.capabilities.validate()?;
         validate_token_free_fields(vec![self.adapter_id.as_str()])
     }
+
+    pub fn supports(&self, capability: SourceCapability) -> bool {
+        self.capabilities.supports(capability)
+    }
+
+    pub fn require(&self, capability: SourceCapability, action: &str) -> Result<(), DomainError> {
+        if self.supports(capability) {
+            return Ok(());
+        }
+        Err(DomainError::actionable(
+            format!("This source does not support {action}."),
+            "No review state or source data was changed.",
+            "Choose an action offered by this review source.",
+            "source_capability_required",
+        ))
+    }
+
+    /// Built-in contracts are created at ingress and persisted with the
+    /// round. The collection remains a queue/ranking concern only; callers
+    /// should use the persisted declaration for reviewer actions.
+    pub fn legacy_for_collection(collection: Collection) -> Self {
+        match collection {
+            Collection::Local => Self {
+                adapter_id: "local_workspace_snapshot".into(),
+                capabilities: CapabilitySet {
+                    capabilities: vec![
+                        SourceCapability::OriginatingAgent,
+                        SourceCapability::AcpDelivery,
+                    ],
+                },
+                approval: ApprovalDisposition::PurgeRound,
+            },
+            Collection::Github => Self {
+                adapter_id: "github_pull_request_mirror".into(),
+                capabilities: CapabilitySet {
+                    capabilities: vec![
+                        SourceCapability::Publish,
+                        SourceCapability::UpstreamDiscussion,
+                        SourceCapability::RemoteRefresh,
+                    ],
+                },
+                approval: ApprovalDisposition::RecordDecision,
+            },
+            Collection::Machine => Self {
+                adapter_id: "connected_daemon_workspace".into(),
+                capabilities: CapabilitySet {
+                    capabilities: vec![
+                        SourceCapability::OriginatingAgent,
+                        SourceCapability::RemoteRefresh,
+                    ],
+                },
+                approval: ApprovalDisposition::RecordDecision,
+            },
+        }
+    }
+}
+
+impl Default for SourceAdapterContract {
+    fn default() -> Self {
+        // This serde default is only for legacy JSON. SQLite migration uses
+        // `legacy_for_collection`, which preserves the original source.
+        Self::legacy_for_collection(Collection::Local)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDisposition {
+    PurgeRound,
+    #[default]
+    RecordDecision,
 }
 
 /// The public, token-free auth vocabulary.  Values deliberately describe
@@ -778,5 +856,34 @@ mod tests {
             status.validate().unwrap_err().error.code,
             "token_shaped_diagnostic"
         );
+    }
+
+    #[test]
+    fn built_in_source_contracts_are_capability_complete_and_token_free() {
+        let local = SourceAdapterContract::legacy_for_collection(Collection::Local);
+        assert!(local.supports(SourceCapability::OriginatingAgent));
+        assert!(local.supports(SourceCapability::AcpDelivery));
+        assert_eq!(local.approval, ApprovalDisposition::PurgeRound);
+
+        let github = SourceAdapterContract::legacy_for_collection(Collection::Github);
+        assert!(github.supports(SourceCapability::Publish));
+        assert!(github.supports(SourceCapability::UpstreamDiscussion));
+        assert!(github.supports(SourceCapability::RemoteRefresh));
+        assert_eq!(github.approval, ApprovalDisposition::RecordDecision);
+
+        let machine = SourceAdapterContract::legacy_for_collection(Collection::Machine);
+        assert!(machine.supports(SourceCapability::RemoteRefresh));
+        assert!(!machine.supports(SourceCapability::Publish));
+        machine.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_manual_feedback_wire_value_remains_readable_as_acp_delivery() {
+        let contract: SourceAdapterContract = serde_json::from_value(serde_json::json!({
+            "adapter_id": "local_workspace_snapshot",
+            "capabilities": { "capabilities": ["manual_feedback_handoff"] }
+        }))
+        .unwrap();
+        assert!(contract.supports(SourceCapability::AcpDelivery));
     }
 }

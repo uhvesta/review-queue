@@ -112,6 +112,7 @@ fn shipped_daemon_serves_machine_protocol_and_complete_reviewer_snapshot() {
             manifest,
             origin_route: Some(route.clone()),
             source_metadata: None,
+            source_adapter: None,
         })
         .unwrap();
     drop(store);

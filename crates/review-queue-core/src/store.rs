@@ -10,7 +10,8 @@ use crate::{
     AgentRoute, Anchor, Collection, Decision, DeliveryPayload, DomainError, DurableDelivery,
     FormalComment, Lifecycle, MachineRecord, ReviewBrief, Round, Submission, WorkspaceManifest,
     adapters::{
-        AskConversation, AskTurn, AskTurnState, ConversationSessionState, DiscoveredSessionOption,
+        ApprovalDisposition, AskConversation, AskTurn, AskTurnState, ConversationSessionState,
+        DiscoveredSessionOption, SourceAdapterContract, SourceCapability,
     },
     capture::{CaptureRequest, Preflight, prepare_capture},
     github::{
@@ -216,6 +217,10 @@ impl Store {
         if !table_has_column(&self.conn, "rounds", "origin_route_json")? {
             self.conn
                 .execute("ALTER TABLE rounds ADD COLUMN origin_route_json TEXT", [])?;
+        }
+        if !table_has_column(&self.conn, "rounds", "source_adapter_json")? {
+            self.conn
+                .execute("ALTER TABLE rounds ADD COLUMN source_adapter_json TEXT", [])?;
         }
         if !table_has_column(&self.conn, "machines", "config_json")? {
             self.conn
@@ -616,6 +621,7 @@ impl Store {
             manifest: pending.manifest().clone(),
             origin_route,
             source_metadata: None,
+            source_adapter: None,
         };
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
@@ -702,6 +708,12 @@ fn submit_in_transaction(
             "repositories_required",
         ));
     }
+    let source_adapter = submission
+        .source_adapter
+        .clone()
+        .unwrap_or_else(|| SourceAdapterContract::legacy_for_collection(submission.collection));
+    source_adapter.validate()?;
+    validate_source_adapter_binding(&submission, &source_adapter)?;
     let hash = manifest_hash(&submission.manifest);
     let now = Utc::now();
     let origin_route_id = submission
@@ -732,6 +744,7 @@ fn submit_in_transaction(
         origin_route_id,
         origin_route,
         source_metadata: submission.source_metadata,
+        source_adapter,
     };
     if let Some(route) = submission.origin_route {
         upsert_route_tx(tx, &route)?;
@@ -814,14 +827,12 @@ impl Store {
     ) -> Result<(), DomainError> {
         validate_ingress(snapshot)?;
         let round = self.round(round_id)?;
-        if round.collection != Collection::Machine {
-            return Err(DomainError::actionable(
-                "A connected-machine snapshot can only be attached to a machine round.",
-                "No review state was changed.",
-                "Choose the matching machine queue item.",
-                "machine_round_required",
-            ));
-        }
+        require_adapter(
+            &round,
+            "connected_daemon_workspace",
+            SourceCapability::RemoteRefresh,
+            "a connected-machine snapshot",
+        )?;
         self.conn
             .execute(
                 "INSERT INTO machine_round_snapshots(round_id,snapshot_json,created_at)
@@ -835,14 +846,12 @@ impl Store {
 
     pub fn machine_snapshot(&self, round_id: &str) -> Result<MachineSnapshot, DomainError> {
         let round = self.round(round_id)?;
-        if round.collection != Collection::Machine {
-            return Err(DomainError::actionable(
-                "That review is not backed by a connected-machine snapshot.",
-                "No source or review state was changed.",
-                "Open a machine queue item.",
-                "machine_round_required",
-            ));
-        }
+        require_adapter(
+            &round,
+            "connected_daemon_workspace",
+            SourceCapability::RemoteRefresh,
+            "a connected-machine snapshot",
+        )?;
         self.conn
             .query_row(
                 "SELECT snapshot_json FROM machine_round_snapshots WHERE round_id=?1",
@@ -870,14 +879,12 @@ impl Store {
     ) -> Result<GithubRoundState, DomainError> {
         validate_ingress(payload)?;
         let round = self.round(round_id)?;
-        if round.collection != Collection::Github {
-            return Err(DomainError::actionable(
-                "GitHub metadata can only be attached to a GitHub review round.",
-                "No local review state was changed.",
-                "Choose the matching GitHub queue item and retry.",
-                "github_round_collection_mismatch",
-            ));
-        }
+        require_adapter(
+            &round,
+            "github_pull_request_mirror",
+            SourceCapability::UpstreamDiscussion,
+            "GitHub source metadata",
+        )?;
         self.conn
             .execute(
                 "INSERT INTO github_round_state(
@@ -913,14 +920,12 @@ impl Store {
 
     pub fn github_round(&self, round_id: &str) -> Result<GithubRoundState, DomainError> {
         let round = self.round(round_id)?;
-        if round.collection != Collection::Github {
-            return Err(DomainError::actionable(
-                "That review is not backed by a GitHub pull request.",
-                "No review state changed.",
-                "Open a GitHub queue item.",
-                "github_round_required",
-            ));
-        }
+        require_adapter(
+            &round,
+            "github_pull_request_mirror",
+            SourceCapability::UpstreamDiscussion,
+            "a GitHub pull request",
+        )?;
         self.conn
             .query_row(
                 "SELECT payload_json,files_json,imported_comments_json,staleness_json
@@ -1299,11 +1304,11 @@ impl Store {
     }
     pub fn approve_remote(&self, id: &str) -> Result<(), DomainError> {
         let round = self.round(id)?;
-        if round.collection == Collection::Local {
+        if round.source_adapter.approval == ApprovalDisposition::PurgeRound {
             return Err(DomainError::actionable(
-                "Local approval requires the desktop confirmation dialog and then purges the round.",
+                "This review source requires desktop confirmation and then purges the round.",
                 "No review state or source file was changed.",
-                "Confirm Approve in the local reviewer, or cancel to keep the round.",
+                "Confirm Approve in the reviewer, or cancel to keep the round.",
                 "local_approval_requires_confirmation",
             ));
         }
@@ -1315,11 +1320,11 @@ impl Store {
     pub fn approve_local(&self, id: &str) -> Result<(), DomainError> {
         let round = self.round(id)?;
         ensure_mutable(&round)?;
-        if round.collection != Collection::Local {
+        if round.source_adapter.approval != ApprovalDisposition::PurgeRound {
             return Err(DomainError::actionable(
-                "Only local review rounds use local approval.",
+                "This review source records a decision instead of purging on approval.",
                 "No review state changed.",
-                "Use remote approval for an upstream-backed round.",
+                "Use the source's decision action for this round.",
                 "local_approval_collection_mismatch",
             ));
         }
@@ -2685,13 +2690,81 @@ fn ensure_mutable(round: &Round) -> Result<(), DomainError> {
     Ok(())
 }
 
+fn require_adapter(
+    round: &Round,
+    adapter_id: &str,
+    capability: SourceCapability,
+    action: &str,
+) -> Result<(), DomainError> {
+    if round.source_adapter.adapter_id != adapter_id {
+        return Err(DomainError::actionable(
+            format!("This review source cannot provide {action}."),
+            "No review state or source data was changed.",
+            "Open a round from the matching source.",
+            "source_adapter_required",
+        ));
+    }
+    round.source_adapter.require(capability, action)
+}
+
+fn validate_source_adapter_binding(
+    submission: &Submission,
+    source_adapter: &SourceAdapterContract,
+) -> Result<(), DomainError> {
+    let (expected_adapter, required_capabilities) = match &submission.source_metadata {
+        Some(crate::SourceMetadata::Github { .. }) => (
+            "github_pull_request_mirror",
+            [
+                SourceCapability::Publish,
+                SourceCapability::UpstreamDiscussion,
+                SourceCapability::RemoteRefresh,
+            ]
+            .as_slice(),
+        ),
+        Some(crate::SourceMetadata::Machine { .. }) => (
+            "connected_daemon_workspace",
+            [SourceCapability::RemoteRefresh].as_slice(),
+        ),
+        // Queue intake persists source metadata in a following atomic store
+        // operation for historical clients. Keep that protocol compatible,
+        // while still resolving the adapter contract immediately.
+        None => match submission.collection {
+            Collection::Local => (
+                "local_workspace_snapshot",
+                [SourceCapability::OriginatingAgent].as_slice(),
+            ),
+            Collection::Github => (
+                "github_pull_request_mirror",
+                [SourceCapability::UpstreamDiscussion].as_slice(),
+            ),
+            Collection::Machine => (
+                "connected_daemon_workspace",
+                [SourceCapability::RemoteRefresh].as_slice(),
+            ),
+        },
+    };
+    if source_adapter.adapter_id != expected_adapter {
+        return Err(DomainError::actionable(
+            "The source adapter does not match this review source.",
+            "No queue item was created.",
+            "Use the adapter declared by the source and retry.",
+            "source_adapter_mismatch",
+        ));
+    }
+    for capability in required_capabilities {
+        source_adapter.require(*capability, "this source operation")?;
+    }
+    Ok(())
+}
+
 fn round_from_row(row: &rusqlite::Row<'_>) -> Result<Round, rusqlite::Error> {
     // Deserialization has an actionable wrapper at public boundaries. SQLite's
     // conversion error is used here only to satisfy query_row's callback type.
     let read = || -> Result<Round, DomainError> {
+        let collection = collection(row.get(1).map_err(db_error)?)?;
         Ok(Round {
             id: row.get(0).map_err(db_error)?,
-            collection: collection(row.get(1).map_err(db_error)?)?,
+            collection,
             topic_identity: row.get(2).map_err(db_error)?,
             manifest_hash: row.get(3).map_err(db_error)?,
             brief: parse(row.get(4).map_err(db_error)?)?,
@@ -2711,6 +2784,12 @@ fn round_from_row(row: &rusqlite::Row<'_>) -> Result<Round, rusqlite::Error> {
                 .map_err(db_error)?
                 .map(parse)
                 .transpose()?,
+            source_adapter: row
+                .get::<_, Option<String>>(13)
+                .map_err(db_error)?
+                .map(parse)
+                .transpose()?
+                .unwrap_or_else(|| SourceAdapterContract::legacy_for_collection(collection)),
         })
     };
     read().map_err(|e| {
@@ -2729,7 +2808,7 @@ fn next_rank(tx: &Transaction<'_>, collection_: Collection) -> Result<i64, Domai
     tx.query_row("SELECT COALESCE(MAX(rank), -1) + 1 FROM rounds WHERE collection = ?1 AND lifecycle != 'completed' AND superseded_by IS NULL", params![collection_.as_str()], |r| r.get(0)).map_err(db_error)
 }
 fn insert_round(tx: &Transaction<'_>, r: &Round) -> Result<(), DomainError> {
-    tx.execute("INSERT INTO rounds(id,collection,topic_identity,manifest_hash,brief_json,manifest_json,rank,lifecycle,superseded_by,created_at,origin_route_id,source_metadata_json,origin_route_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![r.id,r.collection.as_str(),r.topic_identity,r.manifest_hash,json(&r.brief)?,json(&r.manifest)?,r.rank,r.lifecycle.as_str(),r.superseded_by,r.created_at.to_rfc3339(),r.origin_route_id,r.source_metadata.as_ref().map(json).transpose()?,r.origin_route.as_ref().map(json).transpose()?]).map_err(db_error)?;
+    tx.execute("INSERT INTO rounds(id,collection,topic_identity,manifest_hash,brief_json,manifest_json,rank,lifecycle,superseded_by,created_at,origin_route_id,source_metadata_json,origin_route_json,source_adapter_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![r.id,r.collection.as_str(),r.topic_identity,r.manifest_hash,json(&r.brief)?,json(&r.manifest)?,r.rank,r.lifecycle.as_str(),r.superseded_by,r.created_at.to_rfc3339(),r.origin_route_id,r.source_metadata.as_ref().map(json).transpose()?,r.origin_route.as_ref().map(json).transpose()?,json(&r.source_adapter)?]).map_err(db_error)?;
     Ok(())
 }
 fn upsert_route_tx(tx: &Transaction<'_>, route: &AgentRoute) -> Result<(), DomainError> {
@@ -2844,6 +2923,7 @@ mod tests {
             },
             origin_route: None,
             source_metadata: None,
+            source_adapter: None,
         }
     }
 
@@ -3033,6 +3113,60 @@ mod tests {
             store.round(&first.id).unwrap().lifecycle,
             Lifecycle::Completed
         );
+    }
+
+    #[test]
+    fn resolved_source_adapter_persists_with_a_round() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let round = match store.submit(submission("adapter", "a")).unwrap() {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
+        };
+        assert_eq!(round.source_adapter.adapter_id, "local_workspace_snapshot");
+        drop(store);
+
+        let reopened = Store::open(temp.path()).unwrap();
+        let persisted = reopened.round(&round.id).unwrap();
+        assert_eq!(
+            persisted.source_adapter.adapter_id,
+            "local_workspace_snapshot"
+        );
+        assert_eq!(
+            persisted.source_adapter.approval,
+            ApprovalDisposition::PurgeRound
+        );
+    }
+
+    #[test]
+    fn adapter_declaration_not_collection_controls_approval_behavior() {
+        let mut input = submission("adapter-approval", "a");
+        input.collection = Collection::Github;
+        input.source_metadata = Some(crate::SourceMetadata::Github {
+            host: "github.com".into(),
+            owner: "octo".into(),
+            repository: "queue".into(),
+            pull_number: 1,
+            base_sha: "base".into(),
+            head_sha: "head".into(),
+            state: crate::adapters::GithubPullRequestState::Open,
+            is_draft: false,
+            staleness: None,
+        });
+        let mut adapter = SourceAdapterContract::legacy_for_collection(Collection::Github);
+        adapter.approval = ApprovalDisposition::PurgeRound;
+        input.source_adapter = Some(adapter);
+
+        let mut store = Store::in_memory().unwrap();
+        let round = match store.submit(input).unwrap() {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            store.approve_remote(&round.id).unwrap_err().error.code,
+            "local_approval_requires_confirmation"
+        );
+        store.approve_local(&round.id).unwrap();
     }
 
     #[test]
