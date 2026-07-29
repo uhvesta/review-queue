@@ -904,7 +904,7 @@ function QueueColumn({
             <p>{round.manifest.topic} · snapshot {shortSha(round.manifest_hash)}</p>
             {round.brief.why && <p className="muted">why: {round.brief.why}</p>}
             <footer>
-              <span className="status">{displayLifecycle(round.lifecycle)}</span>
+              <span className="status" data-state={displayLifecycle(round.lifecycle)}>{displayLifecycle(round.lifecycle)}</span>
               <button className="open" onClick={() => onOpen(round)}>Open review</button>
               {readOnly ? (
                 <button onClick={() => onRequeue(round)} disabled={Boolean(round.superseded_by)}>
@@ -1581,8 +1581,9 @@ function ChatSheet({
         {loading && <p>Loading saved transcript…</p>}
         {!loading && !turns.length && <p>Select code and <code>/ask</code> to start.</p>}
         {turns.map((turn) => (
-          <article key={turn.id} className="chat-turn">
-            <small>You · {turn.anchor ? `${turn.anchor.workspace_relative_path}:${turn.anchor.start_line}–${turn.anchor.end_line}` : "round follow-up"}</small>
+          <article key={turn.id} className="chat-turn ask-thread">
+            <small className="ask-label">You · {turn.anchor ? `${turn.anchor.workspace_relative_path}:${turn.anchor.start_line}–${turn.anchor.end_line} · ${turn.anchor.side}` : "round follow-up"}</small>
+            {turn.anchor?.selected_code && <pre className="anchor-snippet">{turn.anchor.selected_code}</pre>}
             <p>{turn.prompt}</p>
             <small>Copilot · {turn.state}{Object.keys(turn.option_values).length ? ` · ${Object.entries(turn.option_values).map(([key, value]) => `${key}: ${value}`).join(" · ")}` : ""}</small>
             {turn.response_text && <p>{turn.response_text}</p>}
