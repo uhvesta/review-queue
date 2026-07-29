@@ -49,11 +49,18 @@ scripts/release-macos.sh \
   --updater-acceptance-bootstrap
 ```
 
-Publish all eight retained artifacts as a temporary non-prerelease and make
-it the updater endpoint's latest release:
+Verify that the pushed annotated tag peels to the exact local commit before
+creating any release. Upload all eight retained artifacts to a draft first,
+verify the draft, and only then atomically publish it as the latest
+non-prerelease. This sequence works with the repository host's installed
+GitHub CLI and prevents a partial upload from replacing the updater feed:
 
 ```bash
-gh release create updater-acceptance-v0.1.0 \
+tag=updater-acceptance-v0.1.0
+test "$(git rev-parse "$tag^{}")" = \
+  "$(git ls-remote --tags origin "refs/tags/$tag^{}" | awk '{print $1}')"
+
+gh release create "$tag" \
   dist-updater-acceptance/*.dmg \
   dist-updater-acceptance/*.app.zip \
   dist-updater-acceptance/*.app.tar.gz \
@@ -63,10 +70,18 @@ gh release create updater-acceptance-v0.1.0 \
   dist-updater-acceptance/*.cdx.json \
   dist-updater-acceptance/*.notarization.json \
   --repo uhvesta/review-queue \
-  --verify-tag \
-  --latest \
+  --draft \
   --title "Review Queue updater acceptance (disposable)" \
   --notes "Temporary signed feed for candidate-to-v0.1.0 updater acceptance."
+
+release_id="$(gh api \
+  "repos/uhvesta/review-queue/releases/tags/$tag" --jq .id)"
+gh api "repos/uhvesta/review-queue/releases/$release_id/assets" \
+  --jq 'map(select(.state == "uploaded") | .name) | sort'
+# Compare the output to the exact eight files in dist-updater-acceptance.
+gh api -X PATCH \
+  "repos/uhvesta/review-queue/releases/$release_id" \
+  -F draft=false -F prerelease=false -F make_latest=true
 ```
 
 Before opening the app, verify that
@@ -125,10 +140,11 @@ scripts/release-macos.sh \
   --output dist-v0.1.0
 ```
 
-Publish the real release with `--verify-tag --latest`, using the same eight
-artifact classes as the disposable release. Verify that the latest release
-and latest updater manifest both resolve to `v0.1.0`, and rerun release
-verification against the uploaded artifacts.
+Publish the real release with the same peeled-tag comparison, draft upload,
+exact eight-asset verification, and final REST `PATCH` used for the
+disposable feed. Verify that the latest release and latest updater manifest
+both resolve to `v0.1.0`, and rerun release verification against the uploaded
+artifacts.
 
 ## 5. Remove only the disposable GitHub state
 
@@ -138,8 +154,8 @@ release and its remote and local tag:
 ```bash
 gh release delete updater-acceptance-v0.1.0 \
   --repo uhvesta/review-queue \
-  --yes \
-  --cleanup-tag
+  --yes
+git push origin :refs/tags/updater-acceptance-v0.1.0
 git tag -d updater-acceptance-v0.1.0
 ```
 
