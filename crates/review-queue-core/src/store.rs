@@ -309,6 +309,52 @@ impl Store {
         self.active_conversation_for_round(round_id)
     }
 
+    /// Validates round mutability and exact active-conversation ownership
+    /// before the desktop crosses a provider boundary. Clear chat uses this
+    /// check because clearing a restart-lost, history-only active conversation
+    /// is its one valid route to a fresh chat.
+    pub fn mutable_active_conversation(
+        &self,
+        round_id: &str,
+        conversation_id: &str,
+    ) -> Result<AskConversation, DomainError> {
+        validate_ingress(&(round_id, conversation_id))?;
+        let round = self.round(round_id)?;
+        ensure_mutable(&round)?;
+        let conversation = self
+            .active_conversation_for_round(round_id)?
+            .ok_or_else(|| {
+                DomainError::actionable(
+                    "This round has no active Copilot conversation.",
+                    "No provider session was created and no prompt was sent.",
+                    "Open the current chat before starting a session or sending a prompt.",
+                    "copilot_conversation_required",
+                )
+            })?;
+        if conversation.id != conversation_id {
+            return Err(DomainError::actionable(
+                "The selected Copilot conversation belongs to a different review round.",
+                "No provider session or saved conversation was changed.",
+                "Reopen the intended round and use its current chat.",
+                "copilot_conversation_round_mismatch",
+            ));
+        }
+        Ok(conversation)
+    }
+
+    /// Adds the provider-session check required by start, option, and prompt
+    /// operations. Archived or restart-lost conversations fail here before
+    /// authentication, context materialization, or SDK session mutation.
+    pub fn promptable_conversation(
+        &self,
+        round_id: &str,
+        conversation_id: &str,
+    ) -> Result<AskConversation, DomainError> {
+        let conversation = self.mutable_active_conversation(round_id, conversation_id)?;
+        conversation.validate_prompt_allowed()?;
+        Ok(conversation)
+    }
+
     /// Marks the exact point at which a process-local provider session exists.
     /// Startup recovery uses this marker to distinguish a lost SDK session
     /// from an untouched conversation that is still safe to start.
@@ -3926,6 +3972,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reset.options, vec![unavailable]);
+    }
+
+    #[test]
+    fn provider_preflight_checks_lifecycle_ownership_and_session_before_side_effects() {
+        let mut store = Store::in_memory().unwrap();
+        let first = match store
+            .submit(submission("provider-preflight-a", "a"))
+            .unwrap()
+        {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
+        };
+        let second = match store
+            .submit(submission("provider-preflight-b", "b"))
+            .unwrap()
+        {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
+        };
+        let first_chat = store.active_conversation(&first.id, vec![]).unwrap();
+        let second_chat = store.active_conversation(&second.id, vec![]).unwrap();
+
+        let mismatch = store
+            .mutable_active_conversation(&second.id, &first_chat.id)
+            .unwrap_err();
+        assert_eq!(mismatch.error.code, "copilot_conversation_round_mismatch");
+        assert_eq!(
+            store
+                .mutable_active_conversation(&second.id, &second_chat.id)
+                .unwrap()
+                .id,
+            second_chat.id
+        );
+
+        store.complete(&first.id).unwrap();
+        let completed = store
+            .promptable_conversation(&first.id, &first_chat.id)
+            .unwrap_err();
+        assert_eq!(completed.error.code, "round_read_only");
+
+        let restart_round = match store
+            .submit(submission("provider-preflight-restart", "c"))
+            .unwrap()
+        {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
+        };
+        let restart_chat = store
+            .active_conversation(&restart_round.id, vec![])
+            .unwrap();
+        store
+            .mark_conversation_provider_started(
+                &restart_chat.id,
+                "Copilot via existing CLI sign-in",
+                &[],
+            )
+            .unwrap();
+        store.migrate().unwrap();
+        let history_only = store
+            .promptable_conversation(&restart_round.id, &restart_chat.id)
+            .unwrap_err();
+        assert_eq!(history_only.error.code, "history_only_conversation");
+        assert_eq!(
+            store
+                .mutable_active_conversation(&restart_round.id, &restart_chat.id)
+                .unwrap()
+                .id,
+            restart_chat.id,
+            "Clear chat remains valid for the active restart-lost transcript"
+        );
+
+        let superseded_round = match store
+            .submit(submission("provider-preflight-superseded", "d"))
+            .unwrap()
+        {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
+        };
+        let superseded_chat = store
+            .active_conversation(&superseded_round.id, vec![])
+            .unwrap();
+        let replacement = match store
+            .submit(submission("provider-preflight-superseded", "e"))
+            .unwrap()
+        {
+            SubmissionResult::Superseded { round, .. } => round,
+            _ => unreachable!(),
+        };
+        assert_ne!(replacement.id, superseded_round.id);
+        let superseded = store
+            .promptable_conversation(&superseded_round.id, &superseded_chat.id)
+            .unwrap_err();
+        assert_eq!(superseded.error.code, "round_read_only");
     }
 
     #[test]

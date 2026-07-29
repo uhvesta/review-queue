@@ -360,15 +360,15 @@ pub fn copilot_start_session(
     desktop: State<'_, CopilotDesktopState>,
     state: State<'_, AppState>,
 ) -> Result<CopilotSessionInfo, CopilotCommandError> {
+    let materialization_directory = {
+        let store = state.0.lock().map_err(|_| unavailable())?;
+        ensure_conversation_matches_round(&store, &request.round_id, &request.conversation_id)?;
+        let round = store.round(&request.round_id).map_err(domain_error)?;
+        materialize_copilot_session_directory(&store, &round, &request.conversation_id)?
+    };
     let auth_source = match request.auth_source {
         Some(source) => source,
         None => selected_auth_source()?,
-    };
-    let materialization_directory = {
-        let store = state.0.lock().map_err(|_| unavailable())?;
-        let round = store.round(&request.round_id).map_err(domain_error)?;
-        ensure_conversation_matches_round(&store, &request.round_id, &request.conversation_id)?;
-        materialize_copilot_session_directory(&store, &round, &request.conversation_id)?
     };
     let started = desktop.start(
         request.conversation_id.clone(),
@@ -503,24 +503,9 @@ fn ensure_conversation_matches_round(
     round_id: &str,
     conversation_id: &str,
 ) -> Result<review_queue_core::adapters::AskConversation, CopilotCommandError> {
-    let conversation = store
-        .current_conversation(round_id)
-        .map_err(domain_error)?
-        .ok_or_else(|| {
-            conflict(
-                "copilot_conversation_required",
-                "This round has no active Copilot conversation.",
-                "Open the current chat before starting a session or sending a prompt.",
-            )
-        })?;
-    if conversation.id != conversation_id {
-        return Err(conflict(
-            "copilot_conversation_round_mismatch",
-            "The selected Copilot conversation belongs to a different review round.",
-            "Reopen the intended round and use its current chat.",
-        ));
-    }
-    Ok(conversation)
+    store
+        .promptable_conversation(round_id, conversation_id)
+        .map_err(domain_error)
 }
 
 #[tauri::command]
@@ -752,6 +737,12 @@ pub fn copilot_clear_chat(
     desktop: State<'_, CopilotDesktopState>,
     state: State<'_, AppState>,
 ) -> Result<review_queue_core::adapters::AskConversation, CopilotCommandError> {
+    state
+        .0
+        .lock()
+        .map_err(|_| unavailable())?
+        .mutable_active_conversation(&round_id, &conversation_id)
+        .map_err(domain_error)?;
     let _ = desktop.end_for(Some(&conversation_id))?;
     state
         .0
@@ -1280,7 +1271,8 @@ mod tests {
 
     use review_queue_core::copilot::LocalConversationAction;
     use review_queue_core::{
-        Collection, Lifecycle, RepositorySnapshot, ReviewBrief, WorkspaceManifest,
+        Collection, Lifecycle, RepositorySnapshot, ReviewBrief, Submission, WorkspaceManifest,
+        store::{Store, SubmissionResult},
     };
     use serde_json::json;
 
@@ -1323,6 +1315,47 @@ mod tests {
             origin_route: None,
             source_metadata: None,
             source_adapter: Default::default(),
+        }
+    }
+
+    fn stored_round(store: &mut Store, topic: &str, head: &str) -> Round {
+        match store
+            .submit(Submission {
+                collection: Collection::Local,
+                topic_identity: format!("workspace:{topic}"),
+                brief: ReviewBrief {
+                    title: format!("Review {topic}"),
+                    what: String::new(),
+                    why: String::new(),
+                    approach_alternatives: String::new(),
+                    testing: String::new(),
+                },
+                manifest: WorkspaceManifest {
+                    workspace_id: "workspace".into(),
+                    workspace_root: "/private/local/workspace".into(),
+                    topic: topic.into(),
+                    repositories: vec![RepositorySnapshot {
+                        repository_id: "repo-main".into(),
+                        root: "/private/local/workspace".into(),
+                        branch: "topic".into(),
+                        base_sha: "base".into(),
+                        head_sha: head.into(),
+                        remote_fingerprint: None,
+                        object_checksum: format!("tree-{head}"),
+                        capture_metadata: None,
+                    }],
+                    before_fingerprint: "before".into(),
+                    after_fingerprint: format!("after-{head}"),
+                    created_at: Utc::now(),
+                },
+                origin_route: None,
+                source_metadata: None,
+                source_adapter: None,
+            })
+            .unwrap()
+        {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
         }
     }
 
@@ -1492,6 +1525,77 @@ mod tests {
                 .filter(|frame| frame["method"] == "session/prompt")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn invalid_provider_actions_stop_before_every_provider_side_effect() {
+        let mut store = Store::in_memory().unwrap();
+        let first = stored_round(&mut store, "provider-preflight-a", "head-a");
+        let second = stored_round(&mut store, "provider-preflight-b", "head-b");
+        let first_chat = store.active_conversation(&first.id, vec![]).unwrap();
+        let second_chat = store.active_conversation(&second.id, vec![]).unwrap();
+
+        let mut active_adapter = CopilotAdapter::new(FakeAcpServerTranscript::default());
+        active_adapter
+            .validate_auth(CopilotAuthSource::ExistingCliSignInReadOnly)
+            .unwrap();
+        let capabilities = active_adapter.discover_capabilities().unwrap();
+        active_adapter
+            .start_session(&first_chat.id, capabilities.selected_options())
+            .unwrap();
+        let frames_before_clear = active_adapter.transport().frames.len();
+
+        let mismatched_clear = store.mutable_active_conversation(&second.id, &first_chat.id);
+        if mismatched_clear.is_ok() {
+            active_adapter.end_session().unwrap();
+        }
+        assert_eq!(
+            mismatched_clear.unwrap_err().error.code,
+            "copilot_conversation_round_mismatch"
+        );
+        assert_eq!(
+            active_adapter.transport().frames.len(),
+            frames_before_clear,
+            "a mismatched clear must not close or otherwise touch the provider session"
+        );
+        assert_eq!(
+            store.current_conversation(&second.id).unwrap().unwrap().id,
+            second_chat.id,
+            "a mismatched clear must not archive the target round"
+        );
+
+        store.complete(&first.id).unwrap();
+        let frames_before_option = active_adapter.transport().frames.len();
+        let completed_option = store.promptable_conversation(&first.id, &first_chat.id);
+        if completed_option.is_ok() {
+            active_adapter.change_option("reasoning_effort", "low").unwrap();
+        }
+        assert_eq!(
+            completed_option.unwrap_err().error.code,
+            "round_read_only"
+        );
+        assert_eq!(
+            active_adapter.transport().frames.len(),
+            frames_before_option,
+            "a completed round must fail before an SDK option mutation"
+        );
+
+        let mut unopened_adapter = CopilotAdapter::new(FakeAcpServerTranscript::default());
+        let completed_start = store.promptable_conversation(&first.id, &first_chat.id);
+        if completed_start.is_ok() {
+            unopened_adapter
+                .validate_auth(CopilotAuthSource::ExistingCliSignInReadOnly)
+                .unwrap();
+            let capabilities = unopened_adapter.discover_capabilities().unwrap();
+            unopened_adapter
+                .start_session(&first_chat.id, capabilities.selected_options())
+                .unwrap();
+        }
+        assert_eq!(completed_start.unwrap_err().error.code, "round_read_only");
+        assert!(
+            unopened_adapter.transport().frames.is_empty(),
+            "preflight must run before authentication, discovery, or session creation"
         );
     }
 
