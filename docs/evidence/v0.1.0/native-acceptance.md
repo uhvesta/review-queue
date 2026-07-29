@@ -168,7 +168,7 @@ Retained evidence:
 - `difit-native-reviewer-560.png`
 
 That retained packaged-app run used the then-current 9/9 fixture suite. The
-current suite is 24/24 and additionally covers refreshed-round state
+current suite is 28/28 and additionally covers refreshed-round state
 isolation, cached-machine rematerialization, PR-intake confirmation, global
 hunk navigation, inline conversations, and keyboard diff navigation.
 Browser-fixture screenshots at 1280px, 1024px, and 560px are retained

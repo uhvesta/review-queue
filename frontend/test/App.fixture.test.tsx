@@ -48,6 +48,32 @@ afterEach(() => {
 beforeEach(() => setViewport(1024));
 
 describe("fixture-backed reviewer recovery", () => {
+  it("opens a reviewer without creating a Copilot conversation or discovering capabilities", async () => {
+    let active = vi.fn();
+    let capabilities = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      active = vi.fn((...args: Parameters<typeof api.activeConversation>) =>
+        api.activeConversation(...args));
+      capabilities = vi.fn((...args: Parameters<typeof api.copilotCapabilities>) =>
+        api.copilotCapabilities(...args));
+      return {
+        ...api,
+        activeConversation: active,
+        copilotCapabilities: capabilities,
+      };
+    });
+
+    await openReview("Add retry backoff to sync worker");
+    await Promise.resolve();
+    expect(active).not.toHaveBeenCalled();
+    expect(capabilities).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open chat" }));
+    await waitFor(() => expect(active).toHaveBeenCalledTimes(1));
+    expect(capabilities).toHaveBeenCalledTimes(1);
+  });
+
   it("shows the running app version without checking the update feed", async () => {
     let checkForUpdate = vi.fn();
     vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
@@ -811,7 +837,10 @@ describe("diff anchor selection", () => {
     if (!hunk) throw new Error("The selected split line was not inside a diff hunk.");
     fireEvent.click(within(hunk).getByRole("button", { name: "/ask" }));
 
-    await openChat();
+    expect(await screen.findByRole("complementary", { name: "Round chat" })).toHaveAttribute(
+      "aria-hidden",
+      "false",
+    );
     fireEvent.click(await screen.findByRole("button", { name: "Start Copilot" }));
     const input = await screen.findByRole("textbox", { name: "Ask a follow-up" });
     await waitFor(() => expect(input).toBeEnabled());

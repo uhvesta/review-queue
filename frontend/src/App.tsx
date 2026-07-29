@@ -1829,7 +1829,10 @@ function Reviewer({
                           setPendingFeedbackDraft("");
                           setFeedbackOpen(true);
                         }}
-                        onAsk={setPendingAskAnchor}
+                        onAsk={(anchor) => {
+                          setPendingAskAnchor(anchor);
+                          setChatOpen(true);
+                        }}
                         onOpenAskTurn={(anchor) => {
                           setPendingAskAnchor(anchor);
                           setChatOpen(true);
@@ -1981,7 +1984,7 @@ function ChatSheet({
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      if (readOnly) {
+      if (readOnly || !open) {
         const [current, history] = await Promise.all([
           currentConversation(round.id),
           listPreviousChats(round.id),
@@ -2018,7 +2021,7 @@ function ChatSheet({
     } finally {
       setLoading(false);
     }
-  }, [loadConversation, readOnly, round.id]);
+  }, [loadConversation, open, readOnly, round.id]);
 
   useEffect(() => {
     void refresh();
