@@ -180,7 +180,7 @@ jobs:
       - name: Install release tools
         run: |
           set -euo pipefail
-          cargo install tauri-cli --version "^2.0" --locked
+          cargo install tauri-cli --version "2.11.4" --locked
           command -v rg >/dev/null 2>&1 || brew install ripgrep
       - name: Create ephemeral notary Keychain profile
         env:

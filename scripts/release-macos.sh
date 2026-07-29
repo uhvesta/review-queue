@@ -140,7 +140,7 @@ if [[ "$configured_updater_key" != "$committed_updater_key" ]]; then
 fi
 
 if ! cargo tauri --version >/dev/null 2>&1; then
-  echo "Tauri CLI is required; install the locked v2 CLI with: cargo install tauri-cli --version '^2.0' --locked" >&2
+  echo "Tauri CLI is required; install the locked CLI with: cargo install tauri-cli --version '2.11.4' --locked" >&2
   exit 69
 fi
 
