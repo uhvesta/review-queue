@@ -8,42 +8,31 @@ or any product/security invariant. Commits: `63c04dd`, `a3677ec`, `4afd9db`,
 
 ## What this was, concretely
 
-The starting point was not a blank slate: `frontend/src/App.tsx` (a single
-~3000-line component tree — there is no `WorkspaceShell.tsx`/`QueueHome.tsx`/
-`components/`/`hooks/` directory in this repo; those names exist only in the
-legacy `cmux-localreview` checkout) already implemented the full difit-shaped
-*product* behavior — repo-qualified file list, split/unified/full-file diff
-modes, hunk navigation, Viewed state, inline `/ask`, formal comments, a
-decision bar, Queue Home with Local/GitHub columns and a machine sidebar —
-routed entirely through the closed `api.ts` command surface. What it lacked
-was difit's visual density, exact palette, toolbar layout, and file-list
-richness. This pass was a **visual and markup restyle within the existing
-component boundaries**, not a rewrite.
+The original pass started from `frontend/src/App.tsx`, then a single large
+component tree with no `WorkspaceShell.tsx`/`QueueHome.tsx` decomposition. It
+already implemented the full difit-shaped *product* behavior — repo-qualified
+file list, split/unified/full-file diff modes, hunk navigation, Viewed state,
+inline `/ask`, formal comments, a decision bar, Queue Home with Local/GitHub
+columns and a machine sidebar — routed entirely through the closed `api.ts`
+command surface. What it lacked was difit's visual density, exact palette,
+toolbar layout, and file-list richness. The original pass was a **visual and
+markup restyle within the existing component boundaries**, not a rewrite; the
+current bounded file-tree extraction is described below.
 
-## Architecture decision: no separate presentation-adapter module
+## Current presentation structure
 
-The task's recommended architecture was a formal adapter layer converting
-`ReviewRound`/`MaterializedDiff` into difit-shaped view models in new files.
-I did not build one. Reasons:
+The original migration deliberately kept the reviewer inside `App.tsx`. The
+current working tree has since made one bounded extraction:
+`frontend/src/RepositoryFileTree.tsx` owns only the repository-qualified file
+tree's filtering and expansion state. Selection and Viewed persistence remain
+in `App.tsx` and continue through the existing API path. It is not a general
+presentation-adapter layer and it does not change the `ReviewRound` or
+`MaterializedDiff` command/data boundary.
 
-- The frontend has **zero existing test coverage** (no test runner is even
-  configured in `package.json`). Extracting `App.tsx`'s ~15 inline
-  components into new files/modules is a real refactor with no safety net,
-  on a product whose spec explicitly ranks "correctness and data safety"
-  and "no dead ends" above "brevity and proven interaction patterns" when
-  those conflict.
-- The view-model shaping the spec asks for (`fileKey`, per-file additions/
-  deletions counts, status glyphs, viewed progress) already existed or was
-  added as small pure helper functions inside `App.tsx`, still exclusively
-  fed by `api.ts` return values — the *behavior* the adapter pattern wants
-  (repo-qualified identity preserved in every key/callback, all actions
-  routed through `api.ts`) is satisfied; only the file-boundary refactor was
-  deferred.
-
-**Follow-up recommendation:** once the concurrent backend refactor in flight
-on this branch lands and the app is buildable again, add a frontend test
-harness (vitest + @testing-library/react) *before* attempting the file-level
-componentization, so the extraction can be verified rather than trusted.
+The frontend now also has a Vitest + Testing Library fixture harness. The
+current suite is green and covers durable-chat recovery, stale-poll
+cancellation, cached-machine visibility, responsive pane controls, and the
+repository tree; see "Current verification and remaining gaps" below.
 
 ## difit files copied or adapted
 
@@ -116,10 +105,42 @@ projects. No difit source file exists anywhere in this repository.
    Copilot, or perform queue mutations" — false since the Tauri wiring
    landed (40+ real `invoke()` calls gated by `desktopAvailable`). Corrected.
 
+### Current follow-up: file tree, responsive escape hatches, and semantics
+
+The current working tree adds the following implementation work. It is covered
+by the new packaged-app acceptance addendum below, while the older notarized
+release evidence remains historical.
+
+10. **Repository-aware file tree:** `RepositoryFileTree` renders each
+    repository as its own root, supports filtering, expandable directories,
+    and collapsed single-child directory chains. Its identity is
+    `repository_id + path`, so equal paths in two repositories cannot collide.
+    It retains the existing selected-file and Viewed persistence callbacks.
+11. **Responsive pane controls:** the reviewer toolbar now exposes named
+    Files and Chat controls with `aria-controls` and `aria-expanded`. The
+    narrow rules no longer remove Queue Home secondary actions; at narrow
+    widths the Files pane is explicitly opened/closed rather than silently
+    disappearing, and the decision actions wrap instead of using the previous
+    horizontal action strip.
+12. **Accessible state:** Unified/Split and Full file expose their pressed
+    state; viewed progress is a determinate `progressbar`; status/decision
+    text uses dedicated higher-contrast foreground tokens.
+
+13. **Continuous multi-file review:** Unified and Split now render every
+    changed file in one scroll surface with sticky, collapsible per-file
+    headers. Selecting a path in the tree expands and scrolls to that file
+    without changing immutable snapshot, hunk-action, or Viewed semantics.
+
+A hunk `/ask` click still records the pending anchor without automatically
+opening a collapsed Chat pane. The labelled Chat control makes the pending
+anchor reachable at every supported width; automatically opening Chat remains
+an optional follow-up rather than a correctness gate.
+
 ### Second pass: fixture harness + live browser verification
 
-`src-tauri` still doesn't build (see below), so a dev-only fixture harness
-was added instead of waiting: `frontend/src/api.fixture.ts` (`9c6d475`) is a
+At the time of the second pass, `src-tauri` did not build (see the historical
+record below), so a dev-only fixture harness was added:
+`frontend/src/api.fixture.ts` (`9c6d475`) is a
 structural drop-in for `api.ts` — same 45 exports, in-memory mutable fixture
 store covering 5 rounds across local/github/machine/completed, a multi-repo
 diff (binary/added/deleted/long-path files), formal comments, an `/ask`
@@ -187,10 +208,11 @@ pass. `npm run build` re-verified clean after each fix.
 - **Word-level diff emphasis**: not added, for the same reason — the
   current diff data model has no word/char-level segments; this is a real
   feature, not a style change.
-- **File-list directory tree grouping / collapse-by-folder**: difit
-  collapses single-child directory chains into one row; this app's file
-  list stays a flat filtered list. Deferred as a smaller, separable
-  follow-up.
+- **File-list directory tree grouping / collapse-by-folder**: implemented in
+  the current follow-up. The repository-aware tree keeps repository roots
+  distinct, filters paths, permits explicit directory expansion, and collapses
+  unambiguous single-child chains. Unified and Split now use difit's
+  continuous multi-file scroll pattern with sticky per-file headers.
 - **AI-computed review order (`ReviewPlanPanel` in the legacy app)**:
   intentionally not ported — explicitly out of scope per the task.
 - **Split-mode line selection**: unified mode supports click/shift-click
@@ -200,14 +222,47 @@ pass. `npm run build` re-verified clean after each fix.
   Replicating the selection/anchor logic across a paired two-column layout
   is a real feature addition with its own edge cases (e.g. which side does
   a click on a context row anchor to), deferred rather than rushed.
-- **Narrow-width (<900px) visual verification**: the ~1120px breakpoint
-  added in the accessibility pass was verified by reading the CSS, but this
-  session's browser-automation tooling did not honor window-resize requests
-  (`resize_window` reported success but `window.innerWidth` never changed),
-  so an actual narrow-viewport screenshot could not be captured. Worth a
-  manual check with the real desktop app window resized by hand.
+- **Production notarization:** the Files/Chat escape hatches, repository tree,
+  and continuous diff now have fixture, browser, and universal packaged-app
+  evidence. The package used an ad-hoc signature; production notarization is
+  tracked separately by the release gate.
 
-## Behavioral regressions checked
+## Current verification and remaining gaps
+
+This section separates the retained historical migration checks from checks
+run against the **current working tree**.
+
+- `cd frontend && npm test` passed: 2 files, 9 tests.
+- `cd frontend && npm run build` and `npx vite build --mode fixture` passed.
+- The in-app browser fixture passed at 1280px, 1024px, and 560px. Files and
+  Chat remained reachable, continuous diffs rendered at non-zero width, and
+  the interrupted `/ask` retry created a fresh explicit prompt while retaining
+  prior history. Retained screenshots:
+  `../evidence/v0.1.0/difit-reviewer-desktop.png`,
+  `../evidence/v0.1.0/difit-reviewer-1024.png`,
+  `../evidence/v0.1.0/difit-reviewer-560.png`, and
+  `../evidence/v0.1.0/difit-queue-home.png`.
+- A universal macOS `.app` was built with ad-hoc signing and updater artifacts
+  disabled. It reopened the retained multi-repository round, resized to the
+  560px minimum, and successfully exercised the Files and Chat controls,
+  Settings/Escape, and continuous review. See
+  `../evidence/v0.1.0/difit-native-reviewer.png` and
+  `../evidence/v0.1.0/difit-native-reviewer-560.png`.
+
+### Verification checklist and retained evidence
+
+The browser fixture was exercised at the three exact viewport widths. The
+packaged app was exercised at its wide launch size and by dragging to the
+configured 560px minimum; production notarization remains a separate gate.
+
+| Viewport | Verify |
+| --- | --- |
+| 1280px | Queue Home actions remain available; reviewer shows Files, diff, and Chat; select/filter/collapse a nested file-tree path; switch Unified, Split, and Full file; mark a file Viewed; open and close Settings with keyboard focus returning to its trigger. |
+| 1024px | Open a review with Chat initially collapsed; use the labelled Chat control to open and close it, confirm `aria-expanded` follows state, then verify an `/ask` anchor is visible after opening Chat. Confirm Files remains selectable and no pane/action is clipped. |
+| 560px | Start with Files collapsed; use Open files to reveal the file tree, select a different file, and close it again. Open Chat, exercise the wrapping decision actions, and verify both panes/actions remain reachable by keyboard without horizontal clipping. |
+| Packaged app | Open wide, drag to the configured 560px minimum, reopen the persisted multi-repository round, and perform a no-op review (no Submit/Publish). This confirms Tauri window behavior without mutating source or remote state. |
+
+## Historical behavioral regressions checked
 
 - `npm run build` (tsc --noEmit + vite build) passes clean after every
   commit in this sequence.
@@ -217,21 +272,23 @@ pass. `npm run build` re-verified clean after each fix.
 - Viewed-state now has a single source of truth (file-list checkbox and
   diff-header button call the same handler) rather than risking two paths
   drifting apart.
-- Focus trapping, Escape, and focus restore verified present on all 9
-  dialogs/drawers; the persistent (non-overlay) chat column was confirmed to
-  intentionally *not* use the modal focus trap, since trapping focus in an
-  always-mounted panel with no close affordance would strand keyboard users.
+- The original migration record reports focus trapping, Escape, and focus
+  restore across nine dialogs/drawers. This follow-up re-exercised only the
+  Settings dialog focus return; it did not rerun that full historical matrix.
 - Repo-qualified identity (`fileKey(repository_id, path)`) preserved in every
   touched key/callback — no multi-repo filename collisions introduced.
 - No new `invoke()` calls, no new credential handling, no lifecycle/decision/
   publishing semantics changed — confirmed by reading every diff before
   committing.
 
-## Screenshot comparison
+## Historical screenshot comparison
 
-**The real packaged app still cannot be built.** `src-tauri` fails to compile
-for the same reason as before, from the same unrelated concurrent backend
-work (not touched by this migration):
+The following is retained historical fixture evidence from the original
+migration pass. It is not a current signed-app or responsive acceptance run.
+
+**At the time of this historical run, the packaged app could not be built.**
+`src-tauri` failed to compile because of unrelated concurrent backend work
+(not touched by this migration):
 
 ```
 error[E0425]: cannot find type `ReproductionPreview` in crate `review_queue_core`
@@ -261,7 +318,11 @@ couldn't perform (see "Visual differences that remain" above). Once
 `src-tauri` builds again, re-run this same comparison against the real app
 and the same fixture/topic used for the original legacy screenshots.
 
-## Exact commands and results
+## Historical commands and results
+
+These are the original migration commands/results, retained for provenance;
+they are not claims about the current working tree. Current frontend results
+are stated in "Current verification and remaining gaps" above.
 
 | Command | Result |
 | --- | --- |

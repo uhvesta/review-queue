@@ -97,6 +97,11 @@ import type {
   PreparedFeedbackPrompt,
   UpdateCheck,
 } from "./types";
+import {
+  RepositoryFileTree,
+  diffLineCounts,
+  repositoryFileKey as fileKey,
+} from "./RepositoryFileTree";
 
 type Modal = "submit" | "github" | "details" | "reproduce" | "settings" | "machine" | null;
 type PurgeIntent = { round: ReviewRound; kind: "delete" | "approve_local" };
@@ -108,6 +113,12 @@ const emptyBrief = (): ReviewBrief => ({
   approach_alternatives: "",
   testing: "",
 });
+
+function mediaMatches(query: string, fallback: (width: number) => boolean) {
+  return typeof window.matchMedia === "function"
+    ? window.matchMedia(query).matches
+    : fallback(window.innerWidth);
+}
 
 const dialogFocusableSelector = [
   "button:not([disabled])",
@@ -297,6 +308,11 @@ export function App() {
       ) : activeMachineId ? (
         <MachineQueue
           status={machines.find((machine) => machine.machine.id === activeMachineId) ?? null}
+          cachedRounds={rounds.filter((round) =>
+            round.collection === "machine"
+            && round.source_metadata?.kind === "machine"
+            && round.source_metadata.machine_id === activeMachineId
+          )}
           onBack={() => setActiveMachineId(null)}
           onChanged={refreshMachines}
           onOpen={async (round) => {
@@ -316,6 +332,7 @@ export function App() {
           onSubmit={() => setModal("submit")}
           onReviewPr={() => setModal("github")}
           connectionHealth={connectionHealth}
+          machines={machines}
           onSettings={() => setModal("settings")}
           onRefresh={refresh}
           onComplete={(round) => mutate(() => completeRound(round.id))}
@@ -328,7 +345,9 @@ export function App() {
           onRefreshGithub={(round) => mutate(() => refreshGithubRound(round.id))}
         />
       )}
-      {error && selected && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
+      {error && (selected || activeMachineId) && (
+        <ErrorBanner error={error} onDismiss={() => setError(null)} />
+      )}
       {modal === "submit" && (
         <SubmitLocalDialog
           onClose={() => setModal(null)}
@@ -454,12 +473,14 @@ function Sidebar({
 
 function MachineQueue({
   status,
+  cachedRounds,
   onBack,
   onChanged,
   onOpen,
   onError,
 }: {
   status: MachineStatus | null;
+  cachedRounds: ReviewRound[];
   onBack: () => void;
   onChanged: () => Promise<MachineStatus[]>;
   onOpen: (round: ReviewRound) => Promise<void>;
@@ -543,9 +564,30 @@ function MachineQueue({
             </p>
           )}
           {index?.index.items.length === 0 && <p className="empty-state">No rounds on {localStatus.machine.config.name}.</p>}
+          {cachedRounds.map((round) => (
+            <article className="queue-card" key={round.id}>
+              <div className="card-title">
+                <span className="state-dot" data-state={displayLifecycle(round.lifecycle)} />
+                <strong>{round.brief.title}</strong>
+              </div>
+              <p>{round.source_metadata?.kind === "machine" ? round.source_metadata.remote_workspace_path : round.manifest.workspace_root}</p>
+              <p>{round.manifest.topic} · snapshot {shortSha(round.manifest_hash)}</p>
+              <footer>
+                <span className="status good">cached locally</span>
+                <button className="open" disabled={working} onClick={() => void onOpen(round)}>
+                  Open cached review
+                </button>
+              </footer>
+            </article>
+          ))}
           {index && index.index.items.length > 0 && (
             <>
-            {index.index.items.map((item) => (
+            {index.index.items
+              .filter((item) => !cachedRounds.some((round) =>
+                round.source_metadata?.kind === "machine"
+                && round.source_metadata.source_item_id === item.source_item_id
+              ))
+              .map((item) => (
               <article className="queue-card" key={item.source_item_id}>
                 <div className="card-title"><span className="state-dot" /><strong>{item.title}</strong></div>
                 <p>{item.remote_workspace_path}</p>
@@ -729,6 +771,7 @@ interface QueueHomeProps {
   onSubmit: () => void;
   onReviewPr: () => void;
   connectionHealth: ConnectionHealth | null;
+  machines: MachineStatus[];
   onSettings: () => void;
   onRefresh: () => Promise<void>;
   onComplete: (round: ReviewRound) => void;
@@ -742,13 +785,22 @@ interface QueueHomeProps {
 }
 
 function QueueHome(props: QueueHomeProps) {
-  const [nextScope, setNextScope] = useState<"overall" | "local" | "github" | "machine">("overall");
+  const [nextScope, setNextScope] = useState("overall");
   const local = props.rounds.filter((round) => round.collection === "local");
   const github = props.rounds.filter((round) => round.collection === "github");
   const activeLocal = local.filter(isActive).length;
   const activeGithub = github.filter(isActive).length;
   const next = [...props.rounds].filter((round) =>
-    isActive(round) && (nextScope === "overall" || round.collection === nextScope),
+    isActive(round) && (
+      nextScope === "overall"
+      || round.collection === nextScope
+      || (
+        nextScope.startsWith("machine:")
+        && round.collection === "machine"
+        && round.source_metadata?.kind === "machine"
+        && round.source_metadata.machine_id === nextScope.slice("machine:".length)
+      )
+    ),
   ).sort((a, b) => {
     const sourceOrder = { local: 0, github: 1, machine: 2 };
     return sourceOrder[a.collection] - sourceOrder[b.collection] || a.rank - b.rank;
@@ -814,11 +866,15 @@ function QueueHome(props: QueueHomeProps) {
           <button className="next" disabled={!next} onClick={() => next && props.onOpen(next)}>
             {next ? `Open next · ${next.brief.title}` : "Open next"}
           </button>
-          <select aria-label="Open next source" value={nextScope} onChange={(event) => setNextScope(event.target.value as typeof nextScope)}>
+          <select aria-label="Open next source" value={nextScope} onChange={(event) => setNextScope(event.target.value)}>
             <option value="overall">Overall</option>
             <option value="local">Local</option>
             <option value="github">GitHub</option>
-            <option value="machine">Connected machine</option>
+            {props.machines.map((machine) => (
+              <option value={`machine:${machine.machine.id}`} key={machine.machine.id}>
+                {machine.machine.config.name}
+              </option>
+            ))}
           </select>
         </div>
         <label className="toggle">
@@ -963,11 +1019,16 @@ function Reviewer({
   onPurge: (kind: "delete" | "approve_local") => void;
   onGithubRoundRefreshed: (round: ReviewRound) => Promise<void>;
 }) {
-  const [filter, setFilter] = useState("");
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => mediaMatches("(max-width: 580px)", (width) => width <= 580),
+  );
+  const [chatOpen, setChatOpen] = useState(
+    () => mediaMatches("(min-width: 1121px)", (width) => width >= 1121),
+  );
   const [diff, setDiff] = useState<MaterializedDiff | null>(null);
   const [diffError, setDiffError] = useState<CommandError | null>(null);
   const [selectedKey, setSelectedKey] = useState("");
+  const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(new Set());
   const [viewed, setViewed] = useState<Set<string>>(new Set());
   const [diffLoading, setDiffLoading] = useState(true);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
@@ -986,6 +1047,20 @@ function Reviewer({
     : round.lifecycle === "completed"
       ? "Completed — Requeue to review again"
       : "";
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const filesQuery = window.matchMedia("(max-width: 580px)");
+    const chatQuery = window.matchMedia("(min-width: 1121px)");
+    const updateFiles = (event: MediaQueryListEvent) => setSidebarCollapsed(event.matches);
+    const updateChat = (event: MediaQueryListEvent) => setChatOpen(event.matches);
+    filesQuery.addEventListener("change", updateFiles);
+    chatQuery.addEventListener("change", updateChat);
+    return () => {
+      filesQuery.removeEventListener("change", updateFiles);
+      chatQuery.removeEventListener("change", updateChat);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1041,11 +1116,42 @@ function Reviewer({
       }))),
     [diff],
   );
-  const filteredFiles = files.filter(({ repository, path }) =>
-    `${repository.root}/${path}`.toLowerCase().includes(filter.toLowerCase()),
-  );
   const selected = files.find(({ file, path }) =>
     fileKey(file.repository_id, path) === selectedKey) ?? files[0];
+  const diffFileElements = useRef(new Map<string, HTMLElement>());
+
+  useEffect(() => {
+    setCollapsedFiles(new Set());
+  }, [round.id]);
+
+  useEffect(() => {
+    if (!selectedKey || viewMode === "file") return;
+    const element = diffFileElements.current.get(selectedKey);
+    if (!element) return;
+    const frame = window.requestAnimationFrame(() => {
+      element.scrollIntoView({ block: "start", behavior: "smooth" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [selectedKey, viewMode]);
+
+  const selectDiffFile = (key: string) => {
+    setCollapsedFiles((current) => {
+      if (!current.has(key)) return current;
+      const next = new Set(current);
+      next.delete(key);
+      return next;
+    });
+    setSelectedKey(key);
+  };
+
+  const toggleDiffFileCollapsed = (key: string) => {
+    setCollapsedFiles((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
 
   const toggleViewedFor = async (repositoryId: string, path: string) => {
     if (readOnly) return;
@@ -1145,18 +1251,21 @@ function Reviewer({
       <div className="review-toolbar">
         <div className="toolbar-brand" aria-hidden="true">RQ</div>
         <button
-          className="icon-button"
-          aria-label={sidebarCollapsed ? "Show file list" : "Hide file list"}
-          aria-pressed={sidebarCollapsed}
+          className="pane-toggle"
+          aria-label={sidebarCollapsed ? "Open files" : "Close files"}
+          aria-expanded={!sidebarCollapsed}
+          aria-controls="review-files"
           onClick={() => setSidebarCollapsed((value) => !value)}
         >
-          {sidebarCollapsed ? "»" : "«"}
+          <span aria-hidden="true">☰</span>
+          <span>Files</span>
         </button>
         <button className="icon-button" aria-label="Settings" onClick={onSettings}>⚙</button>
         <div className="view-modes toolbar-view-modes" role="group" aria-label="Diff view">
           {(["unified", "split"] as const).map((mode) => (
             <button
               className={viewMode === mode ? "selected-mode" : ""}
+              aria-pressed={viewMode === mode}
               key={mode}
               onClick={() => setViewMode(mode)}
             >
@@ -1164,16 +1273,33 @@ function Reviewer({
             </button>
           ))}
         </div>
-        <div className="viewed-progress" aria-label={`${viewedCount} of ${totalFiles} files viewed`}>
+        <div
+          className="viewed-progress"
+          aria-label={`${viewedCount} of ${totalFiles} files viewed`}
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={totalFiles}
+          aria-valuenow={viewedCount}
+        >
           <span>{viewedCount} / {totalFiles} files viewed</span>
           <div className="progress-track">
             <div className="progress-fill" style={{ width: `${viewedPercent}%` }} />
           </div>
         </div>
+        <button
+          className="pane-toggle"
+          aria-label={chatOpen ? "Close chat" : "Open chat"}
+          aria-expanded={chatOpen}
+          aria-controls="round-chat"
+          onClick={() => setChatOpen((value) => !value)}
+        >
+          <span aria-hidden="true">◧</span>
+          <span>Chat</span>
+        </button>
         <span className="revision-pill" title={`Manifest ${round.manifest_hash}`}>{shortSha(round.manifest_hash)}</span>
       </div>
-      <div className={`workspace snapshot-workspace ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
-        <aside className="files">
+      <div className={`workspace snapshot-workspace ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${chatOpen ? "chat-open" : "chat-collapsed"}`}>
+        <aside className="files" id="review-files">
           <div className="pane-title">Repositories</div>
           <div className="files-summary">
             <span>{totalFiles} file{totalFiles === 1 ? "" : "s"} changed</span>
@@ -1182,38 +1308,17 @@ function Reviewer({
               <span className="removed">-{aggregateStats.deletions}</span>
             </span>
           </div>
-          <input aria-label="Filter repositories" placeholder="Filter paths" value={filter} onChange={(event) => setFilter(event.target.value)} />
-          {filteredFiles.map(({ repository, file, path }) => {
-            const key = fileKey(file.repository_id, path);
-            const counts = diffLineCounts(file);
-            const isViewed = viewed.has(key);
-            return (
-            <div
-              className={`file ${selected && fileKey(selected.file.repository_id, selected.path) === key ? "selected-file" : ""}`}
-              key={key}
-            >
-              <button className="file-select" onClick={() => setSelectedKey(key)}>
-                <span className={`file-status status-${file.status}`} aria-hidden="true">{statusGlyph(file.status)}</span>
-                <span className="file-name">{repository.root}/{path}</span>
-              </button>
-              <span className="file-stats">
-                {counts.additions > 0 && <span className="added">+{counts.additions}</span>}
-                {counts.deletions > 0 && <span className="removed">-{counts.deletions}</span>}
-              </span>
-              <button
-                className={`file-viewed-toggle ${isViewed ? "checked" : ""}`}
-                disabled={readOnly}
-                aria-pressed={isViewed}
-                aria-label={isViewed ? `Mark ${path} not viewed` : `Mark ${path} viewed`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void toggleViewedFor(file.repository_id, path);
-                }}
-              >
-                {isViewed ? "✓" : ""}
-              </button>
-            </div>
-          )})}
+          <RepositoryFileTree
+            repositories={diff?.repositories ?? []}
+            selectedKey={selected ? fileKey(selected.file.repository_id, selected.path) : null}
+            viewedKeys={viewed}
+            viewedDisabled={readOnly}
+            filterPlaceholder="Filter paths"
+            onSelect={(entry) => selectDiffFile(entry.key)}
+            onToggleViewed={(entry) => {
+              void toggleViewedFor(entry.repositoryId, entry.path);
+            }}
+          />
         </aside>
         <section className="diff snapshot-pane" aria-label="Immutable diff">
           <div className="diff-head">
@@ -1238,6 +1343,7 @@ function Reviewer({
             </div>
             <button
               className={viewMode === "file" ? "full-file-toggle selected-mode" : "full-file-toggle"}
+              aria-pressed={viewMode === "file"}
               onClick={() => setViewMode(viewMode === "file" ? "unified" : "file")}
             >
               Full file
@@ -1253,19 +1359,79 @@ function Reviewer({
           </div>
           {diffLoading && <p className="loading-state">Materializing pinned commits…</p>}
           {diffError && <ErrorPanel error={diffError} />}
-          {!diffLoading && !diffError && selected && viewMode !== "file" && (
-            <DiffFileView
-              file={selected.file}
-              layout={viewMode}
-              repositoryRoot={selected.repository.root}
-              importedComments={importedComments}
-              readOnly={readOnly}
-              onComment={(anchor) => {
-                setPendingAnchor(anchor);
-                setFeedbackOpen(true);
-              }}
-              onAsk={setPendingAskAnchor}
-            />
+          {!diffLoading && !diffError && viewMode !== "file" && files.length > 0 && (
+            <div className="diff-scroll" aria-label="Changed file diffs">
+              {files.map(({ repository, file, path }, index) => {
+                const key = fileKey(file.repository_id, path);
+                const counts = diffLineCounts(file);
+                const isCollapsed = collapsedFiles.has(key);
+                const isViewed = viewed.has(key);
+                const isSelected = selected?.file === file && selected?.path === path;
+                return (
+                  <article
+                    className={`continuous-diff-file ${isSelected ? "selected-diff-file" : ""}`}
+                    data-selected={isSelected || undefined}
+                    key={key}
+                    ref={(element) => {
+                      if (element) diffFileElements.current.set(key, element);
+                      else diffFileElements.current.delete(key);
+                    }}
+                  >
+                    <header className="continuous-diff-file-head">
+                      <div className="continuous-diff-file-title">
+                        <button
+                          className="continuous-diff-collapse"
+                          aria-expanded={!isCollapsed}
+                          aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${repository.root}/${path}`}
+                          onClick={() => toggleDiffFileCollapsed(key)}
+                        >
+                          <span aria-hidden="true">{isCollapsed ? "▸" : "▾"}</span>
+                        </button>
+                        <button
+                          className="continuous-diff-path"
+                          aria-current={isSelected ? "true" : undefined}
+                          onClick={() => selectDiffFile(key)}
+                          title={`${repository.root}/${path}`}
+                        >
+                          {repository.root}/{path}
+                        </button>
+                        <span className={`status-badge status-${file.status}`}>{file.status}</span>
+                      </div>
+                      <div className="continuous-diff-file-actions">
+                        <span className="diff-stat">
+                          {counts.additions > 0 && <span className="added">+{counts.additions}</span>}
+                          {counts.deletions > 0 && <span className="removed">-{counts.deletions}</span>}
+                        </span>
+                        <button
+                          className={isViewed ? "viewed-toggle viewed" : "viewed-toggle"}
+                          disabled={readOnly}
+                          title={readOnly ? reason : isViewed ? "Mark file not viewed" : "Mark file viewed"}
+                          onClick={() => void toggleViewedFor(file.repository_id, path)}
+                        >
+                          {isViewed ? "✓ Viewed" : "Mark viewed"}
+                        </button>
+                      </div>
+                    </header>
+                    {!isCollapsed && (
+                      <DiffFileView
+                        file={file}
+                        fileIndex={index}
+                        continuous
+                        layout={viewMode}
+                        repositoryRoot={repository.root}
+                        importedComments={importedComments}
+                        readOnly={readOnly}
+                        onComment={(anchor) => {
+                          setPendingAnchor(anchor);
+                          setFeedbackOpen(true);
+                        }}
+                        onAsk={setPendingAskAnchor}
+                      />
+                    )}
+                  </article>
+                );
+              })}
+            </div>
           )}
           {!diffLoading && !diffError && selected && viewMode === "file" && (
             <PinnedFilePane
@@ -1301,6 +1467,8 @@ function Reviewer({
         </section>
         <ChatSheet
           round={round}
+          open={chatOpen}
+          onClose={() => setChatOpen(false)}
           readOnly={readOnly}
           readOnlyReason={reason}
           pendingAnchor={pendingAskAnchor}
@@ -1336,12 +1504,16 @@ function Reviewer({
 
 function ChatSheet({
   round,
+  open,
+  onClose,
   readOnly,
   readOnlyReason,
   pendingAnchor,
   onAnchorConsumed,
 }: {
   round: ReviewRound;
+  open: boolean;
+  onClose: () => void;
   readOnly: boolean;
   readOnlyReason: string;
   pendingAnchor: Anchor | null;
@@ -1442,10 +1614,12 @@ function ChatSheet({
     }
   };
 
-  const pollUntilDone = async (turnId: string) => {
+  const pollUntilDone = async (turnId: string, conversation: AskConversation) => {
     try {
       for (;;) {
+        if (cancelledTurnIds.current.has(turnId)) break;
         const result = await pollCopilotPrompt(turnId);
+        if (cancelledTurnIds.current.has(turnId)) break;
         setTurns((current) => {
           const without = current.filter((turn) => turn.id !== result.turn.id);
           return [...without, result.turn].sort((a, b) => a.created_at.localeCompare(b.created_at));
@@ -1453,13 +1627,14 @@ function ChatSheet({
         if (result.update.state !== "chunk") break;
       }
     } catch (problem) {
-      if (cancelledTurnIds.current.delete(turnId)) {
+      if (cancelledTurnIds.current.has(turnId)) {
         setError(null);
       } else {
         setError(toCommandError(problem));
+        await loadConversation(conversation);
       }
-      await loadConversation(active as AskConversation);
     } finally {
+      cancelledTurnIds.current.delete(turnId);
       setStreamingTurnId(null);
     }
   };
@@ -1482,9 +1657,45 @@ function ChatSheet({
       setPrompt("");
       onAnchorConsumed();
       setStreamingTurnId(turn.id);
-      void pollUntilDone(turn.id);
+      void pollUntilDone(turn.id, active);
     } catch (problem) {
       setError(toCommandError(problem));
+    }
+  };
+
+  const retryInFreshChat = async (turn: AskTurn) => {
+    if (!active || starting || streamingTurnId) return;
+    setStarting(true);
+    setError(null);
+    try {
+      const next = await clearCopilotChat(round.id, active.id);
+      const history = await listPreviousChats(round.id);
+      const retryOptions = Object.fromEntries(
+        next.options
+          .filter((option) => option.selected)
+          .map((option) => [option.key, option.selected as string]),
+      );
+      const session = await startCopilotSession(round.id, next.id, retryOptions);
+      const retried = await sendCopilotPrompt(
+        round.id,
+        next.id,
+        turn.prompt,
+        turn.anchor ?? null,
+        session.activeOptions,
+      );
+      setActive(next);
+      setShown(next);
+      setPrevious(history);
+      setTurns([retried]);
+      setSessionId(session.sessionId);
+      setOptionValues(session.activeOptions);
+      setAuthLabel(`${session.authSource === "existing_cli_sign_in_read_only" ? "existing Copilot CLI sign-in" : "app OAuth"}${session.account ? ` · ${session.account}` : ""}`);
+      setStreamingTurnId(retried.id);
+      void pollUntilDone(retried.id, next);
+    } catch (problem) {
+      setError(toCommandError(problem));
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -1501,10 +1712,18 @@ function ChatSheet({
         : "Start a Copilot session before asking";
 
   return (
-    <aside className="chat" aria-label="Round chat">
+    <aside
+      className={`chat ${open ? "is-open" : ""}`}
+      id="round-chat"
+      aria-label="Round chat"
+      aria-hidden={!open}
+    >
       <header>
         <div><b>Chat</b><small> · {shortSha(round.id)}</small></div>
-        <span className="session-state">{historyOnly ? "history only" : authLabel || "ready to start"}</span>
+        <div className="chat-header-actions">
+          <span className="session-state">{historyOnly ? "history only" : authLabel || "ready to start"}</span>
+          <button className="chat-close" aria-label="Close chat" onClick={onClose}>×</button>
+        </div>
       </header>
       <div className="chat-actions">
         {previous.length > 0 && (
@@ -1592,11 +1811,33 @@ function ChatSheet({
             {turn.failure_reason && (
               <p className="danger-text">
                 {turn.failure_reason}{" "}
-                {!historyOnly && sessionId && <button onClick={(event) => void send(event, turn)}>Retry as new prompt</button>}
+                <button
+                  disabled={starting || Boolean(streamingTurnId)}
+                  title={historyOnly || !sessionId
+                    ? "Archives this history-only chat, starts a fresh session, and sends a new prompt only after this click."
+                    : "Creates a new prompt turn; the original request is never replayed automatically."}
+                  onClick={(event) => {
+                    if (historyOnly || !sessionId) void retryInFreshChat(turn);
+                    else void send(event, turn);
+                  }}
+                >
+                  Retry as new prompt
+                </button>
               </p>
             )}
-            {turn.state === "cancelled" && !historyOnly && sessionId && (
-              <button onClick={(event) => void send(event, turn)}>Retry as new prompt</button>
+            {(turn.state === "cancelled" || turn.state === "interrupted") && !turn.failure_reason && (
+              <button
+                disabled={starting || Boolean(streamingTurnId)}
+                title={historyOnly || !sessionId
+                  ? "Archives this history-only chat, starts a fresh session, and sends a new prompt only after this click."
+                  : "Creates a new prompt turn; the original request is never replayed automatically."}
+                onClick={(event) => {
+                  if (historyOnly || !sessionId) void retryInFreshChat(turn);
+                  else void send(event, turn);
+                }}
+              >
+                Retry as new prompt
+              </button>
             )}
           </article>
         ))}
@@ -2057,6 +2298,8 @@ function FullFileView({
 
 function DiffFileView({
   file,
+  fileIndex,
+  continuous = false,
   layout,
   repositoryRoot,
   importedComments,
@@ -2065,6 +2308,8 @@ function DiffFileView({
   onAsk,
 }: {
   file: DiffFile;
+  fileIndex: number;
+  continuous?: boolean;
   layout: "unified" | "split";
   repositoryRoot: string;
   importedComments: ImportedComment[];
@@ -2074,16 +2319,17 @@ function DiffFileView({
 }) {
   const [activeHunk, setActiveHunk] = useState(0);
   useEffect(() => {
-    document.getElementById("review-queue-active-hunk")?.scrollIntoView({
+    if (activeHunk === 0) return;
+    document.getElementById(`review-queue-active-hunk-${fileIndex}-${activeHunk}`)?.scrollIntoView({
       block: "nearest",
       behavior: "smooth",
     });
-  }, [activeHunk]);
+  }, [activeHunk, fileIndex]);
   if (file.is_binary) {
     return <div className="code binary-state"><b>Binary file changed</b><p>The pinned Git patch is retained, but binary content is not rendered as text.</p></div>;
   }
   return (
-    <div className="code" role="region" aria-label="Code diff" tabIndex={0}>
+    <div className={continuous ? "code continuous-code" : "code"} role="region" aria-label="Code diff" tabIndex={0}>
       <nav className="hunk-navigation" aria-label="Hunk navigation">
         <button disabled={activeHunk <= 0} onClick={() => setActiveHunk((value) => Math.max(0, value - 1))}>Previous hunk</button>
         <span>{file.hunks.length ? `${activeHunk + 1} / ${file.hunks.length}` : "No hunks"}</span>
@@ -2091,7 +2337,11 @@ function DiffFileView({
         <span className="muted">Use Full file to expand context.</span>
       </nav>
       {file.hunks.map((hunk, index) => (
-        <div id={index === activeHunk ? "review-queue-active-hunk" : undefined} className={index === activeHunk ? "active-hunk" : ""} key={`${hunk.old_start}:${hunk.new_start}:${index}`}>
+        <div
+          id={index === activeHunk ? `review-queue-active-hunk-${fileIndex}-${index}` : undefined}
+          className={index === activeHunk ? "active-hunk" : ""}
+          key={`${hunk.old_start}:${hunk.new_start}:${index}`}
+        >
           <DiffHunkView
             file={file}
             hunk={hunk}
@@ -2208,8 +2458,16 @@ function DiffHunkView({
       <div className="hunk-header">
         <span>@@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@ {hunk.header}</span>
         <span>
-          <button disabled={readOnly || !anchor} title={!anchor ? "The pinned blob is unavailable" : "Ask Copilot about this hunk"} onClick={() => anchor && onAsk(anchor)}>/ask</button>{" "}
-          <button disabled={readOnly || !anchor} title={!anchor ? "The pinned blob is unavailable" : "Add a formal comment anchored to this hunk"} onClick={() => anchor && onComment(anchor)}>＋ Comment</button>
+          <button
+            disabled={readOnly || !anchor}
+            title={readOnly ? "This round is read-only" : !anchor ? "The pinned blob is unavailable" : "Ask Copilot about this hunk"}
+            onClick={() => anchor && onAsk(anchor)}
+          >/ask</button>{" "}
+          <button
+            disabled={readOnly || !anchor}
+            title={readOnly ? "This round is read-only" : !anchor ? "The pinned blob is unavailable" : "Add a formal comment anchored to this hunk"}
+            onClick={() => anchor && onComment(anchor)}
+          >＋ Comment</button>
         </span>
       </div>
       {layout === "unified"
@@ -2288,7 +2546,7 @@ function ReviewBriefView({ brief }: { brief: ReviewBrief }) {
     ["Testing", brief.testing],
   ].filter(([, value]) => value);
   return (
-    <details className="brief" open>
+    <details className="brief">
       <summary>Review brief</summary>
       <div><b>{brief.title}</b>{fields.map(([label, value]) => <p key={label}><strong>{label}</strong>{value}</p>)}</div>
     </details>
@@ -3088,28 +3346,6 @@ function capabilitySessionOptions(groups: CopilotCapabilityGroup[]): SessionOpti
     supported: group.supported,
     unavailable_reason: group.unsupported_reason ?? null,
   }));
-}
-
-function fileKey(repositoryId: string, path: string) {
-  return `${repositoryId}\u0000${path}`;
-}
-
-function diffLineCounts(file: DiffFile): { additions: number; deletions: number } {
-  let additions = 0;
-  let deletions = 0;
-  for (const hunk of file.hunks) {
-    for (const line of hunk.lines) {
-      if (line.type === "addition") additions += 1;
-      else if (line.type === "deletion") deletions += 1;
-    }
-  }
-  return { additions, deletions };
-}
-
-function statusGlyph(status: DiffFile["status"]) {
-  if (status === "added") return "+";
-  if (status === "deleted") return "\u2212";
-  return "\u25cf";
 }
 
 function toCommandError(problem: unknown): CommandError {

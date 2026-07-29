@@ -7,7 +7,9 @@
     "dev": "vite",
     "dev:fixture": "vite --mode fixture",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
@@ -18,8 +20,12 @@
     "vite": "latest"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "latest",
+    "@testing-library/react": "latest",
     "@types/react": "latest",
-    "@types/react-dom": "latest"
+    "@types/react-dom": "latest",
+    "jsdom": "^29.0.0",
+    "vitest": "latest"
   },
   "optionalDependencies": {
     "@emnapi/core": "^2.0.0-alpha.3",

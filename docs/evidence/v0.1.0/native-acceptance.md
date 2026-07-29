@@ -135,3 +135,40 @@ After the final frontend cancellation and handoff-history fixes:
 - Workspace tests: 92 passed.
 - Desktop tests: 37 passed; two opt-in Keychain tests then passed explicitly.
 - Strict workspace and desktop Clippy passed with warnings denied.
+
+## Post-acceptance difit UI migration
+
+The current working tree was rebuilt as a universal macOS `.app` with ad-hoc
+signing and updater artifacts disabled. `codesign --verify --deep --strict`
+passed. This was a no-op UI acceptance run, not a notarized production release.
+
+The packaged app reopened the existing immutable multi-repository
+`release-acceptance` round and retained the configured public GitHub Client ID.
+Because the validation bundle had a new ad-hoc signature, macOS requested
+Keychain ACL approval; the run chose Deny, preserving the stored credential,
+and verified the actionable Keychain recovery state instead of changing auth.
+The existing Copilot CLI sign-in remained visible and distinct.
+
+Validated in the packaged app:
+
+- Queue Home retained local rounds and connected-machine state.
+- The reviewer rendered all three files continuously with sticky per-file
+  headers and repository-qualified tree entries.
+- The window resized to the 560px minimum; Files and Chat both collapsed to
+  labelled toolbar controls, and each opened and closed successfully.
+- Unified state, Viewed progress, Full file, hunk actions, formal decisions,
+  and the wrapping narrow decision bar remained reachable.
+- Settings opened as a modal, displayed the persisted public Client ID and
+  actionable Keychain recovery, and closed with Escape without mutating data.
+
+Retained evidence:
+
+- `difit-native-queue-home.png`
+- `difit-native-reviewer.png`
+- `difit-native-reviewer-560.png`
+
+The frontend fixture suite also passes 9/9 tests, including interrupted
+`/ask` retry into a fresh explicitly started chat, cancellation versus a late
+poll result, machine failures/cached rounds, responsive controls, and
+repository-tree behavior. Browser-fixture screenshots at 1280px, 1024px, and
+560px are retained alongside the native images.

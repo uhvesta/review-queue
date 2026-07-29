@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn machine_add_parses_the_full_ui_machine_config_for_ssh_and_loopback() {
-        let ssh = machine_config_from_args(&vec![
+        let ssh = machine_config_from_args(&[
             "machine".into(),
             "add".into(),
             "--name".into(),
@@ -606,7 +606,7 @@ mod tests {
         assert!(
             matches!(ssh.endpoint, MachineEndpoint::Ssh { ref target, ref remote_socket, adapter: SshAdapter::SystemOpenSsh } if target == "review@buildbox" && remote_socket == "/run/review-queue.sock")
         );
-        let loopback = machine_config_from_args(&vec![
+        let loopback = machine_config_from_args(&[
             "machine".into(),
             "add".into(),
             "--name".into(),
@@ -619,7 +619,7 @@ mod tests {
             matches!(loopback.endpoint, MachineEndpoint::Loopback { ref socket_path } if socket_path == "/tmp/fixture.sock")
         );
         assert!(
-            machine_config_from_args(&vec![
+            machine_config_from_args(&[
                 "machine".into(),
                 "add".into(),
                 "--name".into(),

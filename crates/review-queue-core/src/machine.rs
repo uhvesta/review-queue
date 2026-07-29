@@ -308,7 +308,9 @@ pub enum MachineRequest {
 pub enum MachineResponse {
     Health(MachineHealth),
     ItemIndex(MachineItemIndex),
-    ItemDetail(MachineItemDetail),
+    // Boxed only for enum layout. `Box<T>` serializes identically to `T`, so
+    // this preserves the established line-delimited JSON protocol envelope.
+    ItemDetail(Box<MachineItemDetail>),
     Snapshot(MachineSnapshot),
     Error { error: ActionableError },
 }
@@ -569,11 +571,11 @@ impl<T: MachineTransport> MachineClient<T> {
         self.details.insert(
             source_item_id.to_owned(),
             Cached {
-                value: detail.clone(),
+                value: (*detail).clone(),
                 cached_at: now,
             },
         );
-        Ok(detail)
+        Ok(*detail)
     }
 
     pub fn fetch_snapshot(
@@ -728,7 +730,7 @@ impl MachineTransport for LoopbackFakeTransport {
                 self.details
                     .get(&source_item_id)
                     .cloned()
-                    .map(MachineResponse::ItemDetail)
+                    .map(|detail| MachineResponse::ItemDetail(Box::new(detail)))
                     .ok_or_else(|| {
                         error(
                             "The requested remote queue item no longer exists.",
@@ -809,13 +811,13 @@ fn dispatch_store_result(
                 .as_deref()
                 .map(|id| store.route(id))
                 .transpose()?;
-            Ok(MachineResponse::ItemDetail(MachineItemDetail {
+            Ok(MachineResponse::ItemDetail(Box::new(MachineItemDetail {
                 summary: round_summary(&round),
                 brief: round.brief.clone(),
                 repository_count: round.manifest.repositories.len() as u32,
                 updated_at: round.created_at,
                 origin_route,
-            }))
+            })))
         }
         MachineRequest::Snapshot {
             protocol_version,
@@ -2151,6 +2153,40 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn boxed_item_detail_preserves_machine_response_json_shape() {
+        let detail = MachineItemDetail {
+            summary: summary(),
+            brief: ReviewBrief {
+                title: "Remote review".into(),
+                what: "A remote review".into(),
+                why: "It needs review.".into(),
+                approach_alternatives: "Use the cached immutable source.".into(),
+                testing: "Run the fixture tests.".into(),
+            },
+            repository_count: 1,
+            updated_at: Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+            origin_route: None,
+        };
+        let response = MachineResponse::ItemDetail(Box::new(detail.clone()));
+        let mut expected = serde_json::to_value(&detail).unwrap();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .insert("result".into(), serde_json::json!("item_detail"));
+
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded, expected,
+            "Box must not alter the protocol envelope"
+        );
+        assert_eq!(
+            serde_json::from_value::<MachineResponse>(encoded).unwrap(),
+            response,
+            "the established response JSON must still deserialize"
+        );
     }
 
     #[test]
