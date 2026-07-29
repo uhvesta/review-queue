@@ -1214,6 +1214,7 @@ mod tests {
             superseded_by: None,
             created_at: Utc::now(),
             origin_route_id: None,
+            origin_route: None,
             source_metadata: None,
         }
     }

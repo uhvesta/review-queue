@@ -60,8 +60,13 @@ directory. Point the CLI at that socket when exercising programmatic flows:
 
 ```sh
 REVIEW_QUEUE_SOCKET=/path/from/desktop/runtime/review-queue.sock \
+  cargo run --bin review-queue -- agent register \
+  --route parser-agent --adapter acp --agent agent-17 \
+  --cwd /path/to/workspace --cmux-workspace review --cmux-surface parser
+
+REVIEW_QUEUE_SOCKET=/path/from/desktop/runtime/review-queue.sock \
   cargo run --bin review-queue -- submit /path/to/workspace \
-  --topic parser-v2 --title "Parser error handling" --json
+  --route parser-agent --topic parser-v2 --title "Parser error handling" --json
 ```
 
 Run `cargo run --bin review-queue -- --help` for PR, machine, agent-liveness,

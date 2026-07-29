@@ -66,6 +66,7 @@ export interface ReviewRound {
   superseded_by?: string | null;
   created_at: string;
   origin_route_id?: string | null;
+  origin_route?: AgentRoute | null;
   source_metadata?:
     | {
         kind: "machine";
@@ -276,6 +277,7 @@ export interface LocalSubmissionRequest {
   workspacePath: string;
   topic: string;
   brief: ReviewBrief;
+  originRouteId?: string | null;
   participatingRepositoryIds: string[];
   preflightToken?: string | null;
 }
@@ -300,6 +302,7 @@ export interface LocalPreflight {
   repositories: LocalPreflightRepository[];
   beforeFingerprint: string;
   participatingRepositoryIds: string[];
+  originRouteId?: string | null;
   preflightToken: string;
 }
 

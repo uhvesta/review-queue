@@ -20,8 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{Store, SubmissionResult};
 use crate::{
-    ActionableError, AgentRoute, Collection, DomainError,
-    capture::{self, CaptureRequest},
+    ActionableError, AgentRoute, Collection, DomainError, capture::CaptureRequest,
     machine::MachineConfig,
 };
 
@@ -106,7 +105,9 @@ pub fn dispatch(store: &mut Store, request: SocketRequest) -> SocketResponse {
             include_old,
         } => store.list(collection, include_old).and_then(json),
         SocketRequest::GetRound { id } => store.round(&id).and_then(json),
-        SocketRequest::PreflightCapture { request } => capture::preflight(&request).and_then(json),
+        SocketRequest::PreflightCapture { request } => {
+            store.preflight_local_capture(&request).and_then(json)
+        }
         SocketRequest::CaptureLocal { request } => store
             .ingest_local_capture(&request)
             .and_then(|result| json(submission_result(result))),
@@ -539,7 +540,9 @@ fn capture_transport_error(what_happened: &str) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ReviewBrief, Round, local_topic_identity};
+    use crate::capture;
+    use crate::{AgentRouteProvenance, ReviewBrief, Round, local_topic_identity};
+    use chrono::Utc;
     use std::{
         net::Shutdown,
         os::unix::{fs::symlink, net::UnixStream},
@@ -593,6 +596,7 @@ mod tests {
                     approach_alternatives: String::new(),
                     testing: String::new(),
                 },
+                origin_route_id: None,
                 participating_repository_ids: Vec::new(),
                 preflight_token: None,
             },
@@ -653,10 +657,30 @@ mod tests {
     fn socket_capture_matches_direct_ingestion_identity_and_rank_behavior() {
         let (direct_workspace, mut direct_request) = capture_fixture();
         direct_request.workspace_root = direct_workspace.path().into();
-        let direct_preflight = capture::preflight(&direct_request).unwrap();
+        let direct_route = AgentRoute {
+            id: "route-parity".into(),
+            adapter_kind: "acp".into(),
+            agent_id: "agent-parity".into(),
+            endpoint: None,
+            session_id: Some("session-parity".into()),
+            status: "busy".into(),
+            last_heartbeat: Utc::now(),
+            provenance: Some(Box::new(AgentRouteProvenance {
+                schema_version: Some(1),
+                original_cwd: Some(direct_workspace.path().to_string_lossy().into_owned()),
+                cmux_workspace: Some("workspace-parity".into()),
+                cmux_surface: Some("surface-parity".into()),
+                ..AgentRouteProvenance::default()
+            })),
+        };
+        let mut direct_store = Store::in_memory().unwrap();
+        direct_store.register_route(&direct_route).unwrap();
+        let direct_preflight = direct_store
+            .preflight_local_capture(&direct_request)
+            .unwrap();
+        direct_request.origin_route_id = direct_preflight.origin_route_id;
         direct_request.participating_repository_ids = direct_preflight.participating_repository_ids;
         direct_request.preflight_token = Some(direct_preflight.preflight_token);
-        let mut direct_store = Store::in_memory().unwrap();
         let direct_round = match direct_store.ingest_local_capture(&direct_request).unwrap() {
             SubmissionResult::Created(round) => round,
             _ => panic!("first direct ingestion should create"),
@@ -665,6 +689,10 @@ mod tests {
         let (socket_workspace, mut socket_request) = capture_fixture();
         socket_request.workspace_root = socket_workspace.path().into();
         let mut socket_store = Store::in_memory().unwrap();
+        let mut socket_route = direct_route.clone();
+        socket_route.provenance.as_mut().unwrap().original_cwd =
+            Some(socket_workspace.path().to_string_lossy().into_owned());
+        socket_store.register_route(&socket_route).unwrap();
         let preflight = match dispatch(
             &mut socket_store,
             SocketRequest::PreflightCapture {
@@ -679,6 +707,7 @@ mod tests {
                 panic!("preflight unexpectedly entered capture handshake")
             }
         };
+        socket_request.origin_route_id = preflight.origin_route_id;
         socket_request.participating_repository_ids = preflight.participating_repository_ids;
         socket_request.preflight_token = Some(preflight.preflight_token);
         let socket_round: Round = match dispatch(
@@ -696,6 +725,22 @@ mod tests {
 
         assert_eq!(socket_round.rank, direct_round.rank);
         assert_eq!(socket_round.lifecycle, direct_round.lifecycle);
+        assert_eq!(
+            socket_round.origin_route_id.as_deref(),
+            Some("route-parity")
+        );
+        assert_eq!(
+            direct_round.origin_route_id.as_deref(),
+            Some("route-parity")
+        );
+        assert_eq!(
+            socket_round
+                .origin_route
+                .as_ref()
+                .and_then(|route| route.provenance.as_deref())
+                .and_then(|provenance| provenance.cmux_surface.as_deref()),
+            Some("surface-parity")
+        );
         assert_eq!(
             socket_round.topic_identity,
             local_topic_identity(&socket_round.manifest)

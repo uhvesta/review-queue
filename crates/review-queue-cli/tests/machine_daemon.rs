@@ -87,6 +87,7 @@ fn shipped_daemon_serves_machine_protocol_and_complete_reviewer_snapshot() {
         workspace_root: repository.clone(),
         topic: "fixture".into(),
         brief: brief.clone(),
+        origin_route_id: None,
         participating_repository_ids: Vec::new(),
         preflight_token: None,
     })

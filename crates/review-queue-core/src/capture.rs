@@ -25,6 +25,12 @@ pub struct CaptureRequest {
     pub workspace_root: PathBuf,
     pub topic: String,
     pub brief: ReviewBrief,
+    /// Optional registered AgentRoute selected for this capture. The Store
+    /// resolves this ID to the complete token-free route and provenance before
+    /// any Git or SQLite mutation. It is included in the preflight fingerprint
+    /// so a route cannot be silently changed between preview and capture.
+    #[serde(default)]
+    pub origin_route_id: Option<String>,
     /// Empty during initial discovery; otherwise the exact repositories which
     /// the user chose to participate.
     #[serde(default)]
@@ -40,6 +46,8 @@ pub struct Preflight {
     pub repositories: Vec<PreflightRepository>,
     pub before_fingerprint: String,
     pub participating_repository_ids: Vec<String>,
+    #[serde(default)]
+    pub origin_route_id: Option<String>,
     pub preflight_token: String,
 }
 
@@ -240,6 +248,7 @@ pub fn preflight(request: &CaptureRequest) -> Result<Preflight, DomainError> {
         repositories: result,
         before_fingerprint,
         participating_repository_ids: requested,
+        origin_route_id: request.origin_route_id.clone(),
         preflight_token,
     })
 }
@@ -336,6 +345,12 @@ fn request_fingerprint(
             request.brief.why.trim().to_owned(),
             request.brief.approach_alternatives.trim().to_owned(),
             request.brief.testing.trim().to_owned(),
+            request
+                .origin_route_id
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
             before_fingerprint.to_owned(),
         ]
         .into_iter()
@@ -682,6 +697,7 @@ mod tests {
                 approach_alternatives: String::new(),
                 testing: String::new(),
             },
+            origin_route_id: None,
             participating_repository_ids: Vec::new(),
             preflight_token: None,
         }
@@ -802,6 +818,13 @@ mod tests {
         input.participating_repository_ids = vec!["app".into()];
         let app_only = preflight(&input).unwrap();
         assert_ne!(all.preflight_token, app_only.preflight_token);
+        let mut routed = input.clone();
+        routed.origin_route_id = Some("route-a".into());
+        let route_a = preflight(&routed).unwrap();
+        routed.origin_route_id = Some("route-b".into());
+        let route_b = preflight(&routed).unwrap();
+        assert_ne!(app_only.preflight_token, route_a.preflight_token);
+        assert_ne!(route_a.preflight_token, route_b.preflight_token);
         assert!(
             app_only
                 .repositories
@@ -822,6 +845,13 @@ mod tests {
         input.preflight_token = Some(app_only.preflight_token);
         input.brief.why = "The form changed.".into();
         let error = prepare_capture(&input).unwrap_err();
+        assert_eq!(error.error.code, "preflight_stale");
+        assert_eq!(output(&app, &["rev-list", "--count", "HEAD"]), "1");
+        assert_eq!(output(&tools, &["rev-list", "--count", "HEAD"]), "1");
+
+        routed.preflight_token = Some(route_b.preflight_token);
+        routed.origin_route_id = Some("route-a".into());
+        let error = prepare_capture(&routed).unwrap_err();
         assert_eq!(error.error.code, "preflight_stale");
         assert_eq!(output(&app, &["rev-list", "--count", "HEAD"]), "1");
         assert_eq!(output(&tools, &["rev-list", "--count", "HEAD"]), "1");

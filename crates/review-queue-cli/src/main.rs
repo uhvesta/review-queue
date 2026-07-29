@@ -9,7 +9,7 @@ use anyhow::Context;
 use chrono::Utc;
 use review_queue_core::store::Store;
 use review_queue_core::{
-    AgentRoute, ReviewBrief, Round,
+    AgentRoute, AgentRouteProvenance, ReviewBrief, Round,
     capture::{CaptureRequest, Preflight},
     machine::{
         DEFAULT_REMOTE_SOCKET, MachineConfig, MachineEndpoint, MachineSourceType, SshAdapter,
@@ -104,23 +104,14 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
             serve(socket, Arc::new(Mutex::new(store)))
         }
         "submit" => {
-            let workspace = args.get(1).context("submit needs a workspace path")?;
-            let topic = required(&args, "--topic")?;
-            let title = required(&args, "--title")?;
-            let brief = read_brief(&args, title)?;
-            let mut capture_request = CaptureRequest {
-                workspace_root: PathBuf::from(workspace),
-                topic: topic.to_owned(),
-                brief,
-                participating_repository_ids: Vec::new(),
-                preflight_token: None,
-            };
+            let mut capture_request = capture_request_from_args(&args)?;
             // Both calls go to the already-running desktop before this process
             // performs any Git operation. The second call owns capture,
             // persistence, index finalization, and rollback.
             let preflight: Preflight = response_data(call(SocketRequest::PreflightCapture {
                 request: capture_request.clone(),
             })?)?;
+            capture_request.origin_route_id = preflight.origin_route_id;
             capture_request.participating_repository_ids = preflight.participating_repository_ids;
             capture_request.preflight_token = Some(preflight.preflight_token);
             print_response(
@@ -155,24 +146,7 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
         },
         "agent" => match args.get(1).map(String::as_str) {
             Some("register") => {
-                let id = required(&args, "--route")?;
-                let adapter_kind = required(&args, "--adapter")?;
-                let agent_id = required(&args, "--agent")?;
-                let status = optional(&args, "--status");
-                let route = AgentRoute {
-                    id: id.into(),
-                    adapter_kind: adapter_kind.into(),
-                    agent_id: agent_id.into(),
-                    endpoint: optional_nonempty(&args, "--endpoint"),
-                    session_id: optional_nonempty(&args, "--session"),
-                    status: if status.is_empty() {
-                        "idle".into()
-                    } else {
-                        status
-                    },
-                    last_heartbeat: Utc::now(),
-                    provenance: None,
-                };
+                let route = agent_route_from_args(&args)?;
                 print_response(
                     call(SocketRequest::AgentRegister {
                         route: Box::new(route),
@@ -192,7 +166,7 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
                 )
             }
             _ => anyhow::bail!(
-                "agent supports: register --route ID --adapter KIND --agent ID [--endpoint URL] [--session ID] | heartbeat --route ID --status idle|busy|error"
+                "agent supports: register --route ID --adapter KIND --agent ID [--endpoint URL] [--session ID] [--provenance FILE] [--cwd PATH] [--cmux-workspace ID] [--cmux-surface ID] | heartbeat --route ID --status idle|busy|error"
             ),
         },
         "pr" if args.get(1).map(String::as_str) == Some("add") => {
@@ -208,6 +182,76 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
         "setup" => anyhow::bail!("setup supports: --copilot"),
         _ => anyhow::bail!("Unknown command '{}'. Run review-queue --help.", args[0]),
     }
+}
+
+fn capture_request_from_args(args: &[String]) -> anyhow::Result<CaptureRequest> {
+    let workspace = args.get(1).context("submit needs a workspace path")?;
+    let topic = required(args, "--topic")?;
+    let title = required(args, "--title")?;
+    Ok(CaptureRequest {
+        workspace_root: PathBuf::from(workspace),
+        topic: topic.to_owned(),
+        brief: read_brief(args, title)?,
+        origin_route_id: optional_nonempty(args, "--route"),
+        participating_repository_ids: Vec::new(),
+        preflight_token: None,
+    })
+}
+
+fn agent_route_from_args(args: &[String]) -> anyhow::Result<AgentRoute> {
+    let status = optional(args, "--status");
+    Ok(AgentRoute {
+        id: required(args, "--route")?.into(),
+        adapter_kind: required(args, "--adapter")?.into(),
+        agent_id: required(args, "--agent")?.into(),
+        endpoint: optional_nonempty(args, "--endpoint"),
+        session_id: optional_nonempty(args, "--session"),
+        status: if status.is_empty() {
+            "idle".into()
+        } else {
+            status
+        },
+        last_heartbeat: Utc::now(),
+        provenance: agent_route_provenance_from_args(args)?,
+    })
+}
+
+fn agent_route_provenance_from_args(
+    args: &[String],
+) -> anyhow::Result<Option<Box<AgentRouteProvenance>>> {
+    if let Some(path) = optional_nonempty(args, "--provenance") {
+        let provenance = serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .with_context(|| format!("Could not read provenance file {path}"))?,
+        )
+        .context("Provenance file must contain AgentRouteProvenance JSON")?;
+        return Ok(Some(Box::new(provenance)));
+    }
+
+    let provenance = AgentRouteProvenance {
+        schema_version: Some(1),
+        adapter_version: optional_nonempty(args, "--adapter-version"),
+        provider: optional_nonempty(args, "--provider"),
+        provider_version: optional_nonempty(args, "--provider-version"),
+        machine_id: optional_nonempty(args, "--machine"),
+        original_cwd: optional_nonempty(args, "--cwd"),
+        cmux_workspace: optional_nonempty(args, "--cmux-workspace"),
+        cmux_surface: optional_nonempty(args, "--cmux-surface"),
+        reconnect_recipe: optional_nonempty(args, "--reconnect"),
+        provider_resume_handle: optional_nonempty(args, "--resume-handle"),
+        transcript_reference: optional_nonempty(args, "--transcript"),
+        mode: optional_nonempty(args, "--mode"),
+        model: optional_nonempty(args, "--model"),
+        thinking: optional_nonempty(args, "--thinking"),
+        context: optional_nonempty(args, "--context"),
+        last_turn: None,
+    };
+    let has_provenance = provenance
+        != AgentRouteProvenance {
+            schema_version: Some(1),
+            ..AgentRouteProvenance::default()
+        };
+    Ok(has_provenance.then_some(Box::new(provenance)))
 }
 
 fn required<'a>(args: &'a [String], flag: &str) -> anyhow::Result<&'a str> {
@@ -408,7 +452,13 @@ description: Capture the current workspace as an immutable local Review Queue ro
 Collect a concise review title plus What, Why, Approach / Alternatives, and
 Testing context. Then invoke the installed token-free CLI:
 
-`review-queue submit <workspace> --topic <stable-key> --title <title> --what <what> --why <why> --approach <approach> --testing <testing> --json`
+Register this agent's token-free route once (and heartbeat it as needed):
+
+`review-queue agent register --route <stable-route-id> --adapter copilot-cli --agent <agent-id> --cwd <workspace> --cmux-workspace <workspace-id> --cmux-surface <surface-id> --json`
+
+Then include that registered route in capture:
+
+`review-queue submit <workspace> --route <stable-route-id> --topic <stable-key> --title <title> --what <what> --why <why> --approach <approach> --testing <testing> --json`
 
 Never request or pass credentials. If Review Queue is unavailable, preserve
 the user's context and show the CLI's exact recovery action.
@@ -517,13 +567,13 @@ fn print_usage() {
     println!(
         "review-queue (token-free CLI)\n\n\
   review-queue daemon --db PATH --socket PATH\n\
-  review-queue submit WORKSPACE --topic KEY --title TEXT [--brief brief.json] [--json]\n\
+  review-queue submit WORKSPACE --topic KEY --title TEXT [--route ID] [--brief brief.json] [--json]\n\
   review-queue pr add https://github.com/OWNER/REPO/pull/NUMBER [--json]\n\
   review-queue machine add --name NAME --ssh SSH_TARGET [--remote-socket PATH] [--json]\n\
   review-queue machine add --name NAME --loopback-socket PATH [--json]\n\
   review-queue machine ls [--json]\n\
   review-queue machine remove ID_OR_NAME [--json]\n\
-  review-queue agent register --route ID --adapter KIND --agent ID [--endpoint URL] [--session ID] [--json]\n\
+  review-queue agent register --route ID --adapter KIND --agent ID [--endpoint URL] [--session ID] [--provenance FILE] [--cwd PATH] [--cmux-workspace ID] [--cmux-surface ID] [--json]\n\
   review-queue agent heartbeat --route ID --status idle|busy|error [--json]\n\
   review-queue reproduce ROUND_ID --destination PATH [--confirm] [--json]\n\
   review-queue diagnose [--json]\n\
@@ -567,6 +617,7 @@ mod tests {
                 approach_alternatives: String::new(),
                 testing: String::new(),
             },
+            origin_route_id: None,
             participating_repository_ids: Vec::new(),
             preflight_token: None,
         }
@@ -631,6 +682,50 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn submit_and_agent_registration_parse_token_free_route_provenance() {
+        let capture = capture_request_from_args(&[
+            "submit".into(),
+            "/work/review".into(),
+            "--topic".into(),
+            "parser".into(),
+            "--title".into(),
+            "Parser review".into(),
+            "--route".into(),
+            "route-17".into(),
+        ])
+        .unwrap();
+        assert_eq!(capture.origin_route_id.as_deref(), Some("route-17"));
+
+        let route = agent_route_from_args(&[
+            "agent".into(),
+            "register".into(),
+            "--route".into(),
+            "route-17".into(),
+            "--adapter".into(),
+            "acp".into(),
+            "--agent".into(),
+            "agent-17".into(),
+            "--cwd".into(),
+            "/work/review".into(),
+            "--cmux-workspace".into(),
+            "workspace-17".into(),
+            "--cmux-surface".into(),
+            "surface-17".into(),
+            "--provider".into(),
+            "copilot-cli".into(),
+            "--model".into(),
+            "gpt-5.6".into(),
+        ])
+        .unwrap();
+        let provenance = route.provenance.expect("provenance");
+        assert_eq!(provenance.original_cwd.as_deref(), Some("/work/review"));
+        assert_eq!(provenance.cmux_workspace.as_deref(), Some("workspace-17"));
+        assert_eq!(provenance.cmux_surface.as_deref(), Some("surface-17"));
+        assert_eq!(provenance.provider.as_deref(), Some("copilot-cli"));
+        assert_eq!(provenance.model.as_deref(), Some("gpt-5.6"));
     }
 
     #[test]
@@ -709,6 +804,8 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_str(&request).expect("parse request");
             assert_eq!(parsed["type"], "preflight_capture");
             assert!(parsed["request"]["preflight_token"].is_null());
+            assert_eq!(parsed["request"]["origin_route_id"], "route-safe");
+            assert!(parsed["request"].get("origin_route").is_none());
             stream
                 .try_clone()
                 .expect("clone response stream")
@@ -716,13 +813,10 @@ mod tests {
                 .expect("write response");
         });
 
-        let response = call_at(
-            path.clone(),
-            SocketRequest::PreflightCapture {
-                request: capture_request(),
-            },
-        )
-        .expect("preflight succeeds");
+        let mut request = capture_request();
+        request.origin_route_id = Some("route-safe".into());
+        let response = call_at(path.clone(), SocketRequest::PreflightCapture { request })
+            .expect("preflight succeeds");
         assert!(matches!(response, SocketResponse::Ok { .. }));
         server.join().expect("server succeeds");
         std::fs::remove_file(path).expect("remove test socket");

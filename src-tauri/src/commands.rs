@@ -186,6 +186,11 @@ pub struct LocalSubmitRequest {
     pub workspace_path: String,
     pub topic: String,
     pub brief: ReviewBrief,
+    /// Optional explicit route selection. When omitted, the shared Store
+    /// boundary attaches the sole registered route whose saved cwd belongs to
+    /// this workspace; ambiguous route sets are never guessed.
+    #[serde(default)]
+    pub origin_route_id: Option<String>,
     #[serde(default)]
     pub participating_repository_ids: Vec<String>,
     #[serde(default)]
@@ -286,6 +291,8 @@ pub struct LocalPreflight {
     pub repositories: Vec<LocalPreflightRepository>,
     pub before_fingerprint: String,
     pub participating_repository_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_route_id: Option<String>,
     pub preflight_token: String,
 }
 
@@ -319,6 +326,7 @@ impl From<capture::Preflight> for LocalPreflight {
                 .collect(),
             before_fingerprint: value.before_fingerprint,
             participating_repository_ids: value.participating_repository_ids,
+            origin_route_id: value.origin_route_id,
             preflight_token: value.preflight_token,
         }
     }
@@ -329,6 +337,7 @@ fn capture_request(input: LocalSubmitRequest) -> CaptureRequest {
         workspace_root: input.workspace_path.into(),
         topic: input.topic,
         brief: input.brief,
+        origin_route_id: input.origin_route_id,
         participating_repository_ids: input.participating_repository_ids,
         preflight_token: input.preflight_token,
     }
@@ -367,8 +376,15 @@ pub fn discover_local(workspace_path: String) -> Result<Vec<String>, CommandErro
 
 /// Runs the complete no-write validation pass for the exact later submission.
 #[tauri::command]
-pub fn preflight_local(request: LocalSubmitRequest) -> Result<LocalPreflight, CommandError> {
-    capture::preflight(&capture_request(request))
+pub fn preflight_local(
+    request: LocalSubmitRequest,
+    state: State<'_, AppState>,
+) -> Result<LocalPreflight, CommandError> {
+    state
+        .0
+        .lock()
+        .map_err(|_| unavailable())?
+        .preflight_local_capture(&capture_request(request))
         .map(LocalPreflight::from)
         .map_err(Into::into)
 }

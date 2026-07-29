@@ -12,7 +12,7 @@ use crate::{
     adapters::{
         AskConversation, AskTurn, AskTurnState, ConversationSessionState, DiscoveredSessionOption,
     },
-    capture::{CaptureRequest, prepare_capture},
+    capture::{CaptureRequest, Preflight, prepare_capture},
     github::{
         GithubMaterializedFile, GithubPublishAttempt, GithubPublishStatus, GithubQueuePayload,
         GithubReplyAttempt, GithubReplyRequest, GithubRoundState,
@@ -212,6 +212,10 @@ impl Store {
                 "ALTER TABLE rounds ADD COLUMN source_metadata_json TEXT",
                 [],
             )?;
+        }
+        if !table_has_column(&self.conn, "rounds", "origin_route_json")? {
+            self.conn
+                .execute("ALTER TABLE rounds ADD COLUMN origin_route_json TEXT", [])?;
         }
         if !table_has_column(&self.conn, "machines", "config_json")? {
             self.conn
@@ -541,6 +545,18 @@ impl Store {
         Ok(result)
     }
 
+    /// Runs local preflight after binding an explicitly selected route, or
+    /// the sole registered route whose saved working directory is inside the
+    /// submitted workspace. The route ID is part of capture's fingerprint, so
+    /// the later mutation cannot silently attach a different route.
+    pub fn preflight_local_capture(
+        &self,
+        request: &CaptureRequest,
+    ) -> Result<Preflight, DomainError> {
+        let (request, _) = self.bind_local_capture_route(request)?;
+        crate::capture::preflight(&request)
+    }
+
     /// The single local-ingestion path used by the desktop UI and local
     /// socket. Git refs stay guarded until SQLite persistence and real-index
     /// finalization have both succeeded.
@@ -563,6 +579,12 @@ impl Store {
     where
         F: FnOnce(&SubmissionResult) -> Result<(), DomainError>,
     {
+        let (request, origin_route) = self.bind_local_capture_route(request)?;
+        if let Some(route) = origin_route.as_ref() {
+            // Route rows may originate in an older database. Re-validate the
+            // complete snapshot at the capture boundary before Git is touched.
+            validate_ingress(route)?;
+        }
         if request.participating_repository_ids.is_empty() {
             return Err(DomainError::actionable(
                 "At least one repository must participate in capture.",
@@ -586,13 +608,13 @@ impl Store {
             ));
         }
 
-        let mut pending = prepare_capture(request)?;
+        let mut pending = prepare_capture(&request)?;
         let submission = Submission {
             collection: Collection::Local,
             topic_identity: local_topic_identity(pending.manifest()),
             brief: request.brief.clone(),
             manifest: pending.manifest().clone(),
-            origin_route: None,
+            origin_route,
             source_metadata: None,
         };
         let tx = match self.conn.transaction() {
@@ -615,6 +637,55 @@ impl Store {
         pending.seal();
         Ok(result)
     }
+
+    fn bind_local_capture_route(
+        &self,
+        request: &CaptureRequest,
+    ) -> Result<(CaptureRequest, Option<AgentRoute>), DomainError> {
+        let mut request = request.clone();
+        if let Some(id) = request
+            .origin_route_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        {
+            let route = self.route(&id)?;
+            request.origin_route_id = Some(route.id.clone());
+            return Ok((request, Some(route)));
+        }
+        request.origin_route_id = None;
+
+        let candidates = self
+            .routes()?
+            .into_iter()
+            .filter(|route| route_matches_workspace(route, &request.workspace_root))
+            .collect::<Vec<_>>();
+        if candidates.len() == 1 {
+            let route = candidates.into_iter().next().expect("one candidate");
+            request.origin_route_id = Some(route.id.clone());
+            return Ok((request, Some(route)));
+        }
+        Ok((request, None))
+    }
+}
+
+fn route_matches_workspace(route: &AgentRoute, workspace: &Path) -> bool {
+    let Some(original_cwd) = route
+        .provenance
+        .as_deref()
+        .and_then(|provenance| provenance.original_cwd.as_deref())
+        .filter(|cwd| !cwd.trim().is_empty())
+    else {
+        return false;
+    };
+    let Ok(workspace) = std::fs::canonicalize(workspace) else {
+        return false;
+    };
+    let Ok(original_cwd) = std::fs::canonicalize(original_cwd) else {
+        return false;
+    };
+    original_cwd.starts_with(workspace)
 }
 
 fn submit_in_transaction(
@@ -637,6 +708,7 @@ fn submit_in_transaction(
         .origin_route
         .as_ref()
         .map(|route| route.id.clone());
+    let origin_route = submission.origin_route.clone();
     let active = find_active_by_topic(tx, submission.collection, &submission.topic_identity)?;
     if let Some(old) = active.as_ref()
         && (old.manifest_hash == hash || same_pinned_source(&old.manifest, &submission.manifest))
@@ -658,6 +730,7 @@ fn submit_in_transaction(
         superseded_by: None,
         created_at: now,
         origin_route_id,
+        origin_route,
         source_metadata: submission.source_metadata,
     };
     if let Some(route) = submission.origin_route {
@@ -2633,6 +2706,11 @@ fn round_from_row(row: &rusqlite::Row<'_>) -> Result<Round, rusqlite::Error> {
                 .map_err(db_error)?
                 .map(parse)
                 .transpose()?,
+            origin_route: row
+                .get::<_, Option<String>>(12)
+                .map_err(db_error)?
+                .map(parse)
+                .transpose()?,
         })
     };
     read().map_err(|e| {
@@ -2651,7 +2729,7 @@ fn next_rank(tx: &Transaction<'_>, collection_: Collection) -> Result<i64, Domai
     tx.query_row("SELECT COALESCE(MAX(rank), -1) + 1 FROM rounds WHERE collection = ?1 AND lifecycle != 'completed' AND superseded_by IS NULL", params![collection_.as_str()], |r| r.get(0)).map_err(db_error)
 }
 fn insert_round(tx: &Transaction<'_>, r: &Round) -> Result<(), DomainError> {
-    tx.execute("INSERT INTO rounds(id,collection,topic_identity,manifest_hash,brief_json,manifest_json,rank,lifecycle,superseded_by,created_at,origin_route_id,source_metadata_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![r.id,r.collection.as_str(),r.topic_identity,r.manifest_hash,json(&r.brief)?,json(&r.manifest)?,r.rank,r.lifecycle.as_str(),r.superseded_by,r.created_at.to_rfc3339(),r.origin_route_id,r.source_metadata.as_ref().map(json).transpose()?]).map_err(db_error)?;
+    tx.execute("INSERT INTO rounds(id,collection,topic_identity,manifest_hash,brief_json,manifest_json,rank,lifecycle,superseded_by,created_at,origin_route_id,source_metadata_json,origin_route_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![r.id,r.collection.as_str(),r.topic_identity,r.manifest_hash,json(&r.brief)?,json(&r.manifest)?,r.rank,r.lifecycle.as_str(),r.superseded_by,r.created_at.to_rfc3339(),r.origin_route_id,r.source_metadata.as_ref().map(json).transpose()?,r.origin_route.as_ref().map(json).transpose()?]).map_err(db_error)?;
     Ok(())
 }
 fn upsert_route_tx(tx: &Transaction<'_>, route: &AgentRoute) -> Result<(), DomainError> {
@@ -2715,6 +2793,7 @@ mod tests {
                 approach_alternatives: "Use a guarded transaction.".into(),
                 testing: "Inject persistence and index failures.".into(),
             },
+            origin_route_id: None,
             participating_repository_ids: Vec::new(),
             preflight_token: None,
         };
@@ -2824,6 +2903,7 @@ mod tests {
             workspace_root: workspace.path().into(),
             topic: request.topic.clone(),
             brief: request.brief.clone(),
+            origin_route_id: None,
             participating_repository_ids: Vec::new(),
             preflight_token: None,
         })
@@ -2834,6 +2914,100 @@ mod tests {
         assert_eq!(
             store.ingest_local_capture(&request).unwrap_err().error.code,
             "preflight_stale"
+        );
+    }
+
+    #[test]
+    fn local_capture_binds_and_freezes_registered_route_provenance() {
+        let (_workspace, repository, mut request) = local_capture_fixture();
+        let database_directory = tempfile::tempdir().unwrap();
+        let database = database_directory.path().join("route-snapshot.sqlite3");
+        let mut store = Store::open(&database).unwrap();
+        let route = AgentRoute {
+            id: "route-capture".into(),
+            adapter_kind: "acp".into(),
+            agent_id: "agent-capture".into(),
+            endpoint: Some("127.0.0.1:4777".into()),
+            session_id: Some("session-capture".into()),
+            status: "busy".into(),
+            last_heartbeat: Utc::now(),
+            provenance: Some(Box::new(AgentRouteProvenance {
+                schema_version: Some(1),
+                adapter_version: Some("1.4.0".into()),
+                provider: Some("copilot-cli".into()),
+                provider_version: Some("0.0.350".into()),
+                machine_id: Some("local-mac".into()),
+                original_cwd: Some(repository.to_string_lossy().into_owned()),
+                cmux_workspace: Some("review-workspace".into()),
+                cmux_surface: Some("surface-7".into()),
+                reconnect_recipe: Some("Resume the saved agent session.".into()),
+                provider_resume_handle: Some("resume-42".into()),
+                transcript_reference: Some("transcript-42".into()),
+                mode: Some("code".into()),
+                model: Some("gpt-5.6".into()),
+                thinking: Some("high".into()),
+                context: Some("originating review task".into()),
+                last_turn: None,
+            })),
+        };
+        store.register_route(&route).unwrap();
+
+        let preflight = store.preflight_local_capture(&request).unwrap();
+        assert_eq!(
+            preflight.origin_route_id.as_deref(),
+            Some(route.id.as_str())
+        );
+        request.origin_route_id = preflight.origin_route_id;
+        request.participating_repository_ids = preflight.participating_repository_ids;
+        request.preflight_token = Some(preflight.preflight_token);
+        let round = match store.ingest_local_capture(&request).unwrap() {
+            SubmissionResult::Created(round) => round,
+            result => panic!("expected created round, got {result:?}"),
+        };
+        assert_eq!(round.origin_route_id.as_deref(), Some(route.id.as_str()));
+        assert_eq!(round.origin_route.as_ref(), Some(&route));
+        assert_eq!(
+            store.round(&round.id).unwrap().origin_route,
+            Some(route.clone())
+        );
+
+        store.heartbeat(&route.id, "idle").unwrap();
+        let mut changed = route.clone();
+        changed.provenance.as_mut().unwrap().model = Some("different-model".into());
+        store.register_route(&changed).unwrap();
+        assert_eq!(
+            store.route(&route.id).unwrap().provenance,
+            changed.provenance
+        );
+        assert_eq!(
+            store.round(&round.id).unwrap().origin_route,
+            Some(route.clone()),
+            "the capture-point snapshot must not follow mutable route updates"
+        );
+        drop(store);
+        let reopened = Store::open(&database).unwrap();
+        assert_eq!(
+            reopened.round(&round.id).unwrap().origin_route,
+            Some(route),
+            "the immutable route snapshot must survive restart"
+        );
+    }
+
+    #[test]
+    fn unknown_explicit_route_is_rejected_before_git_or_sqlite_mutation() {
+        let (_workspace, repository, mut request) = local_capture_fixture();
+        let before = repository_state(&repository);
+        let mut store = Store::in_memory().unwrap();
+        request.origin_route_id = Some("missing-route".into());
+
+        let error = store.ingest_local_capture(&request).unwrap_err();
+        assert_eq!(error.error.code, "route_not_found");
+        assert_eq!(repository_state(&repository), before);
+        assert!(
+            store
+                .list(Some(Collection::Local), true)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -3356,6 +3530,7 @@ mod tests {
         assert_eq!(route.agent_id, "legacy-agent");
         assert_eq!(route.provenance, None);
         assert!(table_has_column(&store.conn, "routes", "provenance_json").unwrap());
+        assert!(table_has_column(&store.conn, "rounds", "origin_route_json").unwrap());
     }
 
     #[test]

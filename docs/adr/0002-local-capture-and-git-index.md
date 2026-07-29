@@ -12,6 +12,16 @@ review brief, topic, selected repository IDs, heads, and porcelain status.
 Changing any form field, selection, ref, index, worktree, or untracked file
 invalidates that token before mutation.
 
+An optional originating-agent selection contains only a registered route ID.
+The Store resolves that ID before Git mutation (or resolves the sole saved
+route whose token-free original cwd belongs to the workspace), validates the
+complete route at the persistence boundary, and includes the normalized ID in
+the preflight token. Ambiguous cwd matches are not guessed. A successful round
+stores both the route ID used for current liveness and an immutable JSON
+snapshot of the capture-time route/provenance. Later heartbeat or registration
+updates therefore cannot rewrite the producing agent, cmux, model, resume, or
+transcript context recorded with an older round.
+
 The implementation builds each selected commit through a temporary Git index.
 The resulting refs remain guarded by `PendingCapture`, which retains the exact
 original index bytes. The same desktop-owned operation then opens the SQLite

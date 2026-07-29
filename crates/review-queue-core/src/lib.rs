@@ -252,6 +252,13 @@ pub struct Round {
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub origin_route_id: Option<String>,
+    /// Immutable token-free snapshot of the route that originated this round.
+    ///
+    /// `origin_route_id` remains useful for current liveness/heartbeat lookup,
+    /// while this value preserves the capture-time provenance even if that
+    /// registered route is later updated or removed.
+    #[serde(default)]
+    pub origin_route: Option<AgentRoute>,
     #[serde(default)]
     pub source_metadata: Option<SourceMetadata>,
 }

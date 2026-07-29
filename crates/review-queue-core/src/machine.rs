@@ -806,11 +806,14 @@ fn dispatch_store_result(
         } => {
             validate_version(protocol_version)?;
             let round = served_round(store, &source_item_id)?;
-            let origin_route = round
-                .origin_route_id
-                .as_deref()
-                .map(|id| store.route(id))
-                .transpose()?;
+            let origin_route = match round.origin_route.clone() {
+                Some(snapshot) => Some(snapshot),
+                None => round
+                    .origin_route_id
+                    .as_deref()
+                    .map(|id| store.route(id))
+                    .transpose()?,
+            };
             Ok(MachineResponse::ItemDetail(Box::new(MachineItemDetail {
                 summary: round_summary(&round),
                 brief: round.brief.clone(),
