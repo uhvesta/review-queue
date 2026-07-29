@@ -2024,7 +2024,7 @@ function ChatSheet({
 
   const clear = async () => {
     try {
-      if (!active) return;
+      if (readOnly || !active) return;
       const next = await clearCopilotChat(round.id, active.id);
       const history = await listPreviousChats(round.id);
       setSessionId(null);
@@ -2039,7 +2039,7 @@ function ChatSheet({
   };
 
   const startSession = async (requestedOptions = optionValues) => {
-    if (!active) return;
+    if (readOnly || !active) return;
     setStarting(true);
     setError(null);
     try {
@@ -2081,7 +2081,7 @@ function ChatSheet({
 
   const send = async (event: React.FormEvent, retry?: AskTurn) => {
     event.preventDefault();
-    if (!active || !sessionId) return;
+    if (readOnly || !active || !sessionId) return;
     const text = retry?.prompt ?? prompt.trim();
     if (!text) return;
     setError(null);
@@ -2104,7 +2104,15 @@ function ChatSheet({
   };
 
   const retryInFreshChat = async (turn: AskTurn) => {
-    if (!active || starting || streamingTurnId) return;
+    if (
+      readOnly
+      || !active
+      || shown?.id !== active.id
+      || shown.session_state === "history_only"
+      || turn.conversation_id !== active.id
+      || starting
+      || streamingTurnId
+    ) return;
     setStarting(true);
     setError(null);
     try {
@@ -2141,6 +2149,21 @@ function ChatSheet({
 
   const providerLost = !sessionId && turns.length > 0 && shown?.id === active?.id;
   const historyOnly = shown?.id !== active?.id || shown?.session_state === "history_only" || providerLost || readOnly;
+  const canRetryTurn = (turn: AskTurn) =>
+    !readOnly
+    && Boolean(active)
+    && shown?.id === active?.id
+    && shown?.session_state !== "history_only"
+    && turn.conversation_id === active?.id;
+  const retryTitle = (turn: AskTurn) => {
+    if (readOnly) return readOnlyReason || "This historical round is read-only.";
+    if (!canRetryTurn(turn)) {
+      return "Archived chats are permanently read-only. Return to Current chat to continue.";
+    }
+    return historyOnly || !sessionId
+      ? "Archives the current transcript, starts a fresh session, and sends a new prompt only after this click."
+      : "Creates a new prompt turn; the original request is never replayed automatically.";
+  };
   const currentConversationShown = shown?.id === active?.id;
   const displayedOptions = currentConversationShown && capabilities
     ? capabilitySessionOptions(capabilities.option_groups)
@@ -2288,10 +2311,8 @@ function ChatSheet({
               <p className="danger-text">
                 {turn.failure_reason}{" "}
                 <button
-                  disabled={starting || Boolean(streamingTurnId)}
-                  title={historyOnly || !sessionId
-                    ? "Archives this history-only chat, starts a fresh session, and sends a new prompt only after this click."
-                    : "Creates a new prompt turn; the original request is never replayed automatically."}
+                  disabled={!canRetryTurn(turn) || starting || Boolean(streamingTurnId)}
+                  title={retryTitle(turn)}
                   onClick={(event) => {
                     if (historyOnly || !sessionId) void retryInFreshChat(turn);
                     else void send(event, turn);
@@ -2303,10 +2324,8 @@ function ChatSheet({
             )}
             {(turn.state === "cancelled" || turn.state === "interrupted") && !turn.failure_reason && (
               <button
-                disabled={starting || Boolean(streamingTurnId)}
-                title={historyOnly || !sessionId
-                  ? "Archives this history-only chat, starts a fresh session, and sends a new prompt only after this click."
-                  : "Creates a new prompt turn; the original request is never replayed automatically."}
+                disabled={!canRetryTurn(turn) || starting || Boolean(streamingTurnId)}
+                title={retryTitle(turn)}
                 onClick={(event) => {
                   if (historyOnly || !sessionId) void retryInFreshChat(turn);
                   else void send(event, turn);

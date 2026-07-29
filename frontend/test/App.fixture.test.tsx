@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const paginationTitle = "Fix pagination cursor drift across core-api and web-frontend";
 const githubTitle = "Improve error messages for expired tokens";
+const completedTitle = "Rename legacy config module path constant";
 const recoverableError = {
   code: "fixture_recoverable_error",
   message: "The requested review update could not be completed.",
@@ -195,16 +196,168 @@ describe("fixture-backed reviewer recovery", () => {
   });
 
   it("lets an interrupted durable /ask turn start a fresh session and retry only on explicit click", async () => {
+    let clearChat = vi.fn();
+    let startSession = vi.fn();
+    let sendPrompt = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      clearChat = vi.fn((...args: Parameters<typeof api.clearCopilotChat>) =>
+        api.clearCopilotChat(...args));
+      startSession = vi.fn((...args: Parameters<typeof api.startCopilotSession>) =>
+        api.startCopilotSession(...args));
+      sendPrompt = vi.fn((...args: Parameters<typeof api.sendCopilotPrompt>) =>
+        api.sendCopilotPrompt(...args));
+      return {
+        ...api,
+        clearCopilotChat: clearChat,
+        startCopilotSession: startSession,
+        sendCopilotPrompt: sendPrompt,
+      };
+    });
+
     await openPaginationReview();
     await openChat();
 
     expect((await screen.findAllByText(/Review Queue restarted before Copilot finished responding/i)).length).toBeGreaterThan(0);
     const retry = screen.getByRole("button", { name: /retry as new prompt/i });
     expect(retry).toBeVisible();
+    expect(clearChat).not.toHaveBeenCalled();
+    expect(startSession).not.toHaveBeenCalled();
+    expect(sendPrompt).not.toHaveBeenCalled();
 
     fireEvent.click(retry);
     expect(await screen.findByRole("button", { name: /cancel/i })).toBeVisible();
+    expect(clearChat).toHaveBeenCalledTimes(1);
+    expect(startSession).toHaveBeenCalledTimes(1);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("combobox", { name: /previous chats/i })).toBeVisible();
+  });
+
+  it("keeps archived Previous chats permanently read-only, including interrupted turns", async () => {
+    let clearChat = vi.fn();
+    let startSession = vi.fn();
+    let sendPrompt = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      clearChat = vi.fn((...args: Parameters<typeof api.clearCopilotChat>) =>
+        api.clearCopilotChat(...args));
+      startSession = vi.fn((...args: Parameters<typeof api.startCopilotSession>) =>
+        api.startCopilotSession(...args));
+      sendPrompt = vi.fn((...args: Parameters<typeof api.sendCopilotPrompt>) =>
+        api.sendCopilotPrompt(...args));
+      return {
+        ...api,
+        clearCopilotChat: clearChat,
+        startCopilotSession: startSession,
+        sendCopilotPrompt: sendPrompt,
+        listAskTurns: async (conversationId: string) => {
+          const turns = await api.listAskTurns(conversationId);
+          return turns.map((turn) => turn.prompt.includes("current pagination cursor format")
+            ? { ...turn, state: "interrupted" as const, failure_reason: "Archived fixture interruption." }
+            : turn);
+        },
+      };
+    });
+
+    await openPaginationReview();
+    await openChat();
+    const previous = screen.getByRole("combobox", { name: /previous chats/i });
+    const archived = within(previous).getByRole("option", { name: /previous chat 1/i });
+    fireEvent.change(previous, { target: { value: (archived as HTMLOptionElement).value } });
+
+    expect(await screen.findByText("Archived fixture interruption.")).toBeVisible();
+    const retry = screen.getByRole("button", { name: /retry as new prompt/i });
+    expect(retry).toBeDisabled();
+    expect(retry).toHaveAttribute(
+      "title",
+      "Archived chats are permanently read-only. Return to Current chat to continue.",
+    );
+    expect(screen.getByRole("button", { name: "Clear chat" })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: /ask a follow-up/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Start Copilot" })).not.toBeInTheDocument();
+
+    fireEvent.click(retry);
+    fireEvent.click(screen.getByRole("button", { name: "Clear chat" }));
+    await Promise.resolve();
+    expect(clearChat).not.toHaveBeenCalled();
+    expect(startSession).not.toHaveBeenCalled();
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("keeps completed round chat controls and interrupted-turn retry read-only", async () => {
+    let clearChat = vi.fn();
+    let startSession = vi.fn();
+    let sendPrompt = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      const conversation: NonNullable<Awaited<ReturnType<typeof api.currentConversation>>> = {
+        id: "completed-round-conversation",
+        round_id: "round-local-rename-config",
+        session_state: "can_continue",
+        history_only_reason: null,
+        provider_session_label: "saved Copilot session",
+        options: [],
+        created_at: "2026-07-29T00:00:00.000Z",
+        archived_at: null,
+      };
+      const interrupted: Awaited<ReturnType<typeof api.listAskTurns>>[number] = {
+        id: "completed-round-interrupted-turn",
+        conversation_id: conversation.id,
+        idempotency_key: "completed-round-interrupted-idempotency",
+        prompt: "Can this completed review be retried?",
+        anchor: null,
+        option_values: {},
+        state: "interrupted",
+        created_at: "2026-07-29T00:00:01.000Z",
+        completed_at: null,
+        failure_reason: "Completed round fixture interruption.",
+        response_text: "",
+      };
+      clearChat = vi.fn((...args: Parameters<typeof api.clearCopilotChat>) =>
+        api.clearCopilotChat(...args));
+      startSession = vi.fn((...args: Parameters<typeof api.startCopilotSession>) =>
+        api.startCopilotSession(...args));
+      sendPrompt = vi.fn((...args: Parameters<typeof api.sendCopilotPrompt>) =>
+        api.sendCopilotPrompt(...args));
+      return {
+        ...api,
+        currentConversation: (roundId: string) =>
+          roundId === conversation.round_id ? Promise.resolve(conversation) : api.currentConversation(roundId),
+        listPreviousChats: (roundId: string) =>
+          roundId === conversation.round_id ? Promise.resolve([]) : api.listPreviousChats(roundId),
+        listAskTurns: (conversationId: string) =>
+          conversationId === conversation.id ? Promise.resolve([interrupted]) : api.listAskTurns(conversationId),
+        clearCopilotChat: clearChat,
+        startCopilotSession: startSession,
+        sendCopilotPrompt: sendPrompt,
+      };
+    });
+
+    await renderFixtureApp();
+    fireEvent.click(screen.getByRole("checkbox", { name: /show completed .* old rounds/i }));
+    const card = await screen.findByText(completedTitle);
+    const article = card.closest("article");
+    if (!article) throw new Error("The completed fixture review card was not rendered.");
+    fireEvent.click(within(article).getByRole("button", { name: "Open review" }));
+    expect((await screen.findAllByRole("region", { name: "Code diff" })).length).toBeGreaterThan(0);
+    await openChat();
+
+    expect(await screen.findByText("Completed round fixture interruption.")).toBeVisible();
+    const retry = screen.getByRole("button", { name: /retry as new prompt/i });
+    expect(retry).toBeDisabled();
+    expect(retry).toHaveAttribute("title", "Completed — Requeue to review again");
+    expect(screen.getByRole("button", { name: "Clear chat" })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: /ask a follow-up/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Start Copilot" })).not.toBeInTheDocument();
+
+    fireEvent.click(retry);
+    fireEvent.click(screen.getByRole("button", { name: "Clear chat" }));
+    await Promise.resolve();
+    expect(clearChat).not.toHaveBeenCalled();
+    expect(startSession).not.toHaveBeenCalled();
+    expect(sendPrompt).not.toHaveBeenCalled();
   });
 
   it("renders saved /ask and formal threads inline and converts a Copilot answer into a formal draft", async () => {
