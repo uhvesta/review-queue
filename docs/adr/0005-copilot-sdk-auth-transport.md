@@ -6,6 +6,42 @@ The desktop adapter uses the official Rust `github-copilot-sdk` to start the
 Copilot CLI server, discover its actual model catalog, and own its sessions.
 Review Queue does not implement Copilot ACP framing itself.
 
+## Runtime option discovery contract
+
+The pinned official SDK (`github-copilot-sdk` `1.0.0-beta.8`) exposes
+`Client::list_models` / the typed `models.list` RPC. Its returned `Model`
+records are the authority for selectable model IDs, model policy state,
+supported reasoning-effort values, and the default reasoning effort. Review
+Queue does not invent fallback model IDs or reasoning levels. Disabled models,
+unknown future policy states, malformed IDs, and duplicate IDs are not
+advertised.
+
+The current Review Queue option schema is flat rather than model-dependent.
+Reasoning effort is therefore advertised only when the SDK catalog reports a
+value supported by every selectable model. The desktop validates the selected
+model/effort pair again before session creation or an SDK `set_model` call.
+This deliberately prefers a smaller truthful picker over presenting a
+combination the runtime may reject. Model and reasoning changes use the
+official SDK's `Session::set_model` path and never send a prompt.
+
+The same SDK version has no client-level RPC that lists interaction modes,
+context-compaction policies, or custom-provider choices. `session.mode.get`
+reports only the current mode after a session exists.
+`InfiniteSessionConfig` accepts caller-selected compaction thresholds, and
+`ProviderConfig` accepts caller-supplied BYOK endpoints and credentials, but
+neither is a discovery API. Review Queue consequently:
+
+- leaves context/compaction at the SDK/CLI default and marks that control
+  unsupported instead of advertising hard-coded percentages;
+- marks provider override unsupported rather than requesting, returning, or
+  persisting BYOK tokens; and
+- does not expose agent modes, because `/ask` must remain a deny-all,
+  non-mutating session.
+
+These unsupported groups remain explicit capability metadata with an
+explanation. A future SDK/CLI discovery RPC can populate them without changing
+the open-ended option-group contract.
+
 For an existing Copilot CLI sign-in, the desktop checks only installed CLI and
 Keychain metadata before selecting the SDK's official logged-in-user path. It
 never reads, displays, or transmits the existing CLI credential. The SDK/CLI

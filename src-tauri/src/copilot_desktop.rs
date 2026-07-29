@@ -15,7 +15,7 @@ use std::{
 
 use chrono::Utc;
 use github_copilot_sdk::{
-    CliProgram, Client, ClientOptions, EventSubscription, InfiniteSessionConfig, SessionConfig,
+    CliProgram, Client, ClientOptions, EventSubscription, Model, SessionConfig, SetModelOptions,
     handler::DenyAllHandler, session::Session,
 };
 use review_queue_core::{
@@ -852,6 +852,7 @@ struct AcpCliTransport {
     runtime: tokio::runtime::Runtime,
     auth: Option<SdkAuthentication>,
     client: Option<Client>,
+    discovered_models: Vec<Model>,
     session: Option<Session>,
     events: Option<EventSubscription>,
 }
@@ -869,6 +870,7 @@ impl AcpCliTransport {
                 .expect("Review Queue requires the bundled Tokio runtime"),
             auth: None,
             client: None,
+            discovered_models: Vec::new(),
             session: None,
             events: None,
         }
@@ -913,26 +915,53 @@ impl AcpCliTransport {
             .ok_or(CopilotTransportError::AuthenticationUnavailable)
     }
 
-    fn discovered_capabilities(models: Vec<github_copilot_sdk::Model>) -> CopilotCapabilities {
-        let model_choices = models
+    fn discovered_capabilities(models: &[Model]) -> CopilotCapabilities {
+        let mut seen_model_ids = std::collections::BTreeSet::new();
+        let selectable_models = models
             .iter()
-            .map(|model| SessionOptionChoice {
-                value: model.id.clone(),
-                label: model.name.clone(),
+            .filter(|model| model_is_selectable(model))
+            .filter(|model| {
+                !model.id.trim().is_empty()
+                    && model.id == model.id.trim()
+                    && seen_model_ids.insert(model.id.clone())
             })
             .collect::<Vec<_>>();
-        let reasoning_choices = models
+        let model_choices = selectable_models
             .iter()
-            .flat_map(|model| model.supported_reasoning_efforts.iter().cloned())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
+            .map(|model| SessionOptionChoice {
+                value: model.id.trim().to_owned(),
+                label: if model.name.trim().is_empty() {
+                    model.id.trim().to_owned()
+                } else {
+                    model.name.trim().to_owned()
+                },
+            })
+            .collect::<Vec<_>>();
+        let reasoning_values = common_reasoning_efforts(&selectable_models);
+        let reasoning_choices = reasoning_values
+            .iter()
+            .cloned()
             .map(|value| SessionOptionChoice {
                 label: value.clone(),
                 value,
             })
             .collect::<Vec<_>>();
+        let has_selectable_model = !model_choices.is_empty();
         let mut option_groups = Vec::new();
-        if !model_choices.is_empty() {
+        if model_choices.is_empty() {
+            option_groups.push(SessionOptionGroup {
+                key: "model".into(),
+                label: "Model".into(),
+                supported: false,
+                unsupported_reason: Some(
+                    "The Copilot CLI returned no selectable models for this account and policy."
+                        .into(),
+                ),
+                apply_policy: OptionApplyPolicy::RequiresFreshSession,
+                selected: None,
+                choices: Vec::new(),
+            });
+        } else {
             option_groups.push(SessionOptionGroup {
                 key: "model".into(),
                 label: "Model".into(),
@@ -943,47 +972,132 @@ impl AcpCliTransport {
                 choices: model_choices,
             });
         }
-        if !reasoning_choices.is_empty() {
+        if reasoning_choices.is_empty() {
+            option_groups.push(SessionOptionGroup {
+                key: "reasoning_effort".into(),
+                label: "Reasoning effort".into(),
+                supported: false,
+                unsupported_reason: Some(
+                    "The SDK model catalog did not advertise one reasoning-effort value supported by every selectable model."
+                        .into(),
+                ),
+                apply_policy: OptionApplyPolicy::AppliesNow,
+                selected: None,
+                choices: Vec::new(),
+            });
+        } else {
+            let selected_reasoning = selectable_models
+                .first()
+                .and_then(|model| model.default_reasoning_effort.as_deref().map(str::trim))
+                .filter(|value| reasoning_values.iter().any(|candidate| candidate == *value))
+                .map(str::to_owned)
+                .or_else(|| reasoning_values.first().cloned());
             option_groups.push(SessionOptionGroup {
                 key: "reasoning_effort".into(),
                 label: "Reasoning effort".into(),
                 supported: true,
                 unsupported_reason: None,
-                apply_policy: OptionApplyPolicy::RequiresFreshSession,
-                selected: models
-                    .iter()
-                    .find_map(|model| model.default_reasoning_effort.clone()),
+                apply_policy: OptionApplyPolicy::AppliesNow,
+                selected: selected_reasoning,
                 choices: reasoning_choices,
             });
         }
         option_groups.push(SessionOptionGroup {
             key: "context_window".into(),
             label: "Context window".into(),
-            supported: true,
-            unsupported_reason: None,
+            supported: false,
+            unsupported_reason: Some(
+                "github-copilot-sdk 1.0.0-beta.8 reports model token limits but does not advertise selectable context or compaction policies; the SDK/CLI default is used."
+                    .into(),
+            ),
             apply_policy: OptionApplyPolicy::RequiresFreshSession,
-            selected: Some("managed_80".into()),
-            choices: vec![
-                SessionOptionChoice {
-                    value: "managed_80".into(),
-                    label: "Managed · compact at 80%".into(),
-                },
-                SessionOptionChoice {
-                    value: "managed_65".into(),
-                    label: "Managed · compact early at 65%".into(),
-                },
-                SessionOptionChoice {
-                    value: "native".into(),
-                    label: "Native model window · no compaction".into(),
-                },
-            ],
+            selected: None,
+            choices: Vec::new(),
+        });
+        option_groups.push(SessionOptionGroup {
+            key: "provider".into(),
+            label: "Provider override".into(),
+            supported: false,
+            unsupported_reason: Some(
+                "The official SDK accepts caller-supplied BYOK provider credentials but exposes no credential-free provider catalog; Review Queue never requests or returns provider tokens."
+                    .into(),
+            ),
+            apply_policy: OptionApplyPolicy::RequiresFreshSession,
+            selected: None,
+            choices: Vec::new(),
         });
         CopilotCapabilities {
-            supported: true,
-            unsupported_reason: None,
+            supported: has_selectable_model,
+            unsupported_reason: (!has_selectable_model).then(|| {
+                "The Copilot CLI returned no selectable models for this account and policy.".into()
+            }),
             option_groups,
         }
     }
+
+    fn validate_discovered_options(
+        &self,
+        options: &BTreeMap<String, String>,
+    ) -> Result<(), CopilotTransportError> {
+        let model_id = options
+            .get("model")
+            .ok_or(CopilotTransportError::ModelUnavailable)?;
+        let model = self
+            .discovered_models
+            .iter()
+            .find(|model| model.id == *model_id && model_is_selectable(model))
+            .ok_or(CopilotTransportError::ModelUnavailable)?;
+        if let Some(effort) = options.get("reasoning_effort")
+            && !model
+                .supported_reasoning_efforts
+                .iter()
+                .any(|supported| supported.trim() == effort)
+        {
+            return Err(CopilotTransportError::ModelUnavailable);
+        }
+        if options
+            .keys()
+            .any(|key| key != "model" && key != "reasoning_effort")
+        {
+            return Err(CopilotTransportError::ProviderRejected);
+        }
+        Ok(())
+    }
+}
+
+fn model_is_selectable(model: &Model) -> bool {
+    use github_copilot_sdk::generated::api_types::ModelPolicyState;
+
+    !matches!(
+        model.policy.as_ref().map(|policy| &policy.state),
+        Some(ModelPolicyState::Disabled | ModelPolicyState::Unknown)
+    )
+}
+
+fn common_reasoning_efforts(models: &[&Model]) -> Vec<String> {
+    let Some(first) = models.first() else {
+        return Vec::new();
+    };
+    let mut common = first
+        .supported_reasoning_efforts
+        .iter()
+        .filter_map(|effort| {
+            let effort = effort.trim();
+            (!effort.is_empty()).then(|| effort.to_owned())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for model in &models[1..] {
+        let supported = model
+            .supported_reasoning_efforts
+            .iter()
+            .filter_map(|effort| {
+                let effort = effort.trim();
+                (!effort.is_empty()).then(|| effort.to_owned())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        common.retain(|effort| supported.contains(effort));
+    }
+    common.into_iter().collect()
 }
 
 impl CopilotTransport for AcpCliTransport {
@@ -1025,7 +1139,9 @@ impl CopilotTransport for AcpCliTransport {
             .runtime
             .block_on(client.list_models())
             .map_err(|_| CopilotTransportError::ProviderRejected)?;
-        Ok(Self::discovered_capabilities(models))
+        let capabilities = Self::discovered_capabilities(&models);
+        self.discovered_models = models;
+        Ok(capabilities)
     }
 
     fn start_session(
@@ -1035,6 +1151,7 @@ impl CopilotTransport for AcpCliTransport {
         if self.session.is_some() {
             return Err(CopilotTransportError::ProviderRejected);
         }
+        self.validate_discovered_options(&request.options)?;
         let client = self.ensure_client()?;
         let mut config = SessionConfig::default()
             .with_client_name("Review Queue")
@@ -1050,23 +1167,6 @@ impl CopilotTransport for AcpCliTransport {
         if let Some(effort) = request.options.get("reasoning_effort") {
             config = config.with_reasoning_effort(effort.clone());
         }
-        config = match request.options.get("context_window").map(String::as_str) {
-            Some("managed_65") => config.with_infinite_sessions(
-                InfiniteSessionConfig::new()
-                    .with_enabled(true)
-                    .with_background_compaction_threshold(0.65)
-                    .with_buffer_exhaustion_threshold(0.9),
-            ),
-            Some("native") => {
-                config.with_infinite_sessions(InfiniteSessionConfig::new().with_enabled(false))
-            }
-            _ => config.with_infinite_sessions(
-                InfiniteSessionConfig::new()
-                    .with_enabled(true)
-                    .with_background_compaction_threshold(0.8)
-                    .with_buffer_exhaustion_threshold(0.95),
-            ),
-        };
         let session = self
             .runtime
             .block_on(client.create_session(config))
@@ -1082,15 +1182,20 @@ impl CopilotTransport for AcpCliTransport {
         _session_id: &str,
         options: BTreeMap<String, String>,
     ) -> Result<(), CopilotTransportError> {
+        self.validate_discovered_options(&options)?;
         let session = self
             .session
             .as_ref()
             .ok_or(CopilotTransportError::ProviderRejected)?;
-        if let Some(model) = options.get("model") {
-            self.runtime
-                .block_on(session.set_model(model, None))
-                .map_err(|_| CopilotTransportError::ModelUnavailable)?;
-        }
+        let model = options
+            .get("model")
+            .ok_or(CopilotTransportError::ModelUnavailable)?;
+        let model_options = options
+            .get("reasoning_effort")
+            .map(|effort| SetModelOptions::default().with_reasoning_effort(effort.clone()));
+        self.runtime
+            .block_on(session.set_model(model, model_options))
+            .map_err(|_| CopilotTransportError::ModelUnavailable)?;
         Ok(())
     }
 
@@ -1217,6 +1322,7 @@ mod tests {
             origin_route_id: None,
             origin_route: None,
             source_metadata: None,
+            source_adapter: Default::default(),
         }
     }
 
@@ -1246,7 +1352,7 @@ mod tests {
 
         fn discover_capabilities(&mut self) -> Result<CopilotCapabilities, CopilotTransportError> {
             self.frames.push(json!({ "method": "initialize" }));
-            Ok(AcpCliTransport::discovered_capabilities(vec![
+            Ok(AcpCliTransport::discovered_capabilities(&[
                 github_copilot_sdk::Model {
                     id: "official-model".into(),
                     name: "Official model".into(),
@@ -1272,10 +1378,14 @@ mod tests {
 
         fn apply_options(
             &mut self,
-            _session_id: &str,
-            _options: BTreeMap<String, String>,
+            session_id: &str,
+            options: BTreeMap<String, String>,
         ) -> Result<(), CopilotTransportError> {
-            unreachable!("all current ACP options require a fresh session")
+            self.frames.push(json!({
+                "method": "session/model",
+                "params": { "sessionId": session_id, "options": options },
+            }));
+            Ok(())
         }
 
         fn start_prompt(
@@ -1386,6 +1496,38 @@ mod tests {
     }
 
     #[test]
+    fn discovered_runtime_option_change_uses_no_prompt() {
+        let mut adapter = CopilotAdapter::new(FakeAcpServerTranscript::default());
+        let capabilities = adapter.discover_capabilities().unwrap();
+        adapter
+            .start_session("conversation-1", capabilities.selected_options())
+            .unwrap();
+        let changed = adapter.change_option("reasoning_effort", "low").unwrap();
+        assert_eq!(
+            changed.effect,
+            review_queue_core::copilot::OptionChangeEffect::AppliedToCurrentSession
+        );
+        assert_eq!(
+            adapter
+                .transport()
+                .frames
+                .iter()
+                .filter(|frame| frame["method"] == "session/model")
+                .count(),
+            1
+        );
+        assert_eq!(
+            adapter
+                .transport()
+                .frames
+                .iter()
+                .filter(|frame| frame["method"] == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn fake_acp_prompt_frame_contains_only_immutable_round_anchor_and_new_question() {
         let anchor = Anchor {
             repository_id: "repo-main".into(),
@@ -1445,7 +1587,7 @@ mod tests {
 
     #[test]
     fn capabilities_are_derived_from_official_sdk_model_discovery() {
-        let capabilities = AcpCliTransport::discovered_capabilities(vec![
+        let capabilities = AcpCliTransport::discovered_capabilities(&[
             github_copilot_sdk::Model {
                 id: "sdk-model-a".into(),
                 name: "SDK model A".into(),
@@ -1466,19 +1608,152 @@ mod tests {
                 .iter()
                 .map(|group| group.key.as_str())
                 .collect::<Vec<_>>(),
-            vec!["model", "reasoning_effort", "context_window"]
+            vec!["model", "reasoning_effort", "context_window", "provider"]
         );
         assert_eq!(
             capabilities.option_groups[0].choices[0].value,
             "sdk-model-a"
         );
+        assert!(!capabilities.option_groups[1].supported);
+        assert!(capabilities.option_groups[1].choices.is_empty());
+        assert!(!capabilities.option_groups[2].supported);
+        assert!(capabilities.option_groups[2].choices.is_empty());
+        assert!(!capabilities.option_groups[3].supported);
+        assert!(capabilities.option_groups[3].choices.is_empty());
+    }
+
+    #[test]
+    fn reasoning_options_are_only_advertised_when_every_model_supports_them() {
+        let capabilities = AcpCliTransport::discovered_capabilities(&[
+            github_copilot_sdk::Model {
+                id: "sdk-model-a".into(),
+                name: "SDK model A".into(),
+                supported_reasoning_efforts: vec!["low".into(), "high".into()],
+                default_reasoning_effort: Some("high".into()),
+                ..Default::default()
+            },
+            github_copilot_sdk::Model {
+                id: "sdk-model-b".into(),
+                name: "SDK model B".into(),
+                supported_reasoning_efforts: vec!["high".into(), "medium".into()],
+                ..Default::default()
+            },
+        ]);
+        let reasoning = &capabilities.option_groups[1];
+        assert!(reasoning.supported);
+        assert_eq!(reasoning.selected.as_deref(), Some("high"));
         assert_eq!(
-            capabilities.option_groups[1].selected.as_deref(),
-            Some("high")
+            reasoning
+                .choices
+                .iter()
+                .map(|choice| choice.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high"]
+        );
+        assert_eq!(reasoning.apply_policy, OptionApplyPolicy::AppliesNow);
+    }
+
+    #[test]
+    fn disabled_unknown_and_malformed_models_are_not_advertised() {
+        use github_copilot_sdk::generated::api_types::{ModelPolicy, ModelPolicyState};
+
+        let capabilities = AcpCliTransport::discovered_capabilities(&[
+            github_copilot_sdk::Model {
+                id: "enabled".into(),
+                name: String::new(),
+                ..Default::default()
+            },
+            github_copilot_sdk::Model {
+                id: "disabled".into(),
+                name: "Disabled".into(),
+                policy: Some(ModelPolicy {
+                    state: ModelPolicyState::Disabled,
+                    terms: None,
+                }),
+                ..Default::default()
+            },
+            github_copilot_sdk::Model {
+                id: "future".into(),
+                name: "Unknown policy".into(),
+                policy: Some(ModelPolicy {
+                    state: ModelPolicyState::Unknown,
+                    terms: None,
+                }),
+                ..Default::default()
+            },
+            github_copilot_sdk::Model {
+                id: " ".into(),
+                name: "Malformed".into(),
+                ..Default::default()
+            },
+        ]);
+        assert!(capabilities.supported);
+        assert_eq!(
+            capabilities.option_groups[0].choices,
+            vec![SessionOptionChoice {
+                value: "enabled".into(),
+                label: "enabled".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_empty_selectable_catalog_fails_closed_with_recovery_metadata() {
+        use github_copilot_sdk::generated::api_types::{ModelPolicy, ModelPolicyState};
+
+        let capabilities = AcpCliTransport::discovered_capabilities(&[
+            github_copilot_sdk::Model {
+                id: "disabled".into(),
+                name: "Disabled".into(),
+                policy: Some(ModelPolicy {
+                    state: ModelPolicyState::Disabled,
+                    terms: None,
+                }),
+                ..Default::default()
+            },
+            github_copilot_sdk::Model {
+                id: String::new(),
+                name: "Malformed".into(),
+                ..Default::default()
+            },
+        ]);
+        assert!(!capabilities.supported);
+        assert!(capabilities.unsupported_reason.is_some());
+        assert!(!capabilities.option_groups[0].supported);
+        assert!(capabilities.option_groups[0].unsupported_reason.is_some());
+        assert!(capabilities.option_groups[0].choices.is_empty());
+    }
+
+    #[test]
+    fn transport_rejects_undiscovered_models_and_non_sdk_options_before_session_creation() {
+        let mut transport = AcpCliTransport::new(PathBuf::from("."));
+        transport.discovered_models = vec![github_copilot_sdk::Model {
+            id: "sdk-model".into(),
+            name: "SDK model".into(),
+            supported_reasoning_efforts: vec!["high".into()],
+            ..Default::default()
+        }];
+        assert!(
+            transport
+                .validate_discovered_options(&BTreeMap::from([
+                    ("model".into(), "sdk-model".into()),
+                    ("reasoning_effort".into(), "high".into()),
+                ]))
+                .is_ok()
         );
         assert_eq!(
-            capabilities.option_groups[2].selected.as_deref(),
-            Some("managed_80")
+            transport.validate_discovered_options(&BTreeMap::from([(
+                "model".into(),
+                "not-discovered".into(),
+            )])),
+            Err(CopilotTransportError::ModelUnavailable)
+        );
+        assert_eq!(
+            transport.validate_discovered_options(&BTreeMap::from([
+                ("model".into(), "sdk-model".into()),
+                ("context_window".into(), "managed_80".into()),
+            ])),
+            Err(CopilotTransportError::ProviderRejected)
         );
     }
 

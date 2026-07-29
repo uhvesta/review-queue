@@ -20,8 +20,8 @@ token-free.
   into a clean destination.
 - Official GitHub Copilot SDK `/ask` sessions with automatic existing-CLI
   sign-in selection, app-owned Device Flow fallback, runtime-discovered
-  model/reasoning/context options, streaming/cancel, durable transcripts,
-  Clear chat, and restart-without-replay recovery.
+  model/reasoning options, provider-managed context, streaming/cancel, durable
+  transcripts, Clear chat, and restart-without-replay recovery.
 - Formal comments and revisioned manual handoff. Review Queue prepares the
   exact feedback prompt for the selected originating route; a user submits it
   in an accessible original session or in a freshly reproduced environment.
