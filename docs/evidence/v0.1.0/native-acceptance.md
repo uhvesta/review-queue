@@ -260,6 +260,35 @@ Retained evidence:
 - `copilot-anchored-ask.jpeg`
 - `copilot-stale-option-restart.jpeg`
 
+## Current-head explicit Copilot source switching
+
+Product source commit `897aae3` was rebuilt as an arm64 debug app and signed
+with the Developer ID Application identity for team `7H66Q22DJD`. Strict deep
+signature verification passed, the bundle reported version `0.1.0`, and the
+signed executable SHA-256 was
+`4094b4c03e5ce6c604b9fda6141f680678cd3f9375171b8cf19bfdc7a4528f30`.
+This remains signed native acceptance evidence rather than a published
+release artifact.
+
+Settings initially showed the existing Copilot CLI source, PR read, and PR
+publish connected as `uhvesta`, the configured public Client ID
+`Ov23li9NHgxO6prQz5f7`, and a healthy capability-scoped Keychain. Selecting
+**Stop using existing sign-in** did not change the CLI credential or either
+GitHub capability. It exposed both **Connect app** and the explicit
+**Use existing CLI sign-in** recovery action. Selecting the latter performed
+the read-only CLI validation, cleared only Review Queue's source preference,
+and restored the existing source as `uhvesta`.
+
+A complete quit and relaunch retained the restored Copilot source, both
+GitHub capabilities, the public Client ID, local rounds, and the connected
+machine. No Device Flow, provider prompt, GitHub request, or credential
+export was used for this check.
+
+Retained evidence:
+
+- `copilot-source-choice.jpeg`
+- `copilot-source-restored.jpeg`
+
 ## Installed updater baseline
 
 The retained `v0.1.0-rc.1` candidate was reverified before installation:
