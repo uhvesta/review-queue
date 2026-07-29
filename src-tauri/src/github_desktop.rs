@@ -1797,9 +1797,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut desktop = desktop();
 
-        let preview = desktop
-            .preview("https://github.com/o/r/pull/1")
-            .unwrap();
+        let preview = desktop.preview("https://github.com/o/r/pull/1").unwrap();
         assert_eq!(desktop.api.metadata_reads, 1);
         assert_eq!(desktop.api.file_reads, 0);
         assert_eq!(desktop.api.comment_reads, 0);
@@ -1810,9 +1808,7 @@ mod tests {
         assert_eq!(store.list(None, true).unwrap().len(), 1);
         assert_eq!(queued.round.manifest.repositories[0].head_sha, "head-a");
 
-        let stale_preview = desktop
-            .preview("https://github.com/o/r/pull/2")
-            .unwrap();
+        let stale_preview = desktop.preview("https://github.com/o/r/pull/2").unwrap();
         desktop.api.head = "head-b".into();
         let error = desktop
             .confirm_queue(&mut store, &stale_preview)
@@ -1823,9 +1819,7 @@ mod tests {
         assert_eq!(desktop.api.publish_writes, 0);
         assert_eq!(desktop.api.reply_writes, 0);
 
-        let mut mismatched_identity = desktop
-            .preview("https://github.com/o/r/pull/3")
-            .unwrap();
+        let mut mismatched_identity = desktop.preview("https://github.com/o/r/pull/3").unwrap();
         mismatched_identity.metadata.repository = "different-repository".into();
         let error = desktop
             .confirm_queue(&mut store, &mismatched_identity)
