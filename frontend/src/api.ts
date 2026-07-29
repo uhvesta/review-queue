@@ -235,13 +235,14 @@ export async function createFormalComment(
   roundId: string,
   body: string,
   anchor: Anchor | null = null,
+  threadId?: string,
 ): Promise<FormalComment> {
   return invoke("create_formal_comment", {
     request: {
       roundId,
-      threadId: anchor
+      threadId: threadId ?? (anchor
         ? `${anchor.repository_id}:${anchor.workspace_relative_path}:${anchor.side}:${anchor.start_line}:${anchor.end_line}`
-        : "round",
+        : "round"),
       body,
       anchor,
     },

@@ -100,13 +100,77 @@ describe("fixture-backed reviewer recovery", () => {
     await openPaginationReview();
     await openChat();
 
-    expect(await screen.findByText(/Review Queue restarted before Copilot finished responding/i)).toBeVisible();
+    expect((await screen.findAllByText(/Review Queue restarted before Copilot finished responding/i)).length).toBeGreaterThan(0);
     const retry = screen.getByRole("button", { name: /retry as new prompt/i });
     expect(retry).toBeVisible();
 
     fireEvent.click(retry);
     expect(await screen.findByRole("button", { name: /cancel/i })).toBeVisible();
     expect(screen.getByRole("combobox", { name: /previous chats/i })).toBeVisible();
+  });
+
+  it("renders saved /ask and formal threads inline and converts a Copilot answer into a formal draft", async () => {
+    await openPaginationReview();
+
+    await screen.findAllByText(
+      /Why do we decode the cursor again inside decode_cursor instead of trusting the caller already validated it/i,
+    );
+    const askThread = Array.from(document.querySelectorAll<HTMLElement>(".inline-ask-thread"))
+      .find((thread) => thread.textContent?.includes("Why do we decode the cursor again"));
+    if (!askThread) throw new Error("The saved Copilot turn was not rendered inline.");
+    expect(within(askThread).getByText(/Copilot completed/i)).toBeVisible();
+    expect(within(askThread).getByText(/We decode twice because/i)).toBeVisible();
+
+    expect(await screen.findByText(/Good call bumping a version into the payload/i, {
+      selector: ".inline-formal-comment p",
+    })).toBeVisible();
+
+    const cursorTreeItem = screen.getByText("cursor.py").closest("li");
+    if (!cursorTreeItem) throw new Error("The cursor file was not present in the file tree.");
+    expect(within(cursorTreeItem).getByText("◇ 1")).toBeVisible();
+
+    fireEvent.click(within(askThread).getByRole("button", { name: "Convert to comment" }));
+    const drawer = await screen.findByRole("dialog", { name: "Formal feedback" });
+    const draft = within(drawer).getByRole("textbox", {
+      name: /Comment on core-api\/src\/pagination\/cursor\.py:17–19/i,
+    });
+    expect((draft as HTMLTextAreaElement).value).toContain("We decode twice because");
+  });
+
+  it("keeps an imported GitHub thread inline and preserves its upstream thread when replying formally", async () => {
+    let createComment = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      createComment = vi.fn((...args: Parameters<typeof api.createFormalComment>) =>
+        api.createFormalComment(...args));
+      return { ...api, createFormalComment: createComment };
+    });
+
+    await openReview(githubTitle);
+    const tokenFile = screen.getByText("token_errors.ts").closest("button");
+    if (!tokenFile) throw new Error("The token error source file was not present in the file tree.");
+    fireEvent.click(tokenFile);
+
+    const importedBody = await screen.findByText(
+      /Nice fix — can we also cover the "revoked" case with a similarly specific message/i,
+    );
+    expect(screen.getAllByText(
+      /Nice fix — can we also cover the "revoked" case with a similarly specific message/i,
+    )).toHaveLength(1);
+    const importedThread = importedBody.closest(".imported-thread-inline");
+    if (!importedThread) throw new Error("The imported GitHub comment was not rendered inline.");
+
+    fireEvent.click(within(importedThread).getByRole("button", { name: "Reply formally" }));
+    const drawer = await screen.findByRole("dialog", { name: "Formal feedback" });
+    const draft = within(drawer).getByRole("textbox", {
+      name: /Comment on auth-service\/src\/auth\/token_errors\.ts:9–9/i,
+    });
+    fireEvent.change(draft, { target: { value: "I added coverage for revoked tokens too." } });
+    fireEvent.click(within(drawer).getByRole("button", { name: "Add comment" }));
+
+    await waitFor(() => expect(createComment).toHaveBeenCalledTimes(1));
+    expect(createComment.mock.calls[0][3]).toBe("thread-1");
+    expect(await within(drawer).findByText("I added coverage for revoked tokens too.")).toBeVisible();
   });
 
   it("keeps a cancelled prompt cancelled when its already-started poll resolves late", async () => {

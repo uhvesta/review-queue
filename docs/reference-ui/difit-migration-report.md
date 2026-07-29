@@ -192,14 +192,12 @@ pass. `npm run build` re-verified clean after each fix.
 
 ## Visual differences that remain, and why
 
-- **Continuous multi-file scroll**: difit renders every changed file
-  stacked in one scrollable pane with sticky per-file headers; this app
-  shows one selected file at a time from the file list. Converting to
-  difit's model is a real interaction-model change (affects anchor
-  positioning, comment-thread rendering, and viewed-state sync across
-  simultaneously-mounted files), not a style change, and this app has zero
-  test coverage to safely verify it. Deliberately deferred — see follow-up
-  recommendation above (write tests first).
+- **Large-diff virtualization**: continuous multi-file scroll with sticky
+  per-file headers is implemented. Unlike difit, the current reviewer mounts
+  every expanded file and hunk eagerly. Intersection-observer/lazy rendering
+  remains future performance work for unusually large reviews; it must retain
+  stable anchor navigation and Viewed state while content enters and leaves
+  the DOM.
 - **Ignore-whitespace toggle**: not added. `DiffLine` is `{type, content}`
   with no whitespace-normalized addition/deletion pairing, so a client-side
   toggle would either misrepresent real changes or require new backend diff
@@ -215,13 +213,12 @@ pass. `npm run build` re-verified clean after each fix.
   continuous multi-file scroll pattern with sticky per-file headers.
 - **AI-computed review order (`ReviewPlanPanel` in the legacy app)**:
   intentionally not ported — explicitly out of scope per the task.
-- **Split-mode line selection**: unified mode supports click/shift-click
-  line selection to build a precise `/ask`/comment anchor; split mode (added
-  in the second pass) currently only offers the same hunk-level `/ask`/`+
-  Comment` buttons already in the hunk header, not per-line selection.
-  Replicating the selection/anchor logic across a paired two-column layout
-  is a real feature addition with its own edge cases (e.g. which side does
-  a click on a context row anchor to), deferred rather than rushed.
+- **Split-mode line selection**: implemented. Each selectable split cell
+  retains its original hunk index, old/new side, and line number. Clicking a
+  deletion produces a `LEFT` anchor, clicking an addition produces a `RIGHT`
+  anchor, and shift-selection extends only on the same side. The fixture suite
+  sends a real in-memory `/ask` turn and asserts the resulting side-qualified
+  workspace anchor.
 - **Production notarization:** the Files/Chat escape hatches, repository tree,
   and continuous diff now have fixture, browser, and universal packaged-app
   evidence. The package used an ad-hoc signature; production notarization is
@@ -232,7 +229,7 @@ pass. `npm run build` re-verified clean after each fix.
 This section separates the retained historical migration checks from checks
 run against the **current working tree**.
 
-- `cd frontend && npm test` passed: 2 files, 9 tests.
+- `cd frontend && npm test` passed: 2 files, 15 tests.
 - `cd frontend && npm run build` and `npx vite build --mode fixture` passed.
 - The in-app browser fixture passed at 1280px, 1024px, and 560px. Files and
   Chat remained reachable, continuous diffs rendered at non-zero width, and
@@ -311,12 +308,10 @@ details modal, Application settings, and Submit local review. It's also what
 surfaced the three real bugs listed above (split-mode coloring, empty-cell
 visibility, settings text collision) that a pure code read had missed.
 
-**Still outstanding:** formal pixel-comparison screenshots captured at the
-exact legacy reference size (1152×768) through the real packaged app, plus
-the narrow-layout (<900px) check that this session's browser tooling
-couldn't perform (see "Visual differences that remain" above). Once
-`src-tauri` builds again, re-run this same comparison against the real app
-and the same fixture/topic used for the original legacy screenshots.
+**Still outstanding:** a formal pixel-comparison capture at the exact legacy
+reference size (1152×768). Narrow layouts have since been checked at 1024px
+and 560px in the fixture browser and at the 560px native window minimum; the
+retained current evidence is listed above.
 
 ## Historical commands and results
 

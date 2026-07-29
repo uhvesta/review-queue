@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   activeConversation,
   addMachine,
@@ -107,6 +107,7 @@ type Modal = "submit" | "github" | "details" | "reproduce" | "settings" | "machi
 type PurgeIntent = { round: ReviewRound; kind: "delete" | "approve_local" };
 type ReviewerRecovery =
   | { kind: "load_viewed" }
+  | { kind: "load_inline_state" }
   | { kind: "set_viewed"; repositoryId: string; path: string; viewed: boolean }
   | { kind: "load_decision" }
   | { kind: "refresh_comments" }
@@ -1051,7 +1052,11 @@ function Reviewer({
   const [diffLoading, setDiffLoading] = useState(true);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [pendingAnchor, setPendingAnchor] = useState<Anchor | null>(null);
+  const [pendingThreadId, setPendingThreadId] = useState<string | undefined>();
+  const [pendingFeedbackDraft, setPendingFeedbackDraft] = useState("");
   const [pendingAskAnchor, setPendingAskAnchor] = useState<Anchor | null>(null);
+  const [formalComments, setFormalComments] = useState<FormalComment[]>([]);
+  const [inlineAskTurns, setInlineAskTurns] = useState<AskTurn[]>([]);
   const [viewMode, setViewMode] = useState<"unified" | "split" | "file">("unified");
   const [githubFiles, setGithubFiles] = useState<GithubMaterializedFile[]>([]);
   const [importedComments, setImportedComments] = useState<ImportedComment[]>([]);
@@ -1069,6 +1074,21 @@ function Reviewer({
   const loadViewedState = async () => {
     const viewedFiles = await listViewedFiles(round.id);
     setViewed(new Set(viewedFiles.map((file) => fileKey(file.repositoryId, file.path))));
+  };
+  const loadInlineState = async () => {
+    const [comments, current, previous] = await Promise.all([
+      listFormalComments(round.id),
+      currentConversation(round.id),
+      listPreviousChats(round.id),
+    ]);
+    const conversations = [current, ...previous].filter(
+      (conversation): conversation is AskConversation => Boolean(conversation),
+    );
+    const turns = (await Promise.all(
+      conversations.map((conversation) => listAskTurns(conversation.id)),
+    )).flat();
+    setFormalComments(comments);
+    setInlineAskTurns(turns);
   };
   const setViewedValue = async (repositoryId: string, path: string, next: boolean) => {
     await setFileViewed(round.id, repositoryId, path, next);
@@ -1118,6 +1138,9 @@ function Reviewer({
     switch (recovery.kind) {
       case "load_viewed":
         await runReviewerAction(recovery, loadViewedState);
+        break;
+      case "load_inline_state":
+        await runReviewerAction(recovery, loadInlineState);
         break;
       case "set_viewed":
         await runReviewerAction(
@@ -1230,6 +1253,44 @@ function Reviewer({
     };
   }, [round.collection, round.id]);
 
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      listFormalComments(round.id),
+      currentConversation(round.id),
+      listPreviousChats(round.id),
+    ])
+      .then(async ([comments, current, previous]) => {
+        const conversations = [current, ...previous].filter(
+          (conversation): conversation is AskConversation => Boolean(conversation),
+        );
+        const turns = (await Promise.all(
+          conversations.map((conversation) => listAskTurns(conversation.id)),
+        )).flat();
+        if (cancelled) return;
+        setFormalComments(comments);
+        setInlineAskTurns(turns);
+      })
+      .catch((problem) => {
+        if (!cancelled) {
+          setActionFailure({
+            error: toCommandError(problem),
+            recovery: { kind: "load_inline_state" },
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [round.id]);
+
+  const mergeConversationTurns = useCallback((conversationId: string, turns: AskTurn[]) => {
+    setInlineAskTurns((current) => [
+      ...current.filter((turn) => turn.conversation_id !== conversationId),
+      ...turns,
+    ].sort((left, right) => left.created_at.localeCompare(right.created_at)));
+  }, []);
+
   const files = useMemo(
     () => (diff?.repositories ?? []).flatMap((repository) =>
       repository.files.map((file) => ({
@@ -1239,6 +1300,24 @@ function Reviewer({
       }))),
     [diff],
   );
+  const commentCountsByFile = useMemo(() => {
+    const counts = new Map<string, number>();
+    const anchors = [
+      ...formalComments.map((comment) => comment.anchor),
+      ...importedComments.map((comment) => comment.anchor),
+    ].filter((item): item is Anchor => Boolean(item));
+    for (const item of anchors) {
+      const match = files.find(({ repository, file, path }) => {
+        const workspacePath = repository.root === "." ? path : `${repository.root}/${path}`;
+        return file.repository_id === item.repository_id
+          && workspacePath === item.workspace_relative_path;
+      });
+      if (!match) continue;
+      const key = fileKey(match.file.repository_id, match.path);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  }, [files, formalComments, importedComments]);
   const selected = files.find(({ file, path }) =>
     fileKey(file.repository_id, path) === selectedKey) ?? files[0];
   const diffFileElements = useRef(new Map<string, HTMLElement>());
@@ -1302,6 +1381,8 @@ function Reviewer({
   const viewedCount = files.filter(({ file, path }) => viewed.has(fileKey(file.repository_id, path))).length;
   const totalFiles = files.length;
   const viewedPercent = totalFiles ? Math.round((viewedCount / totalFiles) * 100) : 0;
+  const roundDiscussion = importedComments.filter((comment) => !comment.anchor);
+  const roundFormalComments = formalComments.filter((comment) => !comment.anchor);
 
   return (
     <main className="reviewer">
@@ -1337,7 +1418,7 @@ function Reviewer({
           <button onClick={() => setActionFailure(null)}>Dismiss</button>
         </div>
       )}
-      {round.collection === "github" && (
+      {(round.collection === "github" || roundFormalComments.length > 0) && (
         <section className="upstream-discussion">
           {staleness && staleness.pinned_head_sha !== staleness.observed_head_sha && (
             <p className="danger-text">
@@ -1349,9 +1430,11 @@ function Reviewer({
             </p>
           )}
           <details>
-            <summary>Upstream discussion ({importedComments.length})</summary>
-            {importedComments.length === 0 && <p className="muted">No imported PR discussion.</p>}
-            {importedComments.map((comment) => (
+            <summary>Round discussion ({roundDiscussion.length + roundFormalComments.length})</summary>
+            {roundDiscussion.length === 0 && roundFormalComments.length === 0 && (
+              <p className="muted">No PR-level discussion or round-level formal comments.</p>
+            )}
+            {roundDiscussion.map((comment) => (
               <details
                 className={`imported-discussion ${comment.upstream_resolved ? "resolved-upstream" : ""}`}
                 key={comment.id}
@@ -1365,6 +1448,12 @@ function Reviewer({
                   <a href={comment.source_url} target="_blank" rel="noreferrer">Open on GitHub</a>
                 </article>
               </details>
+            ))}
+            {roundFormalComments.map((comment) => (
+              <article className="formal-comment" key={comment.id}>
+                <small>Formal round comment · revision {comment.revision}</small>
+                <p>{comment.body}</p>
+              </article>
             ))}
           </details>
         </section>
@@ -1433,6 +1522,7 @@ function Reviewer({
             repositories={diff?.repositories ?? []}
             selectedKey={selected ? fileKey(selected.file.repository_id, selected.path) : null}
             viewedKeys={viewed}
+            commentCounts={commentCountsByFile}
             viewedDisabled={readOnly}
             filterPlaceholder="Filter paths"
             onSelect={(entry) => selectDiffFile(entry.key)}
@@ -1546,12 +1636,26 @@ function Reviewer({
                         layout={viewMode}
                         repositoryRoot={repository.root}
                         importedComments={importedComments}
+                        formalComments={formalComments}
+                        askTurns={inlineAskTurns}
                         readOnly={readOnly}
-                        onComment={(anchor) => {
+                        onComment={(anchor, threadId) => {
                           setPendingAnchor(anchor);
+                          setPendingThreadId(threadId);
+                          setPendingFeedbackDraft("");
                           setFeedbackOpen(true);
                         }}
                         onAsk={setPendingAskAnchor}
+                        onOpenAskTurn={(anchor) => {
+                          setPendingAskAnchor(anchor);
+                          setChatOpen(true);
+                        }}
+                        onConvertAskTurn={(turn) => {
+                          setPendingAnchor(turn.anchor ?? null);
+                          setPendingThreadId(undefined);
+                          setPendingFeedbackDraft(turn.response_text ?? "");
+                          setFeedbackOpen(true);
+                        }}
                       />
                     )}
                   </article>
@@ -1584,7 +1688,12 @@ function Reviewer({
             </button>
             <button
               title={readOnly ? "Inspect and copy saved formal feedback history" : ""}
-              onClick={() => { setPendingAnchor(null); setFeedbackOpen(true); }}
+              onClick={() => {
+                setPendingAnchor(null);
+                setPendingThreadId(undefined);
+                setPendingFeedbackDraft("");
+                setFeedbackOpen(true);
+              }}
             >
               Formal feedback
             </button>
@@ -1599,18 +1708,29 @@ function Reviewer({
           readOnlyReason={reason}
           pendingAnchor={pendingAskAnchor}
           onAnchorConsumed={() => setPendingAskAnchor(null)}
+          onTurnsChange={mergeConversationTurns}
         />
       </div>
       {feedbackOpen && (
         <FormalFeedbackDrawer
           round={round}
           initialAnchor={pendingAnchor}
+          initialThreadId={pendingThreadId}
+          initialDraft={pendingFeedbackDraft}
           readOnly={readOnly}
           readOnlyReason={reason}
-          onClose={() => { setFeedbackOpen(false); setPendingAnchor(null); }}
+          onCommentsChange={setFormalComments}
+          onClose={() => {
+            setFeedbackOpen(false);
+            setPendingAnchor(null);
+            setPendingThreadId(undefined);
+            setPendingFeedbackDraft("");
+          }}
           onReproduce={() => {
             setFeedbackOpen(false);
             setPendingAnchor(null);
+            setPendingThreadId(undefined);
+            setPendingFeedbackDraft("");
             onReproduce();
           }}
         />
@@ -1636,6 +1756,7 @@ function ChatSheet({
   readOnlyReason,
   pendingAnchor,
   onAnchorConsumed,
+  onTurnsChange,
 }: {
   round: ReviewRound;
   open: boolean;
@@ -1644,6 +1765,7 @@ function ChatSheet({
   readOnlyReason: string;
   pendingAnchor: Anchor | null;
   onAnchorConsumed: () => void;
+  onTurnsChange: (conversationId: string, turns: AskTurn[]) => void;
 }) {
   const [active, setActive] = useState<AskConversation | null>(null);
   const [previous, setPrevious] = useState<AskConversation[]>([]);
@@ -1658,6 +1780,11 @@ function ChatSheet({
   const cancelledTurnIds = useRef(new Set<string>());
   const [starting, setStarting] = useState(false);
   const [authLabel, setAuthLabel] = useState("");
+
+  useEffect(() => {
+    if (!shown || turns.some((turn) => turn.conversation_id !== shown.id)) return;
+    onTurnsChange(shown.id, turns);
+  }, [onTurnsChange, shown, turns]);
 
   const loadConversation = useCallback(async (conversation: AskConversation) => {
     setShown(conversation);
@@ -2000,21 +2127,27 @@ function ChatSheet({
 function FormalFeedbackDrawer({
   round,
   initialAnchor,
+  initialThreadId,
+  initialDraft,
   readOnly,
   readOnlyReason,
+  onCommentsChange,
   onClose,
   onReproduce,
 }: {
   round: ReviewRound;
   initialAnchor: Anchor | null;
+  initialThreadId?: string;
+  initialDraft: string;
   readOnly: boolean;
   readOnlyReason: string;
+  onCommentsChange: (comments: FormalComment[]) => void;
   onClose: () => void;
   onReproduce: () => void;
 }) {
   const [comments, setComments] = useState<FormalComment[]>([]);
   const [history, setHistory] = useState<DeliveryHistoryEntry[]>([]);
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = useState(initialDraft);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editBody, setEditBody] = useState("");
   const [loading, setLoading] = useState(true);
@@ -2037,6 +2170,7 @@ function FormalFeedbackDrawer({
         listFeedbackDeliveryHistory(round.id),
       ]);
       setComments(savedComments);
+      onCommentsChange(savedComments);
       setDecision(savedDecision);
       setHistory(savedHistory);
       setError(null);
@@ -2045,7 +2179,7 @@ function FormalFeedbackDrawer({
     } finally {
       setLoading(false);
     }
-  }, [round.id]);
+  }, [onCommentsChange, round.id]);
 
   useEffect(() => {
     void refreshComments();
@@ -2060,7 +2194,7 @@ function FormalFeedbackDrawer({
     event.preventDefault();
     if (readOnly || !draft.trim()) return;
     try {
-      await createFormalComment(round.id, draft.trim(), initialAnchor);
+      await createFormalComment(round.id, draft.trim(), initialAnchor, initialThreadId);
       setDraft("");
       await refreshComments();
     } catch (problem) {
@@ -2429,9 +2563,13 @@ function DiffFileView({
   layout,
   repositoryRoot,
   importedComments,
+  formalComments,
+  askTurns,
   readOnly,
   onComment,
   onAsk,
+  onOpenAskTurn,
+  onConvertAskTurn,
 }: {
   file: DiffFile;
   fileIndex: number;
@@ -2439,9 +2577,13 @@ function DiffFileView({
   layout: "unified" | "split";
   repositoryRoot: string;
   importedComments: ImportedComment[];
+  formalComments: FormalComment[];
+  askTurns: AskTurn[];
   readOnly: boolean;
-  onComment: (anchor: Anchor) => void;
+  onComment: (anchor: Anchor, threadId?: string) => void;
   onAsk: (anchor: Anchor) => void;
+  onOpenAskTurn: (anchor: Anchor) => void;
+  onConvertAskTurn: (turn: AskTurn) => void;
 }) {
   const [activeHunk, setActiveHunk] = useState(0);
   useEffect(() => {
@@ -2474,9 +2616,13 @@ function DiffFileView({
             layout={layout}
             repositoryRoot={repositoryRoot}
             importedComments={importedComments}
+            formalComments={formalComments}
+            askTurns={askTurns}
             readOnly={readOnly}
             onComment={onComment}
             onAsk={onAsk}
+            onOpenAskTurn={onOpenAskTurn}
+            onConvertAskTurn={onConvertAskTurn}
           />
         </div>
       ))}
@@ -2526,18 +2672,26 @@ function DiffHunkView({
   layout,
   repositoryRoot,
   importedComments,
+  formalComments,
+  askTurns,
   readOnly,
   onComment,
   onAsk,
+  onOpenAskTurn,
+  onConvertAskTurn,
 }: {
   file: DiffFile;
   hunk: DiffHunk;
   layout: "unified" | "split";
   repositoryRoot: string;
   importedComments: ImportedComment[];
+  formalComments: FormalComment[];
+  askTurns: AskTurn[];
   readOnly: boolean;
-  onComment: (anchor: Anchor) => void;
+  onComment: (anchor: Anchor, threadId?: string) => void;
   onAsk: (anchor: Anchor) => void;
+  onOpenAskTurn: (anchor: Anchor) => void;
+  onConvertAskTurn: (turn: AskTurn) => void;
 }) {
   const [selection, setSelection] = useState<{
     side: "LEFT" | "RIGHT";
@@ -2577,15 +2731,85 @@ function DiffHunkView({
         selected_code: selectedLines.map(({ line }) => line.content).join("\n") || hunk.header,
       }
     : null;
-  const anchoredDiscussion = importedComments.filter((comment) => {
-    const imported = comment.anchor;
-    if (!imported || !anchor) return false;
-    return imported.repository_id === anchor.repository_id
-      && imported.workspace_relative_path === anchor.workspace_relative_path
-      && imported.side === anchor.side
-      && imported.end_line >= anchor.start_line
-      && imported.start_line <= anchor.end_line;
-  });
+  const workspacePathForSide = (side: "LEFT" | "RIGHT") => {
+    const sidePath = (side === "RIGHT" ? file.new_path : file.old_path) ?? path;
+    return repositoryRoot === "." ? sidePath : `${repositoryRoot}/${sidePath}`;
+  };
+  const anchorEndsAt = (
+    itemAnchor: Anchor | null | undefined,
+    side: "LEFT" | "RIGHT",
+    line: number,
+  ) => Boolean(
+    itemAnchor
+      && itemAnchor.repository_id === file.repository_id
+      && itemAnchor.workspace_relative_path === workspacePathForSide(side)
+      && itemAnchor.side === side
+      && itemAnchor.end_line === line,
+  );
+  const renderInlineThreads = (side: "LEFT" | "RIGHT", line: number) => {
+    const importedAtLine = importedComments.filter((comment) =>
+      anchorEndsAt(comment.anchor, side, line));
+    const formalAtLine = formalComments.filter((comment) =>
+      anchorEndsAt(comment.anchor, side, line));
+    const asksAtLine = askTurns.filter((turn) =>
+      anchorEndsAt(turn.anchor, side, line));
+    if (!importedAtLine.length && !formalAtLine.length && !asksAtLine.length) return null;
+    return (
+      <div className="inline-thread-stack" aria-label={`Threads at ${workspacePathForSide(side)} line ${line}`}>
+        {importedAtLine.map((comment) => (
+          <article
+            className={`imported-thread-inline ${comment.upstream_resolved ? "resolved-upstream" : ""}`}
+            key={`imported:${comment.id}`}
+          >
+            <small>{comment.upstream_resolved ? "Resolved on GitHub" : "Imported review thread · read-only"}</small>
+            <p><b>{comment.upstream_author}</b> · <time>{new Date(comment.upstream_created_at).toLocaleString()}</time></p>
+            <p>{comment.body}</p>
+            <div className="inline-thread-actions">
+              <a href={comment.source_url} target="_blank" rel="noreferrer">Open upstream</a>
+              <button
+                disabled={readOnly || !comment.anchor}
+                title={readOnly ? "This round is read-only" : "Draft a formal reply in this imported GitHub thread"}
+                onClick={() => comment.anchor && onComment(comment.anchor, comment.thread_id)}
+              >Reply formally</button>
+            </div>
+          </article>
+        ))}
+        {formalAtLine.map((comment) => (
+          <article className="formal-comment inline-formal-comment" key={`formal:${comment.id}`}>
+            <small>Formal comment · revision {comment.revision}{comment.delivered_revision ? ` · delivered r${comment.delivered_revision}` : ""}</small>
+            <p>{comment.body}</p>
+          </article>
+        ))}
+        {asksAtLine.map((turn) => (
+          <article className="ask-thread inline-ask-thread" key={`ask:${turn.id}`}>
+            <small className="ask-label">
+              /ask · {new Date(turn.created_at).toLocaleString()} · Copilot {turn.state}
+              {Object.keys(turn.option_values).length
+                ? ` · ${Object.entries(turn.option_values).map(([key, value]) => `${key}: ${value}`).join(" · ")}`
+                : ""}
+            </small>
+            {turn.anchor?.selected_code && <pre className="anchor-snippet">{turn.anchor.selected_code}</pre>}
+            <p><b>You</b> · {turn.prompt}</p>
+            {turn.response_text && <p><b>Copilot</b> · {turn.response_text}</p>}
+            {turn.failure_reason && <p className="danger-text">{turn.failure_reason}</p>}
+            <div className="inline-thread-actions">
+              {turn.anchor && (
+                <>
+                  <button disabled={readOnly} onClick={() => onOpenAskTurn(turn.anchor as Anchor)}>Reply to Copilot</button>
+                  <button onClick={() => onOpenAskTurn(turn.anchor as Anchor)}>Open chat sheet</button>
+                </>
+              )}
+              <button
+                disabled={readOnly || !turn.response_text}
+                title={!turn.response_text ? "A Copilot response is required before converting it" : ""}
+                onClick={() => onConvertAskTurn(turn)}
+              >Convert to comment</button>
+            </div>
+          </article>
+        ))}
+      </div>
+    );
+  };
   const selectLine = (
     side: "LEFT" | "RIGHT",
     index: number,
@@ -2660,48 +2884,40 @@ function DiffHunkView({
               && index >= selection.start
               && index <= selection.end;
             return (
-              <div
-                className={`code-line ${line.type} ${selected ? "selected-code-line" : ""}`}
-                key={index}
-                role="button"
-                tabIndex={0}
-                aria-label={`Select ${linePath} ${lineSide.toLowerCase()} line ${lineSide === "RIGHT" ? newNumber ?? oldNumber : oldNumber ?? newNumber}`}
-                onClick={(event) => {
-                  selectLine(lineSide, index, event.shiftKey);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
+              <Fragment key={index}>
+                <div
+                  className={`code-line ${line.type} ${selected ? "selected-code-line" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Select ${linePath} ${lineSide.toLowerCase()} line ${lineSide === "RIGHT" ? newNumber ?? oldNumber : oldNumber ?? newNumber}`}
+                  onClick={(event) => {
                     selectLine(lineSide, index, event.shiftKey);
-                  }
-                }}
-              >
-                <span>{oldNumber ?? ""}</span><span>{newNumber ?? ""}</span>
-                <code>{line.type === "addition" ? "+" : line.type === "deletion" ? "-" : " "}{line.content}</code>
-              </div>
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      selectLine(lineSide, index, event.shiftKey);
+                    }
+                  }}
+                >
+                  <span>{oldNumber ?? ""}</span><span>{newNumber ?? ""}</span>
+                  <code>{line.type === "addition" ? "+" : line.type === "deletion" ? "-" : " "}{line.content}</code>
+                </div>
+                {oldNumber !== null && line.type !== "addition" && renderInlineThreads("LEFT", oldNumber)}
+                {newNumber !== null && line.type !== "deletion" && renderInlineThreads("RIGHT", newNumber)}
+              </Fragment>
             );
           })
         : pairSplitLines(hunk.lines, hunk.old_start, hunk.new_start).map((row, index) => (
-            <div className="split-diff-row" key={index}>
-              {splitCell("LEFT", row.left)}
-              {splitCell("RIGHT", row.right)}
-            </div>
+            <Fragment key={index}>
+              <div className="split-diff-row">
+                {splitCell("LEFT", row.left)}
+                {splitCell("RIGHT", row.right)}
+              </div>
+              {row.left && renderInlineThreads("LEFT", row.left.number)}
+              {row.right && renderInlineThreads("RIGHT", row.right.number)}
+            </Fragment>
           ))}
-      {anchoredDiscussion.map((comment) => (
-        <details
-          className={`imported-thread-inline ${comment.upstream_resolved ? "resolved-upstream" : ""}`}
-          key={comment.id}
-          open={!comment.upstream_resolved}
-        >
-          <summary>{comment.upstream_resolved ? "Resolved on GitHub" : "Imported review thread · read-only"}</summary>
-          <article>
-            <small>{comment.anchor?.workspace_relative_path}:{comment.anchor?.start_line}</small>
-            <p><b>{comment.upstream_author}</b> · <time>{new Date(comment.upstream_created_at).toLocaleString()}</time></p>
-            <p>{comment.body}</p>
-            <a href={comment.source_url} target="_blank" rel="noreferrer">Open upstream thread</a>
-          </article>
-        </details>
-      ))}
     </section>
   );
 }
@@ -3405,7 +3621,7 @@ function githubFilesToDiff(round: ReviewRound, files: GithubMaterializedFile[]):
   return {
     repositories: [{
       repository_id: repositoryId,
-      root: ".",
+      root: repository?.root ?? ".",
       base_sha: repository?.base_sha ?? "",
       head_sha: repository?.head_sha ?? "",
       files: files.map((file) => ({

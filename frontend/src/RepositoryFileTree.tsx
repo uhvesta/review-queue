@@ -204,6 +204,7 @@ export interface RepositoryFileTreeProps {
   repositories: RepositoryDiff[];
   selectedKey?: string | null;
   viewedKeys: ReadonlySet<string>;
+  commentCounts?: ReadonlyMap<string, number>;
   viewedDisabled?: boolean;
   className?: string;
   filterPlaceholder?: string;
@@ -220,6 +221,7 @@ export function RepositoryFileTree({
   repositories,
   selectedKey = null,
   viewedKeys,
+  commentCounts = new Map(),
   viewedDisabled = false,
   className,
   filterPlaceholder = "Filter files…",
@@ -260,6 +262,7 @@ export function RepositoryFileTree({
       const { entry } = node;
       const viewed = viewedKeys.has(entry.key);
       const selected = selectedKey === entry.key;
+      const commentCount = commentCounts.get(entry.key) ?? 0;
       return (
         <li key={entry.key} className="repository-file-tree-file" data-selected={selected || undefined}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: depth * 16 }}>
@@ -277,6 +280,11 @@ export function RepositoryFileTree({
               {entry.additions > 0 && <span data-kind="addition">+{entry.additions}</span>}
               {entry.deletions > 0 && <span data-kind="deletion">−{entry.deletions}</span>}
             </span>
+            {commentCount > 0 && (
+              <span className="repository-file-tree-comments" aria-label={`${commentCount} comment${commentCount === 1 ? "" : "s"}`}>
+                ◇ {commentCount}
+              </span>
+            )}
             <button
               type="button"
               className="repository-file-tree-viewed"
