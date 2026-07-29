@@ -210,3 +210,18 @@ Retained current-tree screenshots:
 - `difit-current-split.jpeg`
 - `difit-current-full-file.jpeg`
 - `current-signed-auth-persisted.jpeg`
+
+## Installed updater baseline
+
+The retained `v0.1.0-rc.1` candidate was reverified before installation:
+all seven checksum entries passed, Gatekeeper reported `Notarized Developer
+ID`, and the DMG staple validated. With `/Applications/Review Queue.app`
+confirmed absent, the exact candidate was installed there without
+overwriting another app. The installed bundle passed strict deep signature
+verification and Gatekeeper assessment and reports version `0.1.0-rc.1`.
+
+The installed candidate launched with the existing queue state and both
+Keychain-backed GitHub capabilities still connected as `uhvesta`. This is
+only the retained pre-update baseline; no update check, installation, or
+relaunch was attempted because the disposable `0.1.0` feed does not yet
+exist. Evidence: `updater-before-rc-auth.jpeg`.
