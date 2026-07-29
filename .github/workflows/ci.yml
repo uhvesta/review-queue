@@ -51,6 +51,8 @@ jobs:
         with:
           components: clippy,rustfmt
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Ensure universal macOS targets are installed
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |

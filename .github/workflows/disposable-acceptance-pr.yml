@@ -31,6 +31,19 @@ jobs:
             exit 0
           fi
 
+          if git ls-remote \
+            --exit-code \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" \
+            "refs/heads/${fixture_branch}" >/dev/null; then
+            gh pr create \
+              --repo "$REPOSITORY" \
+              --base main \
+              --head "$fixture_branch" \
+              --title "Disposable Review Queue GitHub publish acceptance" \
+              --body "Bot-authored disposable pull request for Review Queue mirror and exact-publish acceptance."
+            exit 0
+          fi
+
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" fixture
           git -C fixture config user.name "github-actions[bot]"
           git -C fixture config user.email "41898282+github-actions[bot]@users.noreply.github.com"

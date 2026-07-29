@@ -56,6 +56,35 @@ with statuses `completed,cancelled`; it was history-only, the provider session
 was not resumed, and no prompt replay occurred. Clear chat archived that
 transcript and opened a new empty conversation without sending a prompt.
 
+## Connected-machine immutable review
+
+The shipped daemon served one fixture over an owner-only local Unix socket;
+the native app used its explicit `Local daemon socket` connection type, with no
+SSH credential or network listener.
+
+- Machine:
+  `machine-d0670836d029da335af0357a563ae511539c5a89440d2b5478c4cc99b086d147`
+- Source item: `0627e45f-9e44-4924-8a0a-f2b05d1cfd85`
+- Snapshot:
+  `a0d09b124c2e420dfba1f5a9f70abbdd0090ba6b6b7672003795f92dd5846256`
+- Base commit: `7a1c58153bcb83cb74b6c277f9e1fe47038dc3c3`
+- Head commit: `7ad6ea69bf72482e10f224153215c94c0c41c9e1`
+
+Before Refresh, the UI showed zero cached items and stated that remote reads
+occur only on Connect, Refresh, or Open review. Refresh cached exactly one
+metadata item. Open review then fetched the complete immutable snapshot and
+rendered the full pinned file:
+
+```text
+baseline: connected-machine acceptance fixture
+candidate: preserve this exact immutable machine snapshot
+```
+
+The reproduction preview created nothing. Confirmation materialized a clean
+detached checkout at the exact head commit while the daemon source repository
+remained clean on `main`. The final reproduction state is retained in
+[connected-machine-reproduced.jpeg](connected-machine-reproduced.jpeg).
+
 ## Manual originating-agent handoff
 
 The reviewer recorded Request changes with one immutable line-anchored formal
@@ -89,4 +118,3 @@ After the final frontend cancellation and handoff-history fixes:
 - Workspace tests: 92 passed.
 - Desktop tests: 37 passed; two opt-in Keychain tests then passed explicitly.
 - Strict workspace and desktop Clippy passed with warnings denied.
-
