@@ -297,19 +297,31 @@ button:disabled {
   gap: 8px;
 }
 .review-header {
-  height: 58px;
+  min-height: 58px;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 14px;
-  padding: 0 20px;
+  padding: 8px 20px;
   border-bottom: 1px solid var(--color-border);
 }
-.review-header div {
+.review-header .review-identity {
   flex: 1;
+  min-width: 120px;
   font-size: 14px;
 }
 .review-header span {
   color: var(--color-text-secondary);
+}
+.review-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.review-header-actions button {
+  font-size: 12px;
+  padding: 6px 9px;
 }
 .back {
   border: 0;
@@ -1176,6 +1188,23 @@ button:disabled {
   .review-header span {
     display: none;
   }
+  .github-review-header {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 7px 10px;
+    padding: 8px 10px;
+  }
+  .github-review-header .review-header-actions {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+  }
+  .github-review-header .review-header-actions button {
+    min-width: 0;
+    padding: 5px 4px;
+    font-size: 11px;
+  }
   .review-toolbar {
     padding: 0 10px;
   }
@@ -1263,6 +1292,21 @@ button:disabled {
 }
 .error-banner > button {
   margin: 0 14px 14px;
+}
+.reviewer-action-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #9b5d53;
+  background: #281b1c;
+}
+.reviewer-action-error .error-panel {
+  flex: 1;
+  margin: 0;
+}
+.reviewer-action-error > button {
+  flex-shrink: 0;
 }
 .snapshot-workspace {
   grid-template-columns: 235px minmax(380px, 1fr) 300px;
@@ -1364,6 +1408,17 @@ button:disabled {
   }
   .error-panel {
     margin: 12px 14px;
+  }
+  .reviewer-action-error {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 8px 10px;
+  }
+  .reviewer-action-error .error-panel {
+    margin: 0;
+  }
+  .reviewer-action-error > button {
+    align-self: flex-end;
   }
 }
 

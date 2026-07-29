@@ -2,6 +2,13 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const paginationTitle = "Fix pagination cursor drift across core-api and web-frontend";
+const githubTitle = "Improve error messages for expired tokens";
+const recoverableError = {
+  code: "fixture_recoverable_error",
+  message: "The requested review update could not be completed.",
+  data_safety: "The immutable diff and saved review data remain unchanged.",
+  next_step: "Retry the explicit review action.",
+};
 
 function setViewport(width: number) {
   Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
@@ -40,6 +47,55 @@ afterEach(() => {
 beforeEach(() => setViewport(1024));
 
 describe("fixture-backed reviewer recovery", () => {
+  it("keeps the immutable GitHub diff visible when initial comment refresh fails, then retries explicitly", async () => {
+    let refreshComments = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      refreshComments = vi.fn()
+        .mockRejectedValueOnce(recoverableError)
+        .mockImplementation(api.refreshGithubComments);
+      return { ...api, refreshGithubComments: refreshComments };
+    });
+
+    await openReview(githubTitle);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(recoverableError.message);
+    expect(screen.getAllByRole("region", { name: "Code diff" }).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(refreshComments).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(screen.getAllByRole("region", { name: "Code diff" }).length).toBeGreaterThan(0);
+  });
+
+  it("keeps the immutable diff visible and retries a failed Viewed update", async () => {
+    let setViewed = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      setViewed = vi.fn()
+        .mockRejectedValueOnce(recoverableError)
+        .mockImplementation(api.setFileViewed);
+      return { ...api, setFileViewed: setViewed };
+    });
+
+    await openPaginationReview();
+    const markViewed = screen.getAllByRole("button")
+      .find((button) => button.classList.contains("viewed-toggle") && button.textContent?.includes("Mark viewed"));
+    if (!markViewed) throw new Error("The selected file did not expose its Viewed action.");
+    fireEvent.click(markViewed);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(recoverableError.data_safety);
+    expect(screen.getAllByRole("region", { name: "Code diff" }).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(setViewed).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(screen.getAllByRole("region", { name: "Code diff" }).length).toBeGreaterThan(0);
+  });
+
   it("lets an interrupted durable /ask turn start a fresh session and retry only on explicit click", async () => {
     await openPaginationReview();
     await openChat();
@@ -132,6 +188,26 @@ describe("fixture-backed reviewer recovery", () => {
 });
 
 describe("responsive reviewer escape hatches", () => {
+  it("keeps narrow source-rail and GitHub reviewer actions named and discoverable", async () => {
+    setViewport(560);
+    await renderFixtureApp();
+
+    expect(screen.getByRole("button", { name: /this Mac, 4 active/i })).toHaveAttribute("title", "this Mac; 4 active");
+    expect(screen.getByRole("button", { name: /Fixture Build Machine, connected, 2 cached/i }))
+      .toHaveAttribute("title", "Fixture Build Machine; connected; 2 cached");
+    expect(screen.getByRole("button", { name: "Add machine" })).toHaveAttribute("title", "Add machine");
+
+    const card = screen.getByText(githubTitle).closest("article");
+    if (!card) throw new Error("The fixture GitHub review card was not rendered.");
+    fireEvent.click(within(card).getByRole("button", { name: "Open review" }));
+    await screen.findAllByRole("region", { name: "Code diff" });
+
+    const actions = screen.getByRole("group", { name: "GitHub review actions" });
+    expect(within(actions).getByRole("button", { name: "Refresh comments" })).toBeVisible();
+    expect(within(actions).getByRole("button", { name: "Check head" })).toBeVisible();
+    expect(within(actions).getByRole("button", { name: "Publish review" })).toBeVisible();
+  });
+
   it("offers a Chat control when the persistent chat column is unavailable at 1024px", async () => {
     setViewport(1024);
     await openPaginationReview();

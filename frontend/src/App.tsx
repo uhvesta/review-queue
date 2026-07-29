@@ -105,6 +105,15 @@ import {
 
 type Modal = "submit" | "github" | "details" | "reproduce" | "settings" | "machine" | null;
 type PurgeIntent = { round: ReviewRound; kind: "delete" | "approve_local" };
+type ReviewerRecovery =
+  | { kind: "load_viewed" }
+  | { kind: "set_viewed"; repositoryId: string; path: string; viewed: boolean }
+  | { kind: "load_decision" }
+  | { kind: "refresh_comments" }
+  | { kind: "check_head" }
+  | { kind: "prepare_publish" }
+  | { kind: "refresh_round" };
+type ReviewerActionFailure = { error: CommandError; recovery: ReviewerRecovery };
 
 const emptyBrief = (): ReviewBrief => ({
   title: "",
@@ -448,23 +457,30 @@ function Sidebar({
     <aside className="sidebar" aria-label="Sources">
       <div className="brand-mark">RQ</div>
       <h2>SOURCES</h2>
-      <button className={`machine ${activeMachineId ? "" : "current"}`} aria-current={activeMachineId ? undefined : "page"} onClick={onThisMac}>
+      <button
+        className={`machine ${activeMachineId ? "" : "current"}`}
+        aria-current={activeMachineId ? undefined : "page"}
+        aria-label={`this Mac, ${activeCount} active`}
+        title={`this Mac; ${activeCount} active`}
+        onClick={onThisMac}
+      >
         <span>●</span><b>this Mac</b><small>{activeCount} active</small>
       </button>
       {machines.map((status) => (
         <button
           className={`machine ${activeMachineId === status.machine.id ? "current" : ""}`}
           aria-current={activeMachineId === status.machine.id ? "page" : undefined}
+          aria-label={`${status.machine.config.name}, ${status.connection}, ${status.cachedItemCount} cached`}
           key={status.machine.id}
           onClick={() => onMachine(status.machine.id)}
-          title={`${status.connection}; ${status.cachedItemCount} cached`}
+          title={`${status.machine.config.name}; ${status.connection}; ${status.cachedItemCount} cached`}
         >
           <span className={status.connection === "connected" ? "health" : ""}>●</span>
           <b>{status.machine.config.name}</b>
           <small>{status.cachedItemCount} cached · {formatCacheAge(status.freshness.age_seconds)}</small>
         </button>
       ))}
-      <button className="add-machine" onClick={onAdd}>
+      <button className="add-machine" aria-label="Add machine" title="Add machine" onClick={onAdd}>
         ＋ <span>Add machine</span>
       </button>
     </aside>
@@ -1026,7 +1042,9 @@ function Reviewer({
     () => mediaMatches("(min-width: 1121px)", (width) => width >= 1121),
   );
   const [diff, setDiff] = useState<MaterializedDiff | null>(null);
-  const [diffError, setDiffError] = useState<CommandError | null>(null);
+  const [coreDiffError, setCoreDiffError] = useState<CommandError | null>(null);
+  const [diffLoadVersion, setDiffLoadVersion] = useState(0);
+  const [actionFailure, setActionFailure] = useState<ReviewerActionFailure | null>(null);
   const [selectedKey, setSelectedKey] = useState("");
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(new Set());
   const [viewed, setViewed] = useState<Set<string>>(new Set());
@@ -1048,6 +1066,83 @@ function Reviewer({
       ? "Completed — Requeue to review again"
       : "";
 
+  const loadViewedState = async () => {
+    const viewedFiles = await listViewedFiles(round.id);
+    setViewed(new Set(viewedFiles.map((file) => fileKey(file.repositoryId, file.path))));
+  };
+  const setViewedValue = async (repositoryId: string, path: string, next: boolean) => {
+    await setFileViewed(round.id, repositoryId, path, next);
+    const key = fileKey(repositoryId, path);
+    setViewed((current) => {
+      const updated = new Set(current);
+      if (next) updated.add(key); else updated.delete(key);
+      return updated;
+    });
+  };
+  const loadGithubDecision = async () => {
+    setGithubDecision(await getRoundDecision(round.id));
+  };
+  const refreshComments = async () => {
+    const result = await refreshGithubComments(round.id);
+    setImportedComments(result.imported);
+    setStaleness(result.staleness);
+  };
+  const checkHead = async () => {
+    setStaleness(await checkGithubStaleness(round.id));
+  };
+  const preparePublish = async () => {
+    setPublishAttempt(await prepareGithubPublish(round.id));
+  };
+  const refreshRound = async () => {
+    const result = await refreshGithubRound(round.id);
+    await onGithubRoundRefreshed(result.round);
+  };
+  const runReviewerAction = async (
+    recovery: ReviewerRecovery,
+    action: () => Promise<void>,
+    showWorking = false,
+  ) => {
+    setActionFailure((current) => current?.recovery.kind === recovery.kind ? null : current);
+    if (showWorking) setGithubWorking(true);
+    try {
+      await action();
+    } catch (problem) {
+      setActionFailure({ error: toCommandError(problem), recovery });
+    } finally {
+      if (showWorking) setGithubWorking(false);
+    }
+  };
+  const retryReviewerAction = async () => {
+    if (!actionFailure) return;
+    const { recovery } = actionFailure;
+    switch (recovery.kind) {
+      case "load_viewed":
+        await runReviewerAction(recovery, loadViewedState);
+        break;
+      case "set_viewed":
+        await runReviewerAction(
+          recovery,
+          () => setViewedValue(recovery.repositoryId, recovery.path, recovery.viewed),
+        );
+        break;
+      case "load_decision":
+        await runReviewerAction(recovery, loadGithubDecision);
+        break;
+      case "refresh_comments":
+        await runReviewerAction(recovery, refreshComments, true);
+        break;
+      case "check_head":
+        await runReviewerAction(recovery, checkHead, true);
+        break;
+      case "prepare_publish":
+        await runReviewerAction(recovery, preparePublish, true);
+        break;
+      case "refresh_round":
+        await runReviewerAction(recovery, refreshRound, true);
+        break;
+    }
+  };
+
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
     const filesQuery = window.matchMedia("(max-width: 580px)");
@@ -1065,29 +1160,23 @@ function Reviewer({
   useEffect(() => {
     let cancelled = false;
     setDiffLoading(true);
+    setCoreDiffError(null);
+    setDiff(null);
+    setSelectedKey("");
     const load = round.collection === "github"
-      ? Promise.all([
-          openGithubPullRequest(round.id).then((opened) => {
-            setGithubFiles(opened.files);
-            return githubFilesToDiff(round, opened.files);
-          }),
-          listViewedFiles(round.id),
-          refreshGithubComments(round.id).then((result) => {
-            setImportedComments(result.imported);
-            setStaleness(result.staleness);
-            return result.imported;
-          }),
-        ]).then(([materialized, viewedFiles]) => [materialized, viewedFiles] as const)
-      : Promise.all([materializeRoundDiff(round.id), listViewedFiles(round.id)]);
+      ? openGithubPullRequest(round.id).then((opened) => {
+          setGithubFiles(opened.files);
+          return githubFilesToDiff(round, opened.files);
+        })
+      : materializeRoundDiff(round.id);
     load
-      .then(([materialized, viewedFiles]) => {
+      .then((materialized) => {
         if (cancelled) return;
         setDiff(materialized);
-        setViewed(new Set(viewedFiles.map((file) => fileKey(file.repositoryId, file.path))));
-        setDiffError(null);
+        setCoreDiffError(null);
       })
       .catch((problem) => {
-        if (!cancelled) setDiffError(toCommandError(problem));
+        if (!cancelled) setCoreDiffError(toCommandError(problem));
       })
       .finally(() => {
         if (!cancelled) setDiffLoading(false);
@@ -1095,16 +1184,50 @@ function Reviewer({
     return () => {
       cancelled = true;
     };
-  }, [round.id]);
+  }, [diffLoadVersion, round.id]);
 
   useEffect(() => {
+    let cancelled = false;
+    setActionFailure(null);
+    listViewedFiles(round.id)
+      .then((viewedFiles) => {
+        if (cancelled) return;
+        setViewed(new Set(viewedFiles.map((file) => fileKey(file.repositoryId, file.path))));
+      })
+      .catch((problem) => {
+        if (!cancelled) {
+          setActionFailure({ error: toCommandError(problem), recovery: { kind: "load_viewed" } });
+        }
+      });
     if (round.collection !== "github") {
       setGithubDecision(null);
-      return;
+      setImportedComments([]);
+      setStaleness(null);
+      return () => {
+        cancelled = true;
+      };
     }
     getRoundDecision(round.id)
       .then(setGithubDecision)
-      .catch((problem) => setDiffError(toCommandError(problem)));
+      .catch((problem) => {
+        if (!cancelled) {
+          setActionFailure({ error: toCommandError(problem), recovery: { kind: "load_decision" } });
+        }
+      });
+    refreshGithubComments(round.id)
+      .then((result) => {
+        if (cancelled) return;
+        setImportedComments(result.imported);
+        setStaleness(result.staleness);
+      })
+      .catch((problem) => {
+        if (!cancelled) {
+          setActionFailure({ error: toCommandError(problem), recovery: { kind: "refresh_comments" } });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [round.collection, round.id]);
 
   const files = useMemo(
@@ -1157,16 +1280,10 @@ function Reviewer({
     if (readOnly) return;
     const key = fileKey(repositoryId, path);
     const next = !viewed.has(key);
-    try {
-      await setFileViewed(round.id, repositoryId, path, next);
-      setViewed((current) => {
-        const updated = new Set(current);
-        if (next) updated.add(key); else updated.delete(key);
-        return updated;
-      });
-    } catch (problem) {
-      setDiffError(toCommandError(problem));
-    }
+    await runReviewerAction(
+      { kind: "set_viewed", repositoryId, path, viewed: next },
+      () => setViewedValue(repositoryId, path, next),
+    );
   };
   const toggleViewed = () => selected
     ? toggleViewedFor(selected.file.repository_id, selected.path)
@@ -1188,43 +1305,47 @@ function Reviewer({
 
   return (
     <main className="reviewer">
-      <header className="review-header">
+      <header className={`review-header ${round.collection === "github" ? "github-review-header" : ""}`}>
         <button className="back" onClick={onBack}>← Queue Home</button>
-        <div>
+        <div className="review-identity">
           <b>{round.manifest.topic}</b>
           <span> · {round.manifest.repositories.length} repositories @ {shortSha(round.manifest_hash)}</span>
         </div>
         <button onClick={onDetails}>Details</button>
         {round.collection === "github" && (
-          <>
-            <button disabled={githubWorking} onClick={() => void githubAction(async () => {
-              const result = await refreshGithubComments(round.id);
-              setImportedComments(result.imported);
-              setStaleness(result.staleness);
-            }, setGithubWorking, setDiffError)}>Refresh comments</button>
-            <button disabled={githubWorking} onClick={() => void githubAction(async () => {
-              setStaleness(await checkGithubStaleness(round.id));
-            }, setGithubWorking, setDiffError)}>Check head</button>
+          <div className="review-header-actions" role="group" aria-label="GitHub review actions">
+            <button
+              disabled={githubWorking}
+              onClick={() => void runReviewerAction({ kind: "refresh_comments" }, refreshComments, true)}
+            >Refresh comments</button>
+            <button
+              disabled={githubWorking}
+              onClick={() => void runReviewerAction({ kind: "check_head" }, checkHead, true)}
+            >Check head</button>
             <button
               disabled={githubWorking || readOnly || !githubDecision}
               title={!githubDecision ? "Record Approve or Request changes before publishing" : readOnly ? reason : "Preview the exact GitHub review request"}
-              onClick={() => void githubAction(async () => {
-              setPublishAttempt(await prepareGithubPublish(round.id));
-            }, setGithubWorking, setDiffError)}
+              onClick={() => void runReviewerAction({ kind: "prepare_publish" }, preparePublish, true)}
             >Publish review</button>
-          </>
+          </div>
         )}
       </header>
       <ReviewBriefView brief={round.brief} />
+      {actionFailure && (
+        <div className="reviewer-action-error">
+          <ErrorPanel error={actionFailure.error} onRetry={retryReviewerAction} />
+          <button onClick={() => setActionFailure(null)}>Dismiss</button>
+        </div>
+      )}
       {round.collection === "github" && (
         <section className="upstream-discussion">
           {staleness && staleness.pinned_head_sha !== staleness.observed_head_sha && (
             <p className="danger-text">
               Head moved from {shortSha(staleness.pinned_head_sha)} to {shortSha(staleness.observed_head_sha)}.{" "}
-              <button disabled={githubWorking} onClick={() => void githubAction(async () => {
-                const result = await refreshGithubRound(round.id);
-                await onGithubRoundRefreshed(result.round);
-              }, setGithubWorking, setDiffError)}>Refresh into new round</button>
+              <button
+                disabled={githubWorking}
+                onClick={() => void runReviewerAction({ kind: "refresh_round" }, refreshRound, true)}
+              >Refresh into new round</button>
             </p>
           )}
           <details>
@@ -1358,8 +1479,13 @@ function Reviewer({
             </button>
           </div>
           {diffLoading && <p className="loading-state">Materializing pinned commits…</p>}
-          {diffError && <ErrorPanel error={diffError} />}
-          {!diffLoading && !diffError && viewMode !== "file" && files.length > 0 && (
+          {coreDiffError && (
+            <ErrorPanel
+              error={coreDiffError}
+              onRetry={async () => setDiffLoadVersion((version) => version + 1)}
+            />
+          )}
+          {!diffLoading && !coreDiffError && viewMode !== "file" && files.length > 0 && (
             <div className="diff-scroll" aria-label="Changed file diffs">
               {files.map(({ repository, file, path }, index) => {
                 const key = fileKey(file.repository_id, path);
@@ -1433,14 +1559,14 @@ function Reviewer({
               })}
             </div>
           )}
-          {!diffLoading && !diffError && selected && viewMode === "file" && (
+          {!diffLoading && !coreDiffError && selected && viewMode === "file" && (
             <PinnedFilePane
               round={round}
               selected={selected}
               githubFile={githubFiles.find((file) => file.path === selected.path)}
             />
           )}
-          {!diffLoading && !diffError && !selected && (
+          {!diffLoading && !coreDiffError && !selected && (
             <p className="loading-state">No changed files in this review round.</p>
           )}
           <div className="decision">
@@ -3271,22 +3397,6 @@ function githubSourceSummary(source: Extract<NonNullable<ReviewRound["source_met
   const pull = typeof value.pull_number === "number" ? `#${value.pull_number}` : "";
   const head = typeof value.head_sha === "string" ? `@ ${shortSha(value.head_sha)}` : "";
   return [repository || "GitHub pull request", pull, head].filter(Boolean).join(" ");
-}
-
-async function githubAction(
-  action: () => Promise<void>,
-  setWorking: React.Dispatch<React.SetStateAction<boolean>>,
-  setError: React.Dispatch<React.SetStateAction<CommandError | null>>,
-) {
-  setWorking(true);
-  setError(null);
-  try {
-    await action();
-  } catch (problem) {
-    setError(toCommandError(problem));
-  } finally {
-    setWorking(false);
-  }
 }
 
 function githubFilesToDiff(round: ReviewRound, files: GithubMaterializedFile[]): MaterializedDiff {
