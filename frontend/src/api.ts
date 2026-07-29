@@ -68,6 +68,10 @@ export async function retryConnection(): Promise<ConnectionHealth> {
   return invoke("retry_connection");
 }
 
+export async function selectExistingCopilotCli(): Promise<ConnectionHealth> {
+  return invoke("select_existing_copilot_cli");
+}
+
 export async function startDeviceFlow(capability: string): Promise<DeviceFlowPublicState> {
   return invoke("start_device_flow", { request: { capability } });
 }

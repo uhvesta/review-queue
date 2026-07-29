@@ -747,6 +747,28 @@ where
         Ok(self.health())
     }
 
+    /// Explicitly selects the existing Copilot CLI sign-in for future
+    /// sessions. The read-only probe must succeed before the app changes its
+    /// Keychain-backed source preference. App-owned OAuth credentials remain
+    /// untouched so switching sources never destroys a separate grant.
+    pub fn select_existing_copilot_cli(&self) -> Result<ConnectionHealth, ConnectionCommandError> {
+        let cli = self.cli_probe.validate_read_only();
+        if !cli.installed || !cli.signed_in {
+            return Err(ConnectionCommandError {
+                code: "existing_copilot_cli_unavailable".into(),
+                message: "The existing Copilot CLI sign-in is not available.".into(),
+                data_safety:
+                    "No source preference, app-owned credential, or review data was changed."
+                        .into(),
+                next_step:
+                    "Sign in with the Copilot CLI, then explicitly choose Use existing CLI sign-in again."
+                        .into(),
+            });
+        }
+        self.vault.delete(Capability::CopilotCliOptOut)?;
+        Ok(self.health())
+    }
+
     pub fn start_device_flow(
         &self,
         request: StartDeviceFlowRequest,
@@ -1129,6 +1151,11 @@ pub async fn disconnect_capability(
 }
 
 #[tauri::command]
+pub async fn select_existing_copilot_cli() -> Result<ConnectionHealth, ConnectionCommandError> {
+    run_connection_operation(|| ConnectionService::production().select_existing_copilot_cli()).await
+}
+
+#[tauri::command]
 pub async fn start_device_flow(
     request: StartDeviceFlowRequest,
 ) -> Result<DeviceFlowPublicState, ConnectionCommandError> {
@@ -1277,6 +1304,153 @@ mod tests {
             .unwrap();
         assert_eq!(health.copilot.state, ConnectionState::NotConnected);
         assert!(health.cli.signed_in);
+    }
+
+    #[test]
+    fn explicit_existing_cli_selection_clears_only_the_opt_out() {
+        let service = service(true);
+        service
+            .vault
+            .set_app_credential(
+                Capability::CopilotApp,
+                &AppCredentialRecord {
+                    access_token: "opaque-app-credential".into(),
+                    account_label: Some("app-account".into()),
+                    scopes: vec!["read:user".into()],
+                    expires_at_unix_seconds: None,
+                },
+            )
+            .unwrap();
+        service
+            .vault
+            .set(Capability::CopilotCliOptOut, "app-oauth-selected")
+            .unwrap();
+        assert_eq!(
+            service.health().copilot.source,
+            ConnectionSource::AppOwnedOauth
+        );
+
+        let health = service.select_existing_copilot_cli().unwrap();
+
+        assert_eq!(health.copilot.source, ConnectionSource::ExistingCopilotCli);
+        assert!(
+            service
+                .vault
+                .get(Capability::CopilotCliOptOut)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            service
+                .vault
+                .get_app_credential(Capability::CopilotApp)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn successful_app_oauth_selection_retains_the_cli_opt_out() {
+        let mut service = service(true);
+        service
+            .start_device_flow(StartDeviceFlowRequest {
+                capability: "copilot_app".into(),
+                expected_account: None,
+            })
+            .unwrap();
+        service.poller = FixedPoller(DeviceFlowPollOutcome::Success {
+            access_token: "opaque-app-credential".into(),
+            account_label: Some("app-account".into()),
+            scopes: vec!["read:user".into()],
+            expires_in_seconds: None,
+        });
+
+        let connected = service.complete_device_flow().unwrap();
+
+        assert_eq!(connected.phase, DeviceFlowPhase::Connected);
+        assert!(
+            service
+                .vault
+                .get(Capability::CopilotCliOptOut)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            service.health().copilot.source,
+            ConnectionSource::AppOwnedOauth
+        );
+    }
+
+    #[test]
+    fn disconnecting_app_oauth_leaves_an_explicit_path_back_to_cli() {
+        let service = service(true);
+        service
+            .vault
+            .set_app_credential(
+                Capability::CopilotApp,
+                &AppCredentialRecord {
+                    access_token: "opaque-app-credential".into(),
+                    account_label: Some("app-account".into()),
+                    scopes: vec!["read:user".into()],
+                    expires_at_unix_seconds: None,
+                },
+            )
+            .unwrap();
+        service
+            .vault
+            .set(Capability::CopilotCliOptOut, "app-oauth-selected")
+            .unwrap();
+
+        let disconnected = service
+            .disconnect(DisconnectCapabilityRequest {
+                capability: "copilot_app".into(),
+                source: ConnectionSource::AppOwnedOauth,
+            })
+            .unwrap();
+        assert_eq!(disconnected.copilot.state, ConnectionState::NotConnected);
+        assert!(disconnected.cli.signed_in);
+        assert!(
+            service
+                .vault
+                .get(Capability::CopilotCliOptOut)
+                .unwrap()
+                .is_some()
+        );
+
+        let reselected = service.select_existing_copilot_cli().unwrap();
+
+        assert_eq!(reselected.copilot.state, ConnectionState::Connected);
+        assert_eq!(
+            reselected.copilot.source,
+            ConnectionSource::ExistingCopilotCli
+        );
+        assert!(
+            service
+                .vault
+                .get(Capability::CopilotCliOptOut)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unavailable_existing_cli_does_not_change_the_source_preference() {
+        let service = service(false);
+        service
+            .vault
+            .set(Capability::CopilotCliOptOut, "app-oauth-selected")
+            .unwrap();
+
+        let error = service.select_existing_copilot_cli().unwrap_err();
+
+        assert_eq!(error.code, "existing_copilot_cli_unavailable");
+        assert!(
+            service
+                .vault
+                .get(Capability::CopilotCliOptOut)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

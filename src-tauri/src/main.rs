@@ -139,6 +139,7 @@ fn main() {
             connection_health::connection_status,
             connection_health::retry_connection,
             connection_health::disconnect_capability,
+            connection_health::select_existing_copilot_cli,
             connection_health::start_device_flow,
             connection_health::cancel_device_flow,
             connection_health::complete_device_flow,

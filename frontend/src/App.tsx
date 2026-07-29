@@ -42,6 +42,7 @@ import {
   purgeRound,
   requestChanges,
   retryConnection,
+  selectExistingCopilotCli,
   refreshGithubComments,
   refreshGithubRound,
   connectMachine,
@@ -3808,7 +3809,16 @@ function SettingsDialog({
       <section {...dialog} className="modal settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header><h2 id="settings-title">Application settings</h2><button onClick={onClose} aria-label="Close">×</button></header>
         <div className="detail-grid">
-          <ConnectionRow label="Copilot /ask" status={health?.copilot} working={working} onConnect={() => void connect("copilot_app")} onDisconnect={(source) => void run(() => disconnectCapability("copilot_app", source))} />
+          <ConnectionRow
+            label="Copilot /ask"
+            status={health?.copilot}
+            working={working}
+            onConnect={() => void connect("copilot_app")}
+            onDisconnect={(source) => void run(() => disconnectCapability("copilot_app", source))}
+            onUseExisting={health?.cli.signedIn && health?.copilot.source !== "existing_copilot_cli"
+              ? () => void run(() => selectExistingCopilotCli())
+              : undefined}
+          />
           <ConnectionRow label="PR read" status={health?.prRead} working={working} onConnect={() => void connect("pr_read")} onDisconnect={(source) => void run(() => disconnectCapability("pr_read", source))} />
           <ConnectionRow label="PR publish" status={health?.prPublish} working={working} onConnect={() => void connect("pr_publish")} onDisconnect={(source) => void run(() => disconnectCapability("pr_publish", source))} />
           {deviceFlow && (
@@ -3888,25 +3898,34 @@ function ConnectionRow({
   working,
   onConnect,
   onDisconnect,
+  onUseExisting,
 }: {
   label: string;
   status?: ConnectionHealth["copilot"];
   working: boolean;
   onConnect: () => void;
   onDisconnect: (source: ConnectionHealth["copilot"]["source"]) => void;
+  onUseExisting?: () => void;
 }) {
   const connected = status?.state === "connected";
   return (
     <section className="connection-row">
       <div><b>{label}</b><p>{status?.explanation ?? "Checking connection…"}</p></div>
       <span className={connected ? "status good" : "status"}>{connected ? `✓ ${status?.account ?? status?.source.replaceAll("_", " ")}` : status?.state.replaceAll("_", " ") ?? "checking…"}</span>
-      {connected ? (
-        <button disabled={working} onClick={() => status && onDisconnect(status.source)}>
-          {status?.source === "existing_copilot_cli" ? "Stop using existing sign-in" : "Disconnect"}
-        </button>
-      ) : (
-        <button disabled={working || status?.state === "unavailable"} onClick={onConnect}>Connect app</button>
-      )}
+      <div className="dialog-actions">
+        {connected ? (
+          <button disabled={working} onClick={() => status && onDisconnect(status.source)}>
+            {status?.source === "existing_copilot_cli" ? "Stop using existing sign-in" : "Disconnect"}
+          </button>
+        ) : (
+          <button disabled={working || status?.state === "unavailable"} onClick={onConnect}>Connect app</button>
+        )}
+        {onUseExisting && (
+          <button disabled={working || status?.state === "unavailable"} onClick={onUseExisting}>
+            Use existing CLI sign-in
+          </button>
+        )}
+      </div>
     </section>
   );
 }
