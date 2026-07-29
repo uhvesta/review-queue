@@ -201,6 +201,8 @@ connection health resolved asynchronously; PR read became enabled without a
 browser flow. Application settings then showed Copilot existing-sign-in,
 PR-read, and PR-publish all connected as `uhvesta`, the configured public
 Client ID `Ov23li9NHgxO6prQz5f7`, and a healthy capability-scoped Keychain.
+The Updates section showed the running version `0.1.0` without reading the
+update feed.
 No credential value was read, copied, logged, or moved outside Keychain.
 
 Retained current-tree screenshots:
@@ -210,6 +212,50 @@ Retained current-tree screenshots:
 - `difit-current-split.jpeg`
 - `difit-current-full-file.jpeg`
 - `current-signed-auth-persisted.jpeg`
+- `current-signed-settings-version.jpeg`
+
+## Current-tree stale Copilot option recovery
+
+Source commit `8b6cba8` was rebuilt as an arm64 debug app and signed with the
+Developer ID Application identity for team `7H66Q22DJD`. Strict deep
+signature verification passed. The signed executable SHA-256 was
+`291a47ded58b65edb16d5622288581e76393b0d67af10372301280525ab9a248`.
+This is current-tree native acceptance evidence, not the notarized release
+artifact.
+
+The active empty conversation
+`e361ab52-8c46-4ba7-8fdf-a22698a4bab7` in round
+`594c05b7-6b2e-4fb1-a36e-0f2252d303e8` initially contained the legacy
+selection `context_window=managed_80` and zero turns. Opening Chat showed the
+exact saved key/value, the SDK's unsupported reason, and stated that the value
+would not be sent. The only start action was **Reset unavailable options and
+start Copilot**.
+
+One explicit reset:
+
+- started the existing-CLI provider session;
+- removed only the unavailable selection;
+- retained Context window as honestly unsupported; and
+- left the same conversation at exactly zero turns.
+
+The reviewer then selected `app/new-review.txt:1` on the RIGHT side and sent
+one explicit question. It completed once with repository `app`, line range
+`1–1`, a 40-character pinned blob SHA, model `auto`, and no
+`context_window` option stamp. SQLite metadata showed the turn count changed
+from zero to one and the sole turn was `completed`.
+
+After a full quit and relaunch of the same signed bundle, the conversation was
+`history_only`, its provider label was cleared, and the turn count remained
+exactly one with state `completed`. The saved migrated Context window
+selection remained null. Reopening the round displayed the persisted anchored
+turn, disabled the input with the restart reason, and issued no prompt.
+
+Retained evidence:
+
+- `copilot-stale-option-disclosure.jpeg`
+- `copilot-stale-option-reset.jpeg`
+- `copilot-anchored-ask.jpeg`
+- `copilot-stale-option-restart.jpeg`
 
 ## Installed updater baseline
 
