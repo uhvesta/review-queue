@@ -116,6 +116,59 @@ projects. No difit source file exists anywhere in this repository.
    Copilot, or perform queue mutations" — false since the Tauri wiring
    landed (40+ real `invoke()` calls gated by `desktopAvailable`). Corrected.
 
+### Second pass: fixture harness + live browser verification
+
+`src-tauri` still doesn't build (see below), so a dev-only fixture harness
+was added instead of waiting: `frontend/src/api.fixture.ts` (`9c6d475`) is a
+structural drop-in for `api.ts` — same 45 exports, in-memory mutable fixture
+store covering 5 rounds across local/github/machine/completed, a multi-repo
+diff (binary/added/deleted/long-path files), formal comments, an `/ask`
+conversation, and a connected machine — wired in only via a `--mode fixture`
+Vite alias (`npm run dev:fixture`). `api.ts`/`App.tsx` are untouched by it,
+and the default `npm run build`/`dev` are unaffected (verified: the fixture
+module is fully tree-shaken out of the production bundle).
+
+This unblocked driving the actual running UI in a browser and comparing it
+directly against `legacy-reviewer.jpeg`/`legacy-queue-home.jpeg` side by
+side, which surfaced three real defects the static-code review above missed:
+
+10. **Split mode had no diff coloring at all** (`4a7be38`) — the most
+    significant finding. "Split" was wired to `PinnedFilePane`, a *different*
+    feature (full pinned-file comparison, `materializeRoundFile` on both
+    sides) than what difit's Split view is: a synced two-column diff with
+    red/green backgrounds. Clicking Split showed two plain, uncolored full
+    files. Fixed by giving `DiffFileView`/`DiffHunkView` a `layout: "unified"
+    | "split"` prop; split layout now pairs each hunk's deletion/addition
+    lines into synchronized rows (`pairSplitLines`) using the same hunks
+    already loaded for unified mode, with the same addition/deletion color
+    tokens and gutter width — matching difit's `SideBySideDiffChunk`
+    pattern. "Full file" keeps using `PinnedFilePane` unchanged (simplified,
+    since it now only ever renders one side). Line-level click-to-select for
+    `/ask`/comment anchoring stays unified-mode-only in this pass — split
+    mode still exposes the same hunk-level `/ask`/`+ Comment` buttons in its
+    header, just not per-line selection; documented as a known scope limit
+    below rather than silently degraded.
+11. **Split-diff empty cells were invisible** (`7c25048`) — the "no
+    corresponding line" side of a pure-addition or pure-deletion hunk used
+    `opacity: 0.5` on a dark background, which blended into the page
+    background and read as a misaligned/broken layout rather than an
+    intentional empty cell. Switched to the flat `--color-diff-neutral-bg`
+    token (previously defined but unused).
+12. **Settings dialog text collision** (`fb35cd3`) — "GitHub OAuth public
+    client" (`<b>`) and "Advanced public Client ID" (`<label>`) were both
+    inline elements with no block sibling between them, rendering as one
+    run-together line: "GitHub OAuth public clientAdvanced public Client
+    ID". Made settings-dialog section headers/labels block-level with
+    proper spacing, scoped narrowly so `ConnectionRow`'s own `<b>`/`<p>`
+    layout is unaffected.
+
+All three were verified live: Queue Home, the multi-repo reviewer (unified
+and split), full-file mode, binary/deleted/long-path files, the machine
+queue, Review round details, Application settings, and Submit local review
+were all opened and visually inspected against the retained legacy
+screenshots and the difit visual-token system established in the first
+pass. `npm run build` re-verified clean after each fix.
+
 ## Visual differences that remain, and why
 
 - **Continuous multi-file scroll**: difit renders every changed file
@@ -140,6 +193,19 @@ projects. No difit source file exists anywhere in this repository.
   follow-up.
 - **AI-computed review order (`ReviewPlanPanel` in the legacy app)**:
   intentionally not ported — explicitly out of scope per the task.
+- **Split-mode line selection**: unified mode supports click/shift-click
+  line selection to build a precise `/ask`/comment anchor; split mode (added
+  in the second pass) currently only offers the same hunk-level `/ask`/`+
+  Comment` buttons already in the hunk header, not per-line selection.
+  Replicating the selection/anchor logic across a paired two-column layout
+  is a real feature addition with its own edge cases (e.g. which side does
+  a click on a context row anchor to), deferred rather than rushed.
+- **Narrow-width (<900px) visual verification**: the ~1120px breakpoint
+  added in the accessibility pass was verified by reading the CSS, but this
+  session's browser-automation tooling did not honor window-resize requests
+  (`resize_window` reported success but `window.innerWidth` never changed),
+  so an actual narrow-viewport screenshot could not be captured. Worth a
+  manual check with the real desktop app window resized by hand.
 
 ## Behavioral regressions checked
 
@@ -161,10 +227,11 @@ projects. No difit source file exists anywhere in this repository.
   publishing semantics changed — confirmed by reading every diff before
   committing.
 
-## Screenshot comparison — limitation
+## Screenshot comparison
 
-**New packaged-app screenshots could not be captured in this session.** The
-Tauri desktop crate (`src-tauri`) currently fails to compile:
+**The real packaged app still cannot be built.** `src-tauri` fails to compile
+for the same reason as before, from the same unrelated concurrent backend
+work (not touched by this migration):
 
 ```
 error[E0425]: cannot find type `ReproductionPreview` in crate `review_queue_core`
@@ -173,28 +240,26 @@ error[E0425]: cannot find type `ReproductionResult` in crate `review_queue_core`
    --> src-tauri/src/machines.rs:391:32
 ```
 
-This comes from unrelated, concurrent, in-flight backend work on this same
-branch (visible in `git status` as modifications to `crates/review-queue-cli/
-src/main.rs`, `crates/review-queue-core/src/{machine,github,socket,store}.rs`,
-`src-tauri/src/{commands,machines}.rs`, none of it touched by this frontend
-migration) — `review_queue_core` appears to have moved `ReproductionPreview`/
-`ReproductionResult` into a `reproduction` module without `src-tauri/src/
-machines.rs` being updated to match. Per this task's constraints ("do not
-replace or weaken the Rust/Tauri backend," "preserve every unrelated or
-concurrent change"), I did not fix this — it isn't mine to fix blind, without
-understanding what the concurrent work is mid-way through.
+Rather than wait on that, this session added a **dev-only fixture harness**
+(`frontend/src/api.fixture.ts` + `npm run dev:fixture`, see above) and used
+Chrome browser automation to drive the real running UI against realistic
+fixture data, comparing it directly against the retained
+`legacy-queue-home.jpeg`/`legacy-reviewer.jpeg` screenshots. This is not a
+substitute for a real packaged-app screenshot pass — it doesn't exercise the
+Tauri window chrome, native menus, or actual backend data — but it verified,
+live, rather than by reading code: Queue Home, the sidebar/machine queue,
+the multi-repo reviewer in both unified and (now-fixed) split mode, full-file
+mode, binary/deleted/added/long-path file rendering, the Review round
+details modal, Application settings, and Submit local review. It's also what
+surfaced the three real bugs listed above (split-mode coloring, empty-cell
+visibility, settings text collision) that a pure code read had missed.
 
-**What this means:** the reviewer screenshot the user captured earlier in
-this session (showing the pre-fix scrollbar bug, since fixed) is the most
-recent real packaged-app evidence available. Direct pixel-comparison
-screenshots of Queue Home, split/unified reviewer, full-file view, inline
-`/ask`, chat sheet, formal feedback drawer, connected-machine queue, and a
-narrow layout — all captured at the legacy reference size and compared
-against `legacy-queue-home.jpeg`/`legacy-reviewer.jpeg` — remain outstanding.
-**Recommended next step:** once `src-tauri` builds again, run the app with
-the same fixture used for the retained legacy screenshots and capture the
-full set listed in the task; the CSS/markup changes in this report are ready
-to verify visually at that point.
+**Still outstanding:** formal pixel-comparison screenshots captured at the
+exact legacy reference size (1152×768) through the real packaged app, plus
+the narrow-layout (<900px) check that this session's browser tooling
+couldn't perform (see "Visual differences that remain" above). Once
+`src-tauri` builds again, re-run this same comparison against the real app
+and the same fixture/topic used for the original legacy screenshots.
 
 ## Exact commands and results
 
@@ -208,6 +273,7 @@ to verify visually at that point.
 | `cd src-tauri && cargo test --locked` | **Fails to compile** — see limitation above, unrelated to this migration |
 | `cd src-tauri && cargo clippy --all-targets --locked` | Same compile failure |
 | `npm ci` | Clean — 78 packages installed, 0 vulnerabilities |
+| `npm run dev:fixture` (added this pass) | Boots clean; used for live browser verification of every fix in the "second pass" section above |
 
 The two `src-tauri` E0425 errors should be resolved as part of finishing the
 concurrent backend work already in progress on this branch — they are not a
