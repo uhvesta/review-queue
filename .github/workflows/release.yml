@@ -1,0 +1,272 @@
+name: Signed macOS release
+
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  push:
+    tags:
+      - "v*.*.*-rc.*"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release train
+        required: true
+        type: choice
+        options:
+          - nightly
+          - candidate
+          - stable
+      release_ref:
+        description: Existing tag or commit to release
+        required: true
+        type: string
+      acceptance_matrix_approved:
+        description: Stable only — I reviewed and approved the complete acceptance matrix
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: signed-macos-${{ github.event_name == 'workflow_dispatch' && inputs.channel || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Resolve and gate release train
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.release.outputs.channel }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      version: ${{ steps.release.outputs.version }}
+      checkout_ref: ${{ steps.release.outputs.checkout_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.ref }}
+      - id: release
+        name: Validate release request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          INPUT_REF: ${{ inputs.release_ref }}
+          ACCEPTED: ${{ inputs.acceptance_matrix_approved }}
+          GIT_REF: ${{ github.ref }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            channel="nightly"
+            checkout_ref="main"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            channel="candidate"
+            checkout_ref="${GIT_REF#refs/tags/}"
+          else
+            channel="$INPUT_CHANNEL"
+            checkout_ref="$INPUT_REF"
+          fi
+
+          case "$channel" in
+            nightly)
+              base_version="$(
+                node -e 'console.log(JSON.parse(require("fs").readFileSync("src-tauri/tauri.conf.json", "utf8")).version)'
+              )"
+              if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "tauri.conf.json must contain a stable X.Y.Z base version" >&2
+                exit 1
+              fi
+              version="$base_version-nightly.$(date -u +%Y%m%d).$RUN_NUMBER"
+              release_tag="nightly-$(date -u +%Y%m%d)-$RUN_NUMBER"
+              prerelease="true"
+              ;;
+            candidate)
+              if [[ ! "$checkout_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+                echo "candidate release_ref must be a vX.Y.Z-rc.N tag" >&2
+                exit 1
+              fi
+              version="${checkout_ref#v}"
+              release_tag="$checkout_ref"
+              prerelease="true"
+              ;;
+            stable)
+              if [[ "$EVENT_NAME" != "workflow_dispatch" || "$ACCEPTED" != "true" ]]; then
+                echo "stable releases require workflow_dispatch and explicit acceptance-matrix approval" >&2
+                exit 1
+              fi
+              if [[ ! "$checkout_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "stable release_ref must be a vX.Y.Z tag" >&2
+                exit 1
+              fi
+              version="${checkout_ref#v}"
+              release_tag="$checkout_ref"
+              prerelease="false"
+              scripts/check-release-readiness.sh
+              ;;
+            *)
+              echo "unknown release channel: $channel" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "channel=$channel"
+            echo "checkout_ref=$checkout_ref"
+            echo "prerelease=$prerelease"
+            echo "release_tag=$release_tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Sign, notarize, staple, and package
+    needs: metadata
+    runs-on: macos-14
+    environment:
+      name: ${{ needs.metadata.outputs.channel == 'stable' && 'stable-release' || 'release' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.metadata.outputs.checkout_ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            src-tauri -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Validate signing and notarization secrets
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          required=(
+            APPLE_CERTIFICATE_P12
+            APPLE_CERTIFICATE_PASSWORD
+            APPLE_API_ISSUER_ID
+            APPLE_API_KEY_ID
+            APPLE_API_KEY_P8
+            TAURI_SIGNING_PRIVATE_KEY
+            TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          )
+          for secret_name in "${required[@]}"; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "required release secret is unavailable: $secret_name" >&2
+              exit 78
+            fi
+          done
+      - uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      - name: Install release tools
+        run: |
+          set -euo pipefail
+          cargo install tauri-cli --version "^2.0" --locked
+          command -v rg >/dev/null 2>&1 || brew install ripgrep
+      - name: Create ephemeral notary Keychain profile
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/review-queue-notary.p8"
+          cleanup() {
+            rm -f "$key_path"
+          }
+          trap cleanup EXIT
+          umask 077
+          printf '%s' "$APPLE_API_KEY_P8" > "$key_path"
+          xcrun notarytool store-credentials review-queue-ci \
+            --key "$key_path" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID"
+      - name: Build signed and notarized universal release
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: >-
+          scripts/release-macos.sh
+          --profile review-queue-ci
+          --version "${{ needs.metadata.outputs.version }}"
+          --channel "${{ needs.metadata.outputs.channel }}"
+          --release-tag "${{ needs.metadata.outputs.release_tag }}"
+          --output dist
+      - name: Upload retained release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-queue-${{ needs.metadata.outputs.version }}-macos
+          path: |
+            dist/*.dmg
+            dist/*.app.zip
+            dist/*.app.tar.gz
+            dist/*.app.tar.gz.sig
+            dist/latest.json
+            dist/SHA256SUMS
+            dist/*.cdx.json
+            dist/*.notarization.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.dmg
+            dist/*.app.zip
+            dist/*.app.tar.gz
+            dist/*.app.tar.gz.sig
+            dist/latest.json
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          CHANNEL: ${{ needs.metadata.outputs.channel }}
+        run: |
+          set -euo pipefail
+          prerelease_args=()
+          latest_args=(--latest=false)
+          verify_tag_args=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            prerelease_args+=(--prerelease)
+          elif [[ "$CHANNEL" == "stable" ]]; then
+            latest_args=(--latest)
+          fi
+          if [[ "$CHANNEL" != "nightly" ]]; then
+            verify_tag_args+=(--verify-tag)
+          fi
+          release_commit="$(git rev-parse HEAD)"
+          gh release create "$RELEASE_TAG" \
+            dist/*.dmg \
+            dist/*.app.zip \
+            dist/*.app.tar.gz \
+            dist/*.app.tar.gz.sig \
+            dist/latest.json \
+            dist/SHA256SUMS \
+            dist/*.cdx.json \
+            dist/*.notarization.json \
+            --target "$release_commit" \
+            --generate-notes \
+            --title "Review Queue $RELEASE_TAG" \
+            "${prerelease_args[@]}" \
+            "${latest_args[@]}" \
+            "${verify_tag_args[@]}"

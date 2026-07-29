@@ -1,0 +1,5 @@
+[toolchain]
+# github-copilot-sdk 1.0.0-beta.8 requires Rust 1.94 or newer.
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

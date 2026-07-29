@@ -1,0 +1,9 @@
+{
+  "name": "review-queue-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "tsc --noEmit && vite build", "preview": "vite preview" },
+  "dependencies": { "@tauri-apps/api": "^2.8.0", "@vitejs/plugin-react": "latest", "vite": "latest", "typescript": "latest", "react": "latest", "react-dom": "latest" },
+  "devDependencies": { "@types/react": "latest", "@types/react-dom": "latest" }
+}

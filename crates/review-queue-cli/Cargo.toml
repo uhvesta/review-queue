@@ -1,0 +1,20 @@
+[package]
+name = "review-queue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "review-queue"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+review-queue-core = { path = "../review-queue-core" }
+
+[dev-dependencies]
+tempfile.workspace = true
