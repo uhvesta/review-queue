@@ -1247,8 +1247,7 @@ button:disabled {
   border-right: 1px solid var(--color-border);
 }
 .split-diff-cell.split-diff-empty {
-  background: var(--color-bg-tertiary);
-  opacity: 0.5;
+  background: var(--color-diff-neutral-bg);
 }
 .full-file {
   min-width: 0;
