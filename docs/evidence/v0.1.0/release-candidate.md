@@ -31,3 +31,30 @@ ee22a67c1a38b47c6a05d09b7df953021949a52541706ec98119b818ce563525  Review-Queue-0
 
 The signed executable then passed the packaged launch smoke and two-phase
 disposable Keychain restart/account-separation harness.
+
+## Current-head local preflight
+
+Clean commit `06baedd` was independently rebuilt on 2026-07-29 as version
+`0.1.0` with the same locked release script and the authorized
+`localreview-notary` profile. This local preflight was deliberately not
+tagged or published. It contains the exact eight expected asset classes,
+including the checksum manifest.
+
+The universal executable contains `x86_64 arm64`. Strict signature,
+Gatekeeper, DMG, archive, updater-signature, SBOM, checksum, staple, and secret
+verification all passed. Apple accepted both submissions:
+
+- App submission: `ba9044c0-5cb5-454b-907d-8e815ff1812e`
+- DMG submission: `3c8a7da2-fa87-4d77-80f0-d4168bcf9482`
+
+Retained local SHA-256 values:
+
+```text
+bb2516738bcb45bc3e63aeb5217f979242ed4dfdfa33ea430997486adfab5403  Review-Queue-0.1.0-universal-candidate.dmg
+a4812b0724e987c844dc20dc9b62c139bd6eb70ec55fa292250f5ba2fb56ad99  Review-Queue-0.1.0-universal-candidate.app.zip
+4261e5a68ec643c96f034df814c6854e65dac2220ce5139f61f1c8f4abcd5870  Review-Queue-0.1.0-universal-candidate.app.tar.gz
+84ddfb5e5f726c520188091b096c995914964a9361371de550e809dd2c30d828  Review-Queue-0.1.0-universal-candidate.app.tar.gz.sig
+a5a0164f7be71665643352b923ec08cc11888c589ea339e3f8037dc0d55addd0  latest.json
+62b8ee3cbff35d72c8d14b2c91f36cbe184c86f580d40dfad539780b50eb1fbc  Review-Queue-0.1.0.cdx.json
+b0f13574a3e842b8cbd630c284553a5505267eeb1d30db14e371f7a0fa073286  Review-Queue-0.1.0.notarization.json
+```
