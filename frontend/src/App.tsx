@@ -283,6 +283,7 @@ export function App() {
           onBack={() => setSelected(null)}
           onDetails={() => setModal("details")}
           onReproduce={() => setModal("reproduce")}
+          onSettings={() => setModal("settings")}
           onRequestChanges={() => mutate(() => requestChanges(selected.id))}
           onApproveRemote={() => mutate(() => approveRemote(selected.id))}
           onComplete={() => mutate(() => completeRound(selected.id))}
@@ -942,6 +943,7 @@ function Reviewer({
   onBack,
   onDetails,
   onReproduce,
+  onSettings,
   onRequestChanges,
   onApproveRemote,
   onComplete,
@@ -952,6 +954,7 @@ function Reviewer({
   onBack: () => void;
   onDetails: () => void;
   onReproduce: () => void;
+  onSettings: () => void;
   onRequestChanges: () => void;
   onApproveRemote: () => void;
   onComplete: () => void;
@@ -959,6 +962,7 @@ function Reviewer({
   onGithubRoundRefreshed: (round: ReviewRound) => Promise<void>;
 }) {
   const [filter, setFilter] = useState("");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [diff, setDiff] = useState<MaterializedDiff | null>(null);
   const [diffError, setDiffError] = useState<CommandError | null>(null);
   const [selectedKey, setSelectedKey] = useState("");
@@ -1041,12 +1045,12 @@ function Reviewer({
   const selected = files.find(({ file, path }) =>
     fileKey(file.repository_id, path) === selectedKey) ?? files[0];
 
-  const toggleViewed = async () => {
-    if (!selected || readOnly) return;
-    const key = fileKey(selected.file.repository_id, selected.path);
+  const toggleViewedFor = async (repositoryId: string, path: string) => {
+    if (readOnly) return;
+    const key = fileKey(repositoryId, path);
     const next = !viewed.has(key);
     try {
-      await setFileViewed(round.id, selected.file.repository_id, selected.path, next);
+      await setFileViewed(round.id, repositoryId, path, next);
       setViewed((current) => {
         const updated = new Set(current);
         if (next) updated.add(key); else updated.delete(key);
@@ -1056,6 +1060,23 @@ function Reviewer({
       setDiffError(toCommandError(problem));
     }
   };
+  const toggleViewed = () => selected
+    ? toggleViewedFor(selected.file.repository_id, selected.path)
+    : Promise.resolve();
+
+  const aggregateStats = useMemo(() => {
+    let additions = 0;
+    let deletions = 0;
+    for (const { file } of files) {
+      const counts = diffLineCounts(file);
+      additions += counts.additions;
+      deletions += counts.deletions;
+    }
+    return { additions, deletions };
+  }, [files]);
+  const viewedCount = files.filter(({ file, path }) => viewed.has(fileKey(file.repository_id, path))).length;
+  const totalFiles = files.length;
+  const viewedPercent = totalFiles ? Math.round((viewedCount / totalFiles) * 100) : 0;
 
   return (
     <main className="reviewer">
@@ -1119,36 +1140,108 @@ function Reviewer({
           </details>
         </section>
       )}
-      <div className="workspace snapshot-workspace">
+      <div className="review-toolbar">
+        <div className="toolbar-brand" aria-hidden="true">RQ</div>
+        <button
+          className="icon-button"
+          aria-label={sidebarCollapsed ? "Show file list" : "Hide file list"}
+          aria-pressed={sidebarCollapsed}
+          onClick={() => setSidebarCollapsed((value) => !value)}
+        >
+          {sidebarCollapsed ? "»" : "«"}
+        </button>
+        <button className="icon-button" aria-label="Settings" onClick={onSettings}>⚙</button>
+        <div className="view-modes toolbar-view-modes" role="group" aria-label="Diff view">
+          {(["unified", "split"] as const).map((mode) => (
+            <button
+              className={viewMode === mode ? "selected-mode" : ""}
+              key={mode}
+              onClick={() => setViewMode(mode)}
+            >
+              {mode}
+            </button>
+          ))}
+        </div>
+        <div className="viewed-progress" aria-label={`${viewedCount} of ${totalFiles} files viewed`}>
+          <span>{viewedCount} / {totalFiles} files viewed</span>
+          <div className="progress-track">
+            <div className="progress-fill" style={{ width: `${viewedPercent}%` }} />
+          </div>
+        </div>
+        <span className="revision-pill" title={`Manifest ${round.manifest_hash}`}>{shortSha(round.manifest_hash)}</span>
+      </div>
+      <div className={`workspace snapshot-workspace ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
         <aside className="files">
           <div className="pane-title">Repositories</div>
+          <div className="files-summary">
+            <span>{totalFiles} file{totalFiles === 1 ? "" : "s"} changed</span>
+            <span className="diff-stat">
+              <span className="added">+{aggregateStats.additions}</span>{" "}
+              <span className="removed">-{aggregateStats.deletions}</span>
+            </span>
+          </div>
           <input aria-label="Filter repositories" placeholder="Filter paths" value={filter} onChange={(event) => setFilter(event.target.value)} />
           {filteredFiles.map(({ repository, file, path }) => {
             const key = fileKey(file.repository_id, path);
+            const counts = diffLineCounts(file);
+            const isViewed = viewed.has(key);
             return (
-            <button
+            <div
               className={`file ${selected && fileKey(selected.file.repository_id, selected.path) === key ? "selected-file" : ""}`}
               key={key}
-              onClick={() => setSelectedKey(key)}
             >
-              <span>{repository.root}/{path}</span>
-              <em>{viewed.has(key) ? "✓" : file.status}</em>
-            </button>
+              <button className="file-select" onClick={() => setSelectedKey(key)}>
+                <span className={`file-status status-${file.status}`} aria-hidden="true">{statusGlyph(file.status)}</span>
+                <span className="file-name">{repository.root}/{path}</span>
+              </button>
+              <span className="file-stats">
+                {counts.additions > 0 && <span className="added">+{counts.additions}</span>}
+                {counts.deletions > 0 && <span className="removed">-{counts.deletions}</span>}
+              </span>
+              <button
+                className={`file-viewed-toggle ${isViewed ? "checked" : ""}`}
+                disabled={readOnly}
+                aria-pressed={isViewed}
+                aria-label={isViewed ? `Mark ${path} not viewed` : `Mark ${path} viewed`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void toggleViewedFor(file.repository_id, path);
+                }}
+              >
+                {isViewed ? "✓" : ""}
+              </button>
+            </div>
           )})}
         </aside>
         <section className="diff snapshot-pane" aria-label="Immutable diff">
           <div className="diff-head">
-            <div>
+            <div className="diff-head-title">
               <b>{selected?.path ?? "Immutable review snapshot"}</b>
-              <span>{selected?.file.status ?? round.collection}</span>
-            </div>
-            <div className="view-modes" role="group" aria-label="Diff view">
-              {(["unified", "split", "file"] as const).map((mode) => (
-                <button className={viewMode === mode ? "selected-mode" : ""} key={mode} onClick={() => setViewMode(mode)}>{mode === "file" ? "Full file" : mode}</button>
-              ))}
+              {selected ? (
+                <>
+                  <span className={`status-badge status-${selected.file.status}`}>{selected.file.status}</span>
+                  {(() => {
+                    const counts = diffLineCounts(selected.file);
+                    return (
+                      <span className="diff-stat">
+                        {counts.additions > 0 && <span className="added">+{counts.additions}</span>}
+                        {counts.deletions > 0 && <span className="removed">-{counts.deletions}</span>}
+                      </span>
+                    );
+                  })()}
+                </>
+              ) : (
+                <span>{round.collection}</span>
+              )}
             </div>
             <button
-              className={selected && viewed.has(fileKey(selected.file.repository_id, selected.path)) ? "viewed" : ""}
+              className={viewMode === "file" ? "full-file-toggle selected-mode" : "full-file-toggle"}
+              onClick={() => setViewMode(viewMode === "file" ? "unified" : "file")}
+            >
+              Full file
+            </button>
+            <button
+              className={selected && viewed.has(fileKey(selected.file.repository_id, selected.path)) ? "viewed-toggle viewed" : "viewed-toggle"}
               disabled={!selected || readOnly}
               title={readOnly ? reason : ""}
               onClick={() => void toggleViewed()}
@@ -2951,6 +3044,24 @@ function capabilitySessionOptions(groups: CopilotCapabilityGroup[]): SessionOpti
 
 function fileKey(repositoryId: string, path: string) {
   return `${repositoryId}\u0000${path}`;
+}
+
+function diffLineCounts(file: DiffFile): { additions: number; deletions: number } {
+  let additions = 0;
+  let deletions = 0;
+  for (const hunk of file.hunks) {
+    for (const line of hunk.lines) {
+      if (line.type === "addition") additions += 1;
+      else if (line.type === "deletion") deletions += 1;
+    }
+  }
+  return { additions, deletions };
+}
+
+function statusGlyph(status: DiffFile["status"]) {
+  if (status === "added") return "+";
+  if (status === "deleted") return "\u2212";
+  return "\u25cf";
 }
 
 function toCommandError(problem: unknown): CommandError {
