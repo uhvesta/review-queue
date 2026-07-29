@@ -96,6 +96,14 @@ if [[ "$updater_acceptance_bootstrap" -eq 1 ]]; then
     echo "updater acceptance bootstrap requires --channel stable --release-tag $expected_acceptance_tag" >&2
     exit 64
   fi
+elif [[ "$channel" == "stable" && "$release_tag" != "v$version" ]]; then
+  echo "stable release requires --release-tag v$version" >&2
+  exit 64
+fi
+
+if [[ "$channel" == "stable" && "$allow_dirty" -eq 1 ]]; then
+  echo "stable and updater-acceptance builds require a clean tagged worktree; --allow-dirty is candidate-only" >&2
+  exit 64
 fi
 
 if [[ "$allow_dirty" -eq 0 && -n "$(git -C "$repo_root" status --porcelain)" ]]; then
@@ -104,11 +112,23 @@ if [[ "$allow_dirty" -eq 0 && -n "$(git -C "$repo_root" status --porcelain)" ]];
 fi
 
 if [[ "$channel" == "stable" ]]; then
+  if ! git -C "$repo_root" show-ref --verify --quiet "refs/tags/$release_tag"; then
+    echo "stable release tag does not exist locally: $release_tag" >&2
+    exit 64
+  fi
+  release_commit="$(git -C "$repo_root" rev-parse "$release_tag^{commit}")"
+  head_commit="$(git -C "$repo_root" rev-parse HEAD)"
+  if [[ "$release_commit" != "$head_commit" ]]; then
+    echo "stable release tag $release_tag does not point to HEAD ($head_commit)" >&2
+    exit 64
+  fi
+
   if [[ "$updater_acceptance_bootstrap" -eq 1 ]]; then
     echo "building disposable updater acceptance feed; every gate except Signed updater / relaunch remains enforced" >&2
     REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP=1 "$script_dir/check-release-readiness.sh"
   else
-    "$script_dir/check-release-readiness.sh"
+    # Never inherit the bootstrap escape hatch into a real stable build.
+    REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP=0 "$script_dir/check-release-readiness.sh"
   fi
 fi
 

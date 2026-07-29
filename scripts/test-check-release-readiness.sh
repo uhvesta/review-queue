@@ -114,4 +114,107 @@ if REVIEW_QUEUE_MATRIX_PATH="$matrix" REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP=
   fail "bootstrap gate bypassed a non-updater failure"
 fi
 
+release_fixture="$fixture_root/release-guard"
+mkdir -p "$release_fixture/scripts" "$release_fixture/bin"
+cp "$script_dir/release-macos.sh" "$release_fixture/scripts/release-macos.sh"
+cat > "$release_fixture/scripts/check-release-readiness.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP:-unset}" != "${EXPECTED_BOOTSTRAP_ENV:?}" ]]; then
+  echo "unexpected bootstrap environment: ${REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP:-unset}" >&2
+  exit 90
+fi
+exit 91
+SH
+chmod +x "$release_fixture/scripts/check-release-readiness.sh"
+cat > "$release_fixture/bin/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"status --porcelain") exit 0 ;;
+  *"show-ref --verify --quiet refs/tags/"*)
+    [[ "${GIT_STUB_MODE:-ok}" != "missing-tag" ]]
+    ;;
+  *"rev-parse "*"^{commit}") printf '%s\n' "acceptance-commit" ;;
+  *"rev-parse HEAD")
+    if [[ "${GIT_STUB_MODE:-ok}" == "mismatched-head" ]]; then
+      printf '%s\n' "different-commit"
+    else
+      printf '%s\n' "acceptance-commit"
+    fi
+    ;;
+  *) echo "unexpected git invocation: $*" >&2; exit 92 ;;
+esac
+SH
+chmod +x "$release_fixture/bin/git"
+
+assert_release_gate_env() {
+  local expected_env="$1"
+  shift
+  local output
+  local status
+  set +e
+  output="$(
+    PATH="$release_fixture/bin:$PATH" \
+      EXPECTED_BOOTSTRAP_ENV="$expected_env" \
+      REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP=1 \
+      "$release_fixture/scripts/release-macos.sh" \
+      --profile unused \
+      --version 0.1.0 \
+      --channel stable \
+      "$@" 2>&1
+  )"
+  status=$?
+  set -e
+  [[ "$status" -eq 91 ]] || {
+    printf '%s\n' "$output" >&2
+    fail "release entrypoint did not reach the gate with bootstrap environment $expected_env"
+  }
+}
+
+assert_release_fails_with() {
+  local expected="$1"
+  shift
+  local output
+  if output="$(
+    PATH="$release_fixture/bin:$PATH" \
+      "$release_fixture/scripts/release-macos.sh" \
+      --profile unused \
+      --version 0.1.0 \
+      --channel stable \
+      "$@" 2>&1
+  )"; then
+    fail "release entrypoint unexpectedly passed: $output"
+  fi
+  [[ "$output" == *"$expected"* ]] || {
+    printf '%s\n' "$output" >&2
+    fail "release failure did not contain: $expected"
+  }
+}
+
+# An inherited variable must not exempt the real stable tag. Only the
+# constrained command-line flag may select the one-row bootstrap gate.
+assert_release_gate_env 0 --release-tag v0.1.0
+assert_release_gate_env 1 \
+  --release-tag updater-acceptance-v0.1.0 \
+  --updater-acceptance-bootstrap
+
+assert_release_fails_with \
+  "requires --channel stable --release-tag updater-acceptance-v0.1.0" \
+  --release-tag v0.1.0 \
+  --updater-acceptance-bootstrap
+assert_release_fails_with \
+  "stable release requires --release-tag v0.1.0" \
+  --release-tag another-tag
+assert_release_fails_with \
+  "require a clean tagged worktree" \
+  --release-tag v0.1.0 \
+  --allow-dirty
+GIT_STUB_MODE=missing-tag assert_release_fails_with \
+  "stable release tag does not exist locally: v0.1.0" \
+  --release-tag v0.1.0
+GIT_STUB_MODE=mismatched-head assert_release_fails_with \
+  "stable release tag v0.1.0 does not point to HEAD" \
+  --release-tag v0.1.0
+
 echo "check-release-readiness fixture tests passed"
