@@ -604,7 +604,7 @@ function AddMachineDialog({
         <header><h2 id="add-machine-title">Add connected machine</h2><button aria-label="Close" onClick={onClose}>×</button></header>
         <form className="form" onSubmit={(event) => void submit(event)}>
           {error && <ErrorPanel error={error} />}
-          <label>Name<input required value={name} onChange={(event) => setName(event.target.value)} placeholder="buildbox" /></label>
+          <label>Name<input required value={name} onChange={(event) => setName(event.target.value)} placeholder="buildbox" autoFocus /></label>
           <label>Connection
             <select value={kind} onChange={(event) => setKind(event.target.value as "ssh" | "loopback")}>
               <option value="ssh">System OpenSSH</option>
@@ -658,7 +658,7 @@ function AddGithubPullRequestDialog({
         <form className="form" onSubmit={(event) => void submit(event)}>
           {error && <ErrorPanel error={error} />}
           <label>GitHub pull request URL
-            <input required type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://github.com/owner/repo/pull/42" />
+            <input required type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://github.com/owner/repo/pull/42" autoFocus />
           </label>
           <p className="notice">Adding resolves metadata and creates a local queue item. Complete file blobs and comments are pulled only when you explicitly open the review.</p>
           <footer><button type="button" onClick={onClose}>Cancel</button><button className="primary" disabled={working}>{working ? "Resolving…" : "Add to GitHub queue"}</button></footer>
@@ -863,6 +863,7 @@ function QueueColumn({
             className={`queue-card ${readOnly ? "old-round" : ""}`}
             key={round.id}
             tabIndex={0}
+            aria-label={readOnly ? round.brief.title : `${round.brief.title}. Press Alt+Arrow Up/Down, Alt+Home, or Alt+End to reorder.`}
             onDragOver={(event) => {
               if (draggedId && !readOnly) event.preventDefault();
             }}
@@ -2518,7 +2519,7 @@ function ReproductionDialog({
       <section {...dialog} className="modal reproduction-dialog" role="dialog" aria-modal="true" aria-labelledby="reproduce-title">
         <header><h2 id="reproduce-title">Reproduce review round</h2><button onClick={onClose} aria-label="Close">×</button></header>
         <div className="detail-grid">
-          <label>Clean destination<input value={destination} onChange={(event) => { setDestination(event.target.value); setPreview(null); setCompleted(false); }} /></label>
+          <label>Clean destination<input value={destination} onChange={(event) => { setDestination(event.target.value); setPreview(null); setCompleted(false); }} autoFocus /></label>
           <p className="safe-copy">Preview creates nothing. Confirmed materialization makes detached clones at the saved commits and never changes the source workspace or sends feedback.</p>
           {!preview && <button onClick={() => void inspect()} disabled={working || !destination}>{working ? "Inspecting…" : "Preview reproduction"}</button>}
           {preview && (
@@ -2836,7 +2837,7 @@ function GithubPublishDialog({
           {attempt.status === "unknown" && <p className="danger-text">The publish outcome is unknown. Inspect the pull request before trying anything else.</p>}
           {error && <ErrorPanel error={error} />}
           <div className="dialog-actions">
-            <button onClick={onClose}>{completed ? "Done" : "Cancel"}</button>
+            <button onClick={onClose} autoFocus>{completed ? "Done" : "Cancel"}</button>
             {!completed && attempt.status === "prepared" && (
               <button className="primary" disabled={working} onClick={() => {
                 setWorking(true);

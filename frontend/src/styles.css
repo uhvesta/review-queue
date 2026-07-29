@@ -253,7 +253,9 @@ button:disabled {
   color: var(--color-warning);
 }
 .status[data-state="completed"] {
-  color: var(--color-text-muted);
+  /* text-muted (#6e7681) on the pill's bg-tertiary background is ~3.3:1, below
+     AA for this 10px text; text-secondary reads ~4.9:1 here. */
+  color: var(--color-text-secondary);
 }
 .status.good {
   color: var(--color-accent);
@@ -1084,6 +1086,18 @@ button:disabled {
 }
 .confirm-dialog {
   width: min(560px, 100%);
+}
+@media (max-width: 1120px) {
+  /* The fixed-width files (235px) + min diff (380px) + chat (300px) columns need
+     ~1095px before they fit without clipping inside .workspace's overflow:hidden
+     box. Drop the chat column early so narrow desktop-window widths (~1000-1100px)
+     reflow instead of clipping the diff/chat panes. */
+  .snapshot-workspace {
+    grid-template-columns: 235px minmax(0, 1fr);
+  }
+  .snapshot-workspace .chat {
+    display: none;
+  }
 }
 @media (max-width: 860px) {
   .snapshot-workspace {
