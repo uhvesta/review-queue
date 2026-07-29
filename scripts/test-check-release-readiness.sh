@@ -94,4 +94,24 @@ sed -i.bak '4s/| passing |/| blocked |/' "$matrix"
 rm "$matrix.bak"
 assert_gate_fails "$matrix" "non-passing flows"
 
+matrix="$(write_valid_fixture updater-bootstrap)"
+updater_line="$(awk -F '|' '$2 ~ /Signed updater/ { print NR }' "$matrix")"
+sed -i.bak "${updater_line}s/| passing |/| blocked |/" "$matrix"
+rm "$matrix.bak"
+assert_gate_fails "$matrix" "non-passing flows"
+bootstrap_output="$(
+  REVIEW_QUEUE_MATRIX_PATH="$matrix" \
+    REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP=1 \
+    "$gate"
+)"
+[[ "$bootstrap_output" == *"updater acceptance bootstrap gate passed"* ]] ||
+  fail "bootstrap pass output was not reported"
+
+matrix="$(write_valid_fixture updater-bootstrap-other-failure)"
+sed -i.bak '4s/| passing |/| blocked |/' "$matrix"
+rm "$matrix.bak"
+if REVIEW_QUEUE_MATRIX_PATH="$matrix" REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP=1 "$gate" >/dev/null 2>&1; then
+  fail "bootstrap gate bypassed a non-updater failure"
+fi
+
 echo "check-release-readiness fixture tests passed"

@@ -4,6 +4,12 @@ set -euo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 matrix_path="${REVIEW_QUEUE_MATRIX_PATH:-$repo_root/docs/test-matrix.md}"
+updater_acceptance_bootstrap="${REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP:-0}"
+
+if [[ "$updater_acceptance_bootstrap" != "0" && "$updater_acceptance_bootstrap" != "1" ]]; then
+  echo "release gate failed: REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP must be 0 or 1" >&2
+  exit 64
+fi
 
 if [[ ! -f "$matrix_path" ]]; then
   echo "release gate failed: docs/test-matrix.md is missing" >&2
@@ -12,13 +18,14 @@ fi
 matrix_dir="$(CDPATH= cd -- "$(dirname -- "$matrix_path")" && pwd)"
 
 failed_rows="$(
-  awk -F '|' '
+  awk -F '|' -v updater_bootstrap="$updater_acceptance_bootstrap" '
     /^\|/ {
       status = $3
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", status)
+      flow = $2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", flow)
+      if (updater_bootstrap == "1" && flow == "Signed updater / relaunch") next
       if (status == "not started" || status == "blocked" || status == "failing") {
-        flow = $2
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", flow)
         print flow " (" status ")"
       }
     }
@@ -54,7 +61,7 @@ if [[ -n "$unknown_statuses" ]]; then
 fi
 
 incomplete_rows="$(
-  awk -F '|' '
+  awk -F '|' -v updater_bootstrap="$updater_acceptance_bootstrap" '
     BEGIN { expected_columns = 11 }
     /^\|/ {
       flow = $2
@@ -62,6 +69,7 @@ incomplete_rows="$(
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", flow)
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", status)
       if (flow == "Flow" || flow ~ /^-+$/) next
+      if (updater_bootstrap == "1" && flow == "Signed updater / relaunch") next
       if (NF != expected_columns) {
         print flow " (expected 9 evidence fields)"
         next
@@ -181,9 +189,16 @@ for required_flow in "${required_flows[@]}"; do
     echo "stable release gate failed: required flow is duplicated: $required_flow" >&2
     exit 1
   fi
+  if [[ "$updater_acceptance_bootstrap" == "1" && "$required_flow" == "Signed updater / relaunch" ]]; then
+    continue
+  fi
   if ! validate_evidence_cell "$required_flow" "$matching_evidence"; then
     exit 1
   fi
 done
 
-echo "stable release gate passed: every required flow has complete passing evidence"
+if [[ "$updater_acceptance_bootstrap" == "1" ]]; then
+  echo "updater acceptance bootstrap gate passed: every required flow except Signed updater / relaunch has complete passing evidence"
+else
+  echo "stable release gate passed: every required flow has complete passing evidence"
+fi

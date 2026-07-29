@@ -11,9 +11,10 @@ release_tag=""
 output_dir="$repo_root/dist"
 identity="${APPLE_SIGNING_IDENTITY:-}"
 allow_dirty=0
+updater_acceptance_bootstrap=0
 
 usage() {
-  echo "usage: $0 --profile <notary-keychain-profile> --version <semver> --channel <nightly|candidate|stable> --release-tag <tag> [--output <dir>] [--identity <Developer ID identity>] [--allow-dirty]" >&2
+  echo "usage: $0 --profile <notary-keychain-profile> --version <semver> --channel <nightly|candidate|stable> --release-tag <tag> [--output <dir>] [--identity <Developer ID identity>] [--allow-dirty] [--updater-acceptance-bootstrap]" >&2
 }
 
 while [[ "$#" -gt 0 ]]; do
@@ -44,6 +45,10 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --allow-dirty)
       allow_dirty=1
+      shift
+      ;;
+    --updater-acceptance-bootstrap)
+      updater_acceptance_bootstrap=1
       shift
       ;;
     *)
@@ -85,13 +90,26 @@ case "$channel" in
     ;;
 esac
 
+if [[ "$updater_acceptance_bootstrap" -eq 1 ]]; then
+  expected_acceptance_tag="updater-acceptance-v$version"
+  if [[ "$channel" != "stable" || "$release_tag" != "$expected_acceptance_tag" ]]; then
+    echo "updater acceptance bootstrap requires --channel stable --release-tag $expected_acceptance_tag" >&2
+    exit 64
+  fi
+fi
+
 if [[ "$allow_dirty" -eq 0 && -n "$(git -C "$repo_root" status --porcelain)" ]]; then
   echo "release build refused: the Git worktree is dirty (use --allow-dirty only for an intentional local candidate)" >&2
   exit 1
 fi
 
 if [[ "$channel" == "stable" ]]; then
-  "$script_dir/check-release-readiness.sh"
+  if [[ "$updater_acceptance_bootstrap" -eq 1 ]]; then
+    echo "building disposable updater acceptance feed; every gate except Signed updater / relaunch remains enforced" >&2
+    REVIEW_QUEUE_UPDATER_ACCEPTANCE_BOOTSTRAP=1 "$script_dir/check-release-readiness.sh"
+  else
+    "$script_dir/check-release-readiness.sh"
+  fi
 fi
 
 if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
