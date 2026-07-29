@@ -76,6 +76,7 @@ import type {
   DeliveryHistoryEntry,
   DiffFile,
   DiffHunk,
+  DiffLine,
   FormalComment,
   LocalSubmissionRequest,
   MaterializedDiff,
@@ -1252,9 +1253,10 @@ function Reviewer({
           </div>
           {diffLoading && <p className="loading-state">Materializing pinned commits…</p>}
           {diffError && <ErrorPanel error={diffError} />}
-          {!diffLoading && !diffError && selected && viewMode === "unified" && (
+          {!diffLoading && !diffError && selected && viewMode !== "file" && (
             <DiffFileView
               file={selected.file}
+              layout={viewMode}
               repositoryRoot={selected.repository.root}
               importedComments={importedComments}
               readOnly={readOnly}
@@ -1265,11 +1267,10 @@ function Reviewer({
               onAsk={setPendingAskAnchor}
             />
           )}
-          {!diffLoading && !diffError && selected && viewMode !== "unified" && (
+          {!diffLoading && !diffError && selected && viewMode === "file" && (
             <PinnedFilePane
               round={round}
               selected={selected}
-              mode={viewMode}
               githubFile={githubFiles.find((file) => file.path === selected.path)}
             />
           )}
@@ -1981,12 +1982,10 @@ function feedbackPromptFromHistory(entry: DeliveryHistoryEntry) {
 function PinnedFilePane({
   round,
   selected,
-  mode,
   githubFile,
 }: {
   round: ReviewRound;
   selected: { repository: RepositoryDiff; file: DiffFile; path: string };
-  mode: "split" | "file";
   githubFile?: GithubMaterializedFile;
 }) {
   const [left, setLeft] = useState<PinnedFileContent | null>(null);
@@ -2034,13 +2033,7 @@ function PinnedFilePane({
 
   if (loading) return <p className="loading-state">Loading complete pinned file…</p>;
   if (error) return <ErrorPanel error={error} />;
-  if (mode === "file") return <FullFileView file={right ?? left} />;
-  return (
-    <div className="split-files">
-      <FullFileView file={left} empty="File is new on the RIGHT side." />
-      <FullFileView file={right} empty="File was deleted from the RIGHT side." />
-    </div>
-  );
+  return <FullFileView file={right ?? left} />;
 }
 
 function FullFileView({
@@ -2064,6 +2057,7 @@ function FullFileView({
 
 function DiffFileView({
   file,
+  layout,
   repositoryRoot,
   importedComments,
   readOnly,
@@ -2071,6 +2065,7 @@ function DiffFileView({
   onAsk,
 }: {
   file: DiffFile;
+  layout: "unified" | "split";
   repositoryRoot: string;
   importedComments: ImportedComment[];
   readOnly: boolean;
@@ -2100,6 +2095,7 @@ function DiffFileView({
           <DiffHunkView
             file={file}
             hunk={hunk}
+            layout={layout}
             repositoryRoot={repositoryRoot}
             importedComments={importedComments}
             readOnly={readOnly}
@@ -2112,9 +2108,45 @@ function DiffFileView({
   );
 }
 
+function pairSplitLines(lines: DiffLine[], oldStart: number, newStart: number) {
+  type Numbered = { line: DiffLine; number: number };
+  const rows: Array<{ left: Numbered | null; right: Numbered | null }> = [];
+  let oldLine = oldStart;
+  let newLine = newStart;
+  let deletions: DiffLine[] = [];
+  let additions: DiffLine[] = [];
+  const flush = () => {
+    const pairCount = Math.max(deletions.length, additions.length);
+    for (let i = 0; i < pairCount; i++) {
+      const del = deletions[i];
+      const add = additions[i];
+      rows.push({
+        left: del ? { line: del, number: oldLine++ } : null,
+        right: add ? { line: add, number: newLine++ } : null,
+      });
+    }
+    deletions = [];
+    additions = [];
+  };
+  for (const line of lines) {
+    if (line.type === "deletion") deletions.push(line);
+    else if (line.type === "addition") additions.push(line);
+    else {
+      flush();
+      rows.push({
+        left: { line, number: oldLine++ },
+        right: { line, number: newLine++ },
+      });
+    }
+  }
+  flush();
+  return rows;
+}
+
 function DiffHunkView({
   file,
   hunk,
+  layout,
   repositoryRoot,
   importedComments,
   readOnly,
@@ -2123,6 +2155,7 @@ function DiffHunkView({
 }: {
   file: DiffFile;
   hunk: DiffHunk;
+  layout: "unified" | "split";
   repositoryRoot: string;
   importedComments: ImportedComment[];
   readOnly: boolean;
@@ -2179,32 +2212,45 @@ function DiffHunkView({
           <button disabled={readOnly || !anchor} title={!anchor ? "The pinned blob is unavailable" : "Add a formal comment anchored to this hunk"} onClick={() => anchor && onComment(anchor)}>＋ Comment</button>
         </span>
       </div>
-      {numberedLines.map(({ line, index, oldNumber, newNumber }) => {
-        const selected = selection && index >= selection.start && index <= selection.end;
-        return (
-          <div
-            className={`code-line ${line.type} ${selected ? "selected-code-line" : ""}`}
-            key={index}
-            role="button"
-            tabIndex={0}
-            aria-label={`Select ${path} line ${right ? newNumber ?? oldNumber : oldNumber ?? newNumber}`}
-            onClick={(event) => {
-              setSelection((current) => event.shiftKey && current
-                ? { start: Math.min(current.start, index), end: Math.max(current.end, index) }
-                : { start: index, end: index });
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" || event.key === " ") {
-                event.preventDefault();
-                setSelection({ start: index, end: index });
-              }
-            }}
-          >
-            <span>{oldNumber ?? ""}</span><span>{newNumber ?? ""}</span>
-            <code>{line.type === "addition" ? "+" : line.type === "deletion" ? "-" : " "}{line.content}</code>
-          </div>
-        );
-      })}
+      {layout === "unified"
+        ? numberedLines.map(({ line, index, oldNumber, newNumber }) => {
+            const selected = selection && index >= selection.start && index <= selection.end;
+            return (
+              <div
+                className={`code-line ${line.type} ${selected ? "selected-code-line" : ""}`}
+                key={index}
+                role="button"
+                tabIndex={0}
+                aria-label={`Select ${path} line ${right ? newNumber ?? oldNumber : oldNumber ?? newNumber}`}
+                onClick={(event) => {
+                  setSelection((current) => event.shiftKey && current
+                    ? { start: Math.min(current.start, index), end: Math.max(current.end, index) }
+                    : { start: index, end: index });
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setSelection({ start: index, end: index });
+                  }
+                }}
+              >
+                <span>{oldNumber ?? ""}</span><span>{newNumber ?? ""}</span>
+                <code>{line.type === "addition" ? "+" : line.type === "deletion" ? "-" : " "}{line.content}</code>
+              </div>
+            );
+          })
+        : pairSplitLines(hunk.lines, hunk.old_start, hunk.new_start).map((row, index) => (
+            <div className="split-diff-row" key={index}>
+              <div className={`code-line split-diff-cell ${row.left ? row.left.line.type : "split-diff-empty"}`}>
+                <span>{row.left?.number ?? ""}</span>
+                <code>{row.left ? (row.left.line.type === "deletion" ? "-" : " ") + row.left.line.content : ""}</code>
+              </div>
+              <div className={`code-line split-diff-cell ${row.right ? row.right.line.type : "split-diff-empty"}`}>
+                <span>{row.right?.number ?? ""}</span>
+                <code>{row.right ? (row.right.line.type === "addition" ? "+" : " ") + row.right.line.content : ""}</code>
+              </div>
+            </div>
+          ))}
       {anchoredDiscussion.map((comment) => (
         <details
           className={`imported-thread-inline ${comment.upstream_resolved ? "resolved-upstream" : ""}`}

@@ -1235,15 +1235,20 @@ button:disabled {
   background: #315f8d;
   color: #fff;
 }
-.split-files {
+.split-diff-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
 }
-.split-files > .full-file:first-child {
+.split-diff-cell {
+  min-width: 0;
+  overflow: hidden;
+}
+.split-diff-row > .split-diff-cell:first-child {
   border-right: 1px solid var(--color-border);
+}
+.split-diff-cell.split-diff-empty {
+  background: var(--color-bg-tertiary);
+  opacity: 0.5;
 }
 .full-file {
   min-width: 0;
