@@ -305,14 +305,28 @@ describe("fixture-backed reviewer recovery", () => {
     expect(alert).toHaveTextContent("Reconnect the fixture machine and retry.");
   });
 
-  it("keeps a cached machine round visible and openable from its machine queue", async () => {
+  it("gives a cached machine round the same queue actions and opens its immutable review", async () => {
     await renderFixtureApp();
 
     expect(screen.getByRole("option", { name: "Fixture Build Machine" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /fixture build machine/i }));
     await screen.findByRole("heading", { name: "Fixture Build Machine" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Open cached review" }));
+    const card = screen.getByText("Refactor session cache eviction").closest("article");
+    if (!card) throw new Error("The cached machine round card was not rendered.");
+    expect(within(card).getByRole("button", { name: "Open review" })).toBeVisible();
+    expect(within(card).getByRole("button", { name: /Move Refactor session cache eviction up/i })).toBeVisible();
+    expect(within(card).getByRole("button", { name: /Move Refactor session cache eviction down/i })).toBeVisible();
+    const moreActions = card.querySelector("summary[aria-label^='More actions']");
+    if (!moreActions) throw new Error("The cached machine round did not expose its overflow actions.");
+    fireEvent.click(moreActions);
+    expect(within(card).getByRole("button", { name: "Edit brief / details" })).toBeVisible();
+    expect(within(card).getByRole("button", { name: "Reproduce…" })).toBeVisible();
+    expect(within(card).getByRole("button", { name: "Copy feedback prompt" })).toBeVisible();
+    expect(within(card).getByRole("button", { name: "Complete" })).toBeVisible();
+    expect(within(card).getByRole("button", { name: "Delete" })).toBeVisible();
+
+    fireEvent.click(within(card).getByRole("button", { name: "Open review" }));
     expect((await screen.findAllByRole("region", { name: "Code diff" })).length).toBeGreaterThan(0);
   });
 });

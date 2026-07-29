@@ -329,6 +329,14 @@ export function App() {
             await refresh();
             await openRound(round);
           }}
+          onComplete={(round) => mutate(() => completeRound(round.id))}
+          onRequeue={(round) => mutate(() => requeueRound(round.id))}
+          onMove={(round, rank) => mutate(() => moveRound(round.id, rank))}
+          onDelete={(round) => setPurgeIntent({ round, kind: "delete" })}
+          onDetails={(round) => void openRoundModal(round, "details")}
+          onReproduce={(round) => void openRoundModal(round, "reproduce")}
+          onCopyFeedback={(round) => void copyRoundFeedback(round)}
+          onShowOld={() => setShowOld(true)}
           onError={setError}
         />
       ) : (
@@ -494,13 +502,22 @@ function MachineQueue({
   onBack,
   onChanged,
   onOpen,
+  onComplete,
+  onRequeue,
+  onMove,
+  onDelete,
+  onDetails,
+  onReproduce,
+  onCopyFeedback,
+  onShowOld,
   onError,
-}: {
+}: Pick<QueueHomeProps, "onComplete" | "onRequeue" | "onMove" | "onDelete" | "onDetails" | "onReproduce" | "onCopyFeedback"> & {
   status: MachineStatus | null;
   cachedRounds: ReviewRound[];
   onBack: () => void;
   onChanged: () => Promise<MachineStatus[]>;
   onOpen: (round: ReviewRound) => Promise<void>;
+  onShowOld: () => void;
   onError: (error: CommandError | null) => void;
 }) {
   const [index, setIndex] = useState<MachineIndexResult | null>(null);
@@ -535,6 +552,10 @@ function MachineQueue({
     const statuses = await onChanged();
     setLocalStatus(statuses.find((item) => item.machine.id === localStatus.machine.id) ?? localStatus);
   });
+  const uncachedItems = index?.index.items.filter((item) => !cachedRounds.some((round) =>
+    round.source_metadata?.kind === "machine"
+    && round.source_metadata.source_item_id === item.source_item_id
+  )) ?? [];
 
   return (
     <main className="main">
@@ -571,8 +592,23 @@ function MachineQueue({
         <p className="muted">Remote reads happen only when you choose Connect, Refresh, or Open review. Review Queue stores no SSH credentials.</p>
       </section>
       <section className="queue-grid machine-grid">
+        <QueueColumn
+          title={`${localStatus.machine.config.name.toUpperCase()} CACHED (${cachedRounds.filter(isActive).length})`}
+          rounds={cachedRounds}
+          empty={`No cached rounds on ${localStatus.machine.config.name}.`}
+          onOpen={(round) => void onOpen(round)}
+          onComplete={onComplete}
+          onRequeue={onRequeue}
+          onMove={onMove}
+          onDelete={onDelete}
+          onDetails={onDetails}
+          onReproduce={onReproduce}
+          onCopyFeedback={onCopyFeedback}
+          onShowOld={onShowOld}
+          onRefreshGithub={() => {}}
+        />
         <section className="queue-column machine-items">
-          <h2>{localStatus.machine.config.name.toUpperCase()} ({index?.index.items.length ?? localStatus.cachedItemCount})</h2>
+          <h2>REMOTE INDEX ({uncachedItems.length})</h2>
           {!index && (
             <p className="empty-state">
               {localStatus.connection === "connected"
@@ -580,31 +616,10 @@ function MachineQueue({
                 : `Connect ${localStatus.machine.config.name} to refresh its queue.`}
             </p>
           )}
-          {index?.index.items.length === 0 && <p className="empty-state">No rounds on {localStatus.machine.config.name}.</p>}
-          {cachedRounds.map((round) => (
-            <article className="queue-card" key={round.id}>
-              <div className="card-title">
-                <span className="state-dot" data-state={displayLifecycle(round.lifecycle)} />
-                <strong>{round.brief.title}</strong>
-              </div>
-              <p>{round.source_metadata?.kind === "machine" ? round.source_metadata.remote_workspace_path : round.manifest.workspace_root}</p>
-              <p>{round.manifest.topic} · snapshot {shortSha(round.manifest_hash)}</p>
-              <footer>
-                <span className="status good">cached locally</span>
-                <button className="open" disabled={working} onClick={() => void onOpen(round)}>
-                  Open cached review
-                </button>
-              </footer>
-            </article>
-          ))}
-          {index && index.index.items.length > 0 && (
+          {index && uncachedItems.length === 0 && <p className="empty-state">No uncached rounds on {localStatus.machine.config.name}.</p>}
+          {uncachedItems.length > 0 && (
             <>
-            {index.index.items
-              .filter((item) => !cachedRounds.some((round) =>
-                round.source_metadata?.kind === "machine"
-                && round.source_metadata.source_item_id === item.source_item_id
-              ))
-              .map((item) => (
+            {uncachedItems.map((item) => (
               <article className="queue-card" key={item.source_item_id}>
                 <div className="card-title"><span className="state-dot" /><strong>{item.title}</strong></div>
                 <p>{item.remote_workspace_path}</p>
