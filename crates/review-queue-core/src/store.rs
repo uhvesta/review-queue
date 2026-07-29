@@ -1361,6 +1361,25 @@ impl Store {
         let round = self.round(id)?;
         ensure_mutable(&round)?;
         let tx = self.conn.unchecked_transaction().map_err(db_error)?;
+        let unsettled_copilot_turns: i64 = tx
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM ask_turns
+                 JOIN conversations ON conversations.id = ask_turns.conversation_id
+                 WHERE conversations.round_id = ?1
+                   AND ask_turns.state IN ('queued', 'streaming')",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if unsettled_copilot_turns > 0 {
+            return Err(DomainError::actionable(
+                "This review cannot be completed while a Copilot response is queued or streaming.",
+                "The review and its saved Copilot transcript are unchanged.",
+                "Wait for the response to finish, or cancel it, then retry Complete.",
+                "copilot_turn_unsettled",
+            ));
+        }
         tx.execute(
             "UPDATE rounds SET lifecycle = 'completed' WHERE id = ?1",
             params![id],
@@ -3925,6 +3944,59 @@ mod tests {
                 .error
                 .code,
             "round_read_only"
+        );
+    }
+
+    #[test]
+    fn complete_rejects_unsettled_copilot_turn_and_freezes_settled_transcript() {
+        let mut store = Store::in_memory().unwrap();
+        let round = match store
+            .submit(submission("streaming-completion", "a"))
+            .unwrap()
+        {
+            SubmissionResult::Created(round) => round,
+            _ => unreachable!(),
+        };
+        let chat = store.active_conversation(&round.id, vec![]).unwrap();
+        let turn = store
+            .queue_ask_turn(queued_turn(&chat, "streaming-completion-turn"))
+            .unwrap();
+        store.begin_ask_turn(&turn.id).unwrap();
+        store
+            .append_ask_chunk(&turn.id, "Saved partial answer")
+            .unwrap();
+
+        let error = store.complete(&round.id).unwrap_err();
+        assert_eq!(error.error.code, "copilot_turn_unsettled");
+        assert!(error.error.next_step.contains("cancel"));
+        assert_eq!(store.round(&round.id).unwrap().lifecycle, Lifecycle::Queued);
+        assert!(
+            store.lifecycle_events(&round.id).unwrap().is_empty(),
+            "rejected completion must not append a lifecycle event"
+        );
+        let streaming = store.ask_turns(&chat.id).unwrap().pop().unwrap();
+        assert_eq!(streaming.state, AskTurnState::Streaming);
+        assert_eq!(streaming.response_text, "Saved partial answer");
+        assert_eq!(streaming.completed_at, None);
+
+        store.complete_ask_turn(&turn.id).unwrap();
+        store.complete(&round.id).unwrap();
+        let frozen = store.ask_turns(&chat.id).unwrap().pop().unwrap();
+        assert_eq!(frozen.state, AskTurnState::Completed);
+        assert_eq!(frozen.response_text, "Saved partial answer");
+        assert!(frozen.completed_at.is_some());
+        assert_eq!(
+            store
+                .append_ask_chunk(&turn.id, " late mutation")
+                .unwrap_err()
+                .error
+                .code,
+            "ask_turn_not_streaming"
+        );
+        assert_eq!(
+            store.ask_turns(&chat.id).unwrap().pop().unwrap(),
+            frozen,
+            "a completed round's settled transcript must remain immutable"
         );
     }
 
