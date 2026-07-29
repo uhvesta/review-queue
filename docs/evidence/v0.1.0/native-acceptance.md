@@ -168,9 +168,12 @@ Retained evidence:
 - `difit-native-reviewer-560.png`
 
 That retained packaged-app run used the then-current 9/9 fixture suite. The
-current suite is 28/28 and additionally covers refreshed-round state
+current suite is 33/33 and additionally covers refreshed-round state
 isolation, cached-machine rematerialization, PR-intake confirmation, global
-hunk navigation, inline conversations, and keyboard diff navigation.
+hunk navigation, inline conversations, keyboard diff navigation, cached
+GitHub discussion without implicit network access, viewport-safe dialogs,
+collapsed-pane accessibility, scoped queue shortcuts, and explicit Copilot
+authentication-source switching.
 Browser-fixture screenshots at 1280px, 1024px, and 560px are retained
 alongside the native images.
 
