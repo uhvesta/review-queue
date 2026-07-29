@@ -2931,6 +2931,7 @@ mod tests {
                 head_content_base64: Some("bmV3".into()),
                 materialized: None,
             }],
+            repository_packs: vec![],
         };
         store.save_machine_snapshot(&round.id, &snapshot).unwrap();
         assert_eq!(store.machine_snapshot(&round.id).unwrap(), snapshot);

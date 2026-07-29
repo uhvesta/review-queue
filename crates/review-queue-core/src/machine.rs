@@ -990,7 +990,11 @@ fn repository_pack(
     };
     let resolved_head = git_small_output(
         &root,
-        &["rev-parse", "--verify", &format!("{}^{{commit}}", repository.head_sha)],
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", repository.head_sha),
+        ],
         &repository.repository_id,
     )?;
     if resolved_head != repository.head_sha {
@@ -1006,7 +1010,11 @@ fn repository_pack(
     }
     let root_tree = git_small_output(
         &root,
-        &["rev-parse", "--verify", &format!("{}^{{tree}}", repository.head_sha)],
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{tree}}", repository.head_sha),
+        ],
         &repository.repository_id,
     )?;
     let listed = bounded_git_output(
@@ -1034,7 +1042,10 @@ fn repository_pack(
                 "machine_snapshot_git_objects_invalid",
             )
         })?;
-        if object.chars().any(|character| !character.is_ascii_hexdigit()) {
+        if object
+            .chars()
+            .any(|character| !character.is_ascii_hexdigit())
+        {
             return Err(protocol_error(
                 "Git returned an invalid object identity while building a machine snapshot.",
                 "Repair the originating repository, then retry.",
@@ -1290,6 +1301,346 @@ pub fn materialize_snapshot_file(
         content,
         content_base64: encoded.into(),
     })
+}
+
+/// Builds a remote-path-independent reconstruction plan from the immutable
+/// Git packs retained with a connected-machine snapshot.
+pub fn preview_cached_git_reproduction(
+    snapshot: &MachineSnapshot,
+    destination: impl AsRef<Path>,
+) -> Result<ReproductionPreview, DomainError> {
+    validate_repository_packs(snapshot)?;
+    let destination = destination.as_ref();
+    if !destination.is_absolute() || destination.exists() {
+        return Err(error(
+            "Machine reproduction needs a new absolute destination.",
+            "No directory or source file was created.",
+            "Choose a new absolute path that does not already exist.",
+            "machine_reproduction_destination_not_clean",
+        ));
+    }
+    let mut destinations = BTreeSet::new();
+    let mut repositories = Vec::with_capacity(snapshot.manifest.repositories.len());
+    for repository in &snapshot.manifest.repositories {
+        let relative = safe_reproduction_root(repository);
+        let target = destination.join(relative);
+        if !destinations.insert(target.clone()) {
+            return Err(protocol_error(
+                "The cached machine manifest maps multiple repositories to one destination.",
+                "Reconnect and materialize the machine round again.",
+                "machine_reproduction_destination_collision",
+            ));
+        }
+        repositories.push(ReproductionRepository {
+            repository_id: repository.repository_id.clone(),
+            source: format!("cached-machine-git-pack:{}", repository.repository_id),
+            destination: target.to_string_lossy().into_owned(),
+            head_sha: repository.head_sha.clone(),
+        });
+    }
+    repositories.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    Ok(ReproductionPreview {
+        destination: destination.to_string_lossy().into_owned(),
+        command_bundle: cached_git_command_bundle(snapshot, destination, &repositories)?,
+        agent_working_directory: destination.to_string_lossy().into_owned(),
+        launch_guidance: "After the cached Git packs are restored, start a fresh agent session in this working directory, then submit the prepared feedback prompt manually.".into(),
+        repositories,
+    })
+}
+
+/// Recreates complete shallow Git repositories from app-cached object packs.
+/// The advertised remote workspace path is never read.
+pub fn reproduce_cached_git_snapshot(
+    snapshot: &MachineSnapshot,
+    destination: impl AsRef<Path>,
+) -> Result<ReproductionResult, DomainError> {
+    let preview = preview_cached_git_reproduction(snapshot, destination)?;
+    let destination = Path::new(&preview.destination);
+    let parent = destination.parent().ok_or_else(|| {
+        error(
+            "The reproduction destination has no parent directory.",
+            "No directory or source file was created.",
+            "Choose a new absolute destination under an existing directory.",
+            "machine_reproduction_parent_required",
+        )
+    })?;
+    let staging = tempfile::Builder::new()
+        .prefix(".review-queue-machine-git-")
+        .tempdir_in(parent)
+        .map_err(|_| {
+            error(
+                "Review Queue could not create a staging directory for Git reproduction.",
+                "The original workspace and cached snapshot are unchanged.",
+                "Check destination permissions and retry.",
+                "machine_reproduction_staging_failed",
+            )
+        })?;
+    for repository in &preview.repositories {
+        let pack = snapshot
+            .repository_packs
+            .iter()
+            .find(|pack| pack.repository_id == repository.repository_id)
+            .expect("validated pack exists");
+        let relative = Path::new(&repository.destination)
+            .strip_prefix(destination)
+            .expect("planned destination is below reproduction root");
+        let target = staging.path().join(relative);
+        fs::create_dir_all(&target).map_err(|_| {
+            machine_reproduction_error(
+                &repository.repository_id,
+                "create the repository destination",
+            )
+        })?;
+        run_reproduction_git(
+            None,
+            &["init", "-q", "--", target.to_string_lossy().as_ref()],
+            &repository.repository_id,
+        )?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&pack.pack_base64)
+            .map_err(|_| {
+                protocol_error(
+                    "The cached machine Git pack is invalid.",
+                    "Reconnect and materialize the machine round again.",
+                    "machine_snapshot_pack_invalid",
+                )
+            })?;
+        unpack_git_objects(&target, &bytes, &repository.repository_id)?;
+        if pack.shallow_boundary {
+            fs::write(target.join(".git/shallow"), format!("{}\n", pack.head_sha)).map_err(
+                |_| {
+                    machine_reproduction_error(
+                        &repository.repository_id,
+                        "record the shallow commit boundary",
+                    )
+                },
+            )?;
+        }
+        run_reproduction_git(
+            Some(&target),
+            &["checkout", "--detach", "--force", &pack.head_sha],
+            &repository.repository_id,
+        )?;
+        run_reproduction_git(
+            Some(&target),
+            &["fsck", "--no-dangling"],
+            &repository.repository_id,
+        )?;
+        let head = git_small_output(
+            &target,
+            &["rev-parse", "--verify", "HEAD"],
+            &repository.repository_id,
+        )?;
+        let status = git_small_output(
+            &target,
+            &["status", "--porcelain", "--untracked-files=all"],
+            &repository.repository_id,
+        )?;
+        if head != pack.head_sha || !status.is_empty() {
+            return Err(machine_reproduction_error(
+                &repository.repository_id,
+                "verify the exact clean detached checkout",
+            ));
+        }
+    }
+    let staging_path = staging.keep();
+    fs::rename(&staging_path, destination).map_err(|_| {
+        let _ = fs::remove_dir_all(&staging_path);
+        error(
+            "Review Queue could not finalize the reproduced Git workspace.",
+            "The original workspace and cached snapshot are unchanged.",
+            "Choose another new absolute destination and retry.",
+            "machine_reproduction_finalize_failed",
+        )
+    })?;
+    Ok(ReproductionResult {
+        destination: preview.destination,
+        repositories: preview.repositories,
+        command_bundle: preview.command_bundle,
+        agent_working_directory: preview.agent_working_directory,
+        launch_guidance: preview.launch_guidance,
+    })
+}
+
+fn validate_repository_packs(snapshot: &MachineSnapshot) -> Result<(), DomainError> {
+    if snapshot.repository_packs.len() != snapshot.manifest.repositories.len() {
+        return Err(protocol_error(
+            "The cached machine snapshot is missing immutable Git repository data.",
+            "Reconnect and materialize the machine round again.",
+            "machine_snapshot_pack_missing",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for pack in &snapshot.repository_packs {
+        if !ids.insert(pack.repository_id.as_str()) {
+            return Err(protocol_error(
+                "The cached machine snapshot contains duplicate Git repository data.",
+                "Reconnect and materialize the machine round again.",
+                "machine_snapshot_pack_duplicate",
+            ));
+        }
+        let Some(repository) = snapshot
+            .manifest
+            .repositories
+            .iter()
+            .find(|repository| repository.repository_id == pack.repository_id)
+        else {
+            return Err(protocol_error(
+                "The cached machine Git pack references an unknown repository.",
+                "Reconnect and materialize the machine round again.",
+                "machine_snapshot_pack_repository_mismatch",
+            ));
+        };
+        if pack.head_sha != repository.head_sha {
+            return Err(protocol_error(
+                "The cached machine Git pack does not match the saved repository HEAD.",
+                "Reconnect and materialize the machine round again.",
+                "machine_snapshot_pack_head_mismatch",
+            ));
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&pack.pack_base64)
+            .map_err(|_| {
+                protocol_error(
+                    "The cached machine Git pack is invalid.",
+                    "Reconnect and materialize the machine round again.",
+                    "machine_snapshot_pack_invalid",
+                )
+            })?;
+        if decoded.len() > MAX_MACHINE_FRAME_BYTES || !decoded.starts_with(b"PACK") {
+            return Err(protocol_error(
+                "The cached machine Git pack is invalid or exceeds the safe frame limit.",
+                "Reconnect and materialize a smaller machine round.",
+                "machine_snapshot_pack_invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unpack_git_objects(root: &Path, bytes: &[u8], repository_id: &str) -> Result<(), DomainError> {
+    let mut child = Command::new("git")
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["unpack-objects", "-r"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| machine_reproduction_error(repository_id, "start Git object restoration"))?;
+    child
+        .stdin
+        .take()
+        .expect("piped Git input")
+        .write_all(bytes)
+        .map_err(|_| machine_reproduction_error(repository_id, "restore Git objects"))?;
+    let status = child
+        .wait()
+        .map_err(|_| machine_reproduction_error(repository_id, "finish Git object restoration"))?;
+    if !status.success() {
+        return Err(machine_reproduction_error(
+            repository_id,
+            "restore the cached Git objects",
+        ));
+    }
+    Ok(())
+}
+
+fn run_reproduction_git(
+    cwd: Option<&Path>,
+    args: &[&str],
+    repository_id: &str,
+) -> Result<(), DomainError> {
+    let mut command = Command::new("git");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let status = command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| machine_reproduction_error(repository_id, "run Git"))?;
+    if !status.success() {
+        return Err(machine_reproduction_error(
+            repository_id,
+            "restore the exact saved Git checkout",
+        ));
+    }
+    Ok(())
+}
+
+fn machine_reproduction_error(repository_id: &str, action: &str) -> DomainError {
+    error(
+        format!("Review Queue could not {action} for cached repository '{repository_id}'."),
+        "The original workspace and cached snapshot are unchanged; the temporary reproduction was discarded.",
+        "Choose another new absolute destination and retry. If it persists, reconnect and cache the machine round again.",
+        "machine_reproduction_git_failed",
+    )
+}
+
+fn cached_git_command_bundle(
+    snapshot: &MachineSnapshot,
+    destination: &Path,
+    repositories: &[ReproductionRepository],
+) -> Result<String, DomainError> {
+    let mut lines = vec![format!(
+        "mkdir -p {}",
+        shell_quote(&destination.to_string_lossy())
+    )];
+    for repository in repositories {
+        let pack = snapshot
+            .repository_packs
+            .iter()
+            .find(|pack| pack.repository_id == repository.repository_id)
+            .ok_or_else(|| {
+                protocol_error(
+                    "The cached machine snapshot is missing immutable Git repository data.",
+                    "Reconnect and materialize the machine round again.",
+                    "machine_snapshot_pack_missing",
+                )
+            })?;
+        lines.push(format!(
+            "git init -q -- {}",
+            shell_quote(&repository.destination)
+        ));
+        lines.push(format!(
+            "printf %s {} | /usr/bin/base64 -D | git -C {} unpack-objects -r",
+            shell_quote(&pack.pack_base64),
+            shell_quote(&repository.destination)
+        ));
+        if pack.shallow_boundary {
+            lines.push(format!(
+                "printf '%s\\n' {} > {}/.git/shallow",
+                shell_quote(&pack.head_sha),
+                shell_quote(&repository.destination)
+            ));
+        }
+        lines.push(format!(
+            "git -C {} checkout --detach --force {}",
+            shell_quote(&repository.destination),
+            shell_quote(&pack.head_sha)
+        ));
+        lines.push(format!(
+            "git -C {} fsck --no-dangling",
+            shell_quote(&repository.destination)
+        ));
+    }
+    lines.push(format!(
+        "cd {}",
+        shell_quote(&destination.to_string_lossy())
+    ));
+    Ok(lines.join("\n"))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1652,6 +2003,7 @@ fn validate_snapshot(snapshot: &MachineSnapshot) -> Result<(), DomainError> {
             ));
         }
     }
+    validate_repository_packs(snapshot)?;
     validate_token_free(snapshot)
 }
 
@@ -1763,7 +2115,13 @@ mod tests {
             },
             vec![MachineItemDetail {
                 summary: item,
-                description: "A remote review".into(),
+                brief: ReviewBrief {
+                    title: "Remote review".into(),
+                    what: "A remote review".into(),
+                    why: "It needs review.".into(),
+                    approach_alternatives: "Use the cached immutable source.".into(),
+                    testing: "Run the fixture tests.".into(),
+                },
                 repository_count: 1,
                 updated_at: Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
                 origin_route: None,
@@ -1783,6 +2141,12 @@ mod tests {
                     base_content_base64: None,
                     head_content_base64: None,
                     materialized: None,
+                }],
+                repository_packs: vec![MachineRepositoryPack {
+                    repository_id: "repo".into(),
+                    head_sha: "head".into(),
+                    pack_base64: "UEFDSw==".into(),
+                    shallow_boundary: false,
                 }],
             }],
         )
@@ -1895,6 +2259,7 @@ mod tests {
                 head_content_base64: Some("YWZ0ZXI=".into()),
                 materialized: None,
             }],
+            repository_packs: vec![],
         };
 
         let preview = preview_snapshot_reproduction(&snapshot, &destination).unwrap();

@@ -78,11 +78,8 @@ pub fn preview_round_reproduction(
     request: ReproductionRequest,
     state: State<'_, AppState>,
 ) -> Result<ReproductionPreview, CommandError> {
-    let round = state
-        .0
-        .lock()
-        .map_err(|_| unavailable())?
-        .round(&request.round_id)?;
+    let store = state.0.lock().map_err(|_| unavailable())?;
+    let round = store.round(&request.round_id)?;
     if round.collection == Collection::Github {
         return Err(CommandError {
             code: "github_reproduction_uses_cached_source".into(),
@@ -91,6 +88,16 @@ pub fn preview_round_reproduction(
             next_step: "Use github_preview_reproduction for this round.".into(),
         });
     }
+    if round.collection == Collection::Machine {
+        let snapshot = store.machine_snapshot(&request.round_id)?;
+        drop(store);
+        return review_queue_core::machine::preview_cached_git_reproduction(
+            &snapshot,
+            request.destination,
+        )
+        .map_err(Into::into);
+    }
+    drop(store);
     reproduction::preview(&round.manifest, request.destination).map_err(Into::into)
 }
 
@@ -102,11 +109,8 @@ pub fn materialize_round_reproduction(
     state: State<'_, AppState>,
 ) -> Result<ReproductionResult, CommandError> {
     require_confirmation(&request.round_id, &request.confirmation, "reproduce")?;
-    let round = state
-        .0
-        .lock()
-        .map_err(|_| unavailable())?
-        .round(&request.round_id)?;
+    let store = state.0.lock().map_err(|_| unavailable())?;
+    let round = store.round(&request.round_id)?;
     if round.collection == Collection::Github {
         return Err(CommandError {
             code: "github_reproduction_uses_cached_source".into(),
@@ -115,6 +119,16 @@ pub fn materialize_round_reproduction(
             next_step: "Use github_materialize_reproduction for this round.".into(),
         });
     }
+    if round.collection == Collection::Machine {
+        let snapshot = store.machine_snapshot(&request.round_id)?;
+        drop(store);
+        return review_queue_core::machine::reproduce_cached_git_snapshot(
+            &snapshot,
+            request.destination,
+        )
+        .map_err(Into::into);
+    }
+    drop(store);
     reproduction::materialize(&round.manifest, request.destination, true).map_err(Into::into)
 }
 

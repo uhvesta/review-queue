@@ -641,7 +641,13 @@ fn connected_machine_transport_runs_only_for_named_fetches() {
     };
     let detail = MachineItemDetail {
         summary: summary.clone(),
-        description: "Remote review detail.".into(),
+        brief: ReviewBrief {
+            title: "Parser review".into(),
+            what: "Remote review detail.".into(),
+            why: "The parser must remain compatible.".into(),
+            approach_alternatives: "Keep the existing parser as the fallback.".into(),
+            testing: "Run parser fixtures.".into(),
+        },
         repository_count: 1,
         updated_at: now,
         origin_route: None,
@@ -678,6 +684,12 @@ fn connected_machine_transport_runs_only_for_named_fetches() {
             base_content_base64: None,
             head_content_base64: None,
             materialized: None,
+        }],
+        repository_packs: vec![review_queue_core::machine::MachineRepositoryPack {
+            repository_id: "repo".into(),
+            head_sha: "head-sha".into(),
+            pack_base64: "UEFDSw==".into(),
+            shallow_boundary: false,
         }],
     };
     let transport = LoopbackFakeTransport::new(

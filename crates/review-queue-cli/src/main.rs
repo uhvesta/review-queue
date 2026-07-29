@@ -11,6 +11,9 @@ use review_queue_core::store::Store;
 use review_queue_core::{
     AgentRoute, ReviewBrief, Round,
     capture::{CaptureRequest, Preflight},
+    machine::{
+        DEFAULT_REMOTE_SOCKET, MachineConfig, MachineEndpoint, MachineSourceType, SshAdapter,
+    },
     reproduction,
     socket::{SocketRequest, SocketResponse, request, serve},
 };
@@ -50,16 +53,7 @@ fn main() -> ExitCode {
         Err(error) => {
             if let Some(error) = error.downcast_ref::<CliError>() {
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "status": "error",
-                            "code": error.code,
-                            "what_happened": error.what_happened,
-                            "data_safety": error.data_safety,
-                            "next_step": error.next_step,
-                        })
-                    );
+                    println!("{}", cli_error_json(error));
                 } else {
                     eprintln!("{error}");
                 }
@@ -83,6 +77,16 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn cli_error_json(error: &CliError) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "code": error.code,
+        "what_happened": error.what_happened,
+        "data_safety": error.data_safety,
+        "next_step": error.next_step,
+    })
 }
 
 fn run(args: Vec<String>) -> anyhow::Result<()> {
@@ -129,15 +133,8 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
         }
         "machine" => match args.get(1).map(String::as_str) {
             Some("add") => {
-                let name = required(&args, "--name")?;
-                let endpoint = required(&args, "--endpoint")?;
-                print_response(
-                    call(SocketRequest::AddMachine {
-                        name: name.into(),
-                        endpoint: endpoint.into(),
-                    })?,
-                    json,
-                )
+                let config = machine_config_from_args(&args)?;
+                print_response(call(SocketRequest::AddMachine { config })?, json)
             }
             Some("ls") => print_response(call(SocketRequest::ListMachines)?, json),
             Some("remove") => {
@@ -256,6 +253,42 @@ fn optional(args: &[String], flag: &str) -> String {
 fn optional_nonempty(args: &[String], flag: &str) -> Option<String> {
     let value = optional(args, flag);
     (!value.is_empty()).then_some(value)
+}
+
+/// Parses the same token-free `MachineConfig` accepted by the desktop UI.
+/// Exactly one endpoint form is required, so an invocation cannot silently
+/// turn a local test socket into an SSH connection (or vice versa).
+fn machine_config_from_args(args: &[String]) -> anyhow::Result<MachineConfig> {
+    let name = required(args, "--name")?.to_owned();
+    let ssh = optional_nonempty(args, "--ssh").or_else(|| optional_nonempty(args, "--endpoint"));
+    let loopback = optional_nonempty(args, "--loopback-socket");
+    let endpoint = match (ssh, loopback) {
+        (Some(target), None) => MachineEndpoint::Ssh {
+            target,
+            remote_socket: optional_nonempty(args, "--remote-socket")
+                .unwrap_or_else(|| DEFAULT_REMOTE_SOCKET.to_owned()),
+            adapter: SshAdapter::SystemOpenSsh,
+        },
+        (None, Some(socket_path)) => {
+            if optional_nonempty(args, "--remote-socket").is_some() {
+                anyhow::bail!("--remote-socket is valid only with --ssh")
+            }
+            MachineEndpoint::Loopback { socket_path }
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("machine add accepts exactly one of --ssh or --loopback-socket")
+        }
+        (None, None) => {
+            anyhow::bail!("machine add needs --ssh SSH_TARGET or --loopback-socket PATH")
+        }
+    };
+    let config = MachineConfig {
+        name,
+        endpoint,
+        source_type: MachineSourceType::ReviewQueueDaemon,
+    };
+    config.validate().map_err(anyhow::Error::from)?;
+    Ok(config)
 }
 fn socket_path() -> PathBuf {
     env::var_os("REVIEW_QUEUE_SOCKET")
@@ -486,7 +519,8 @@ fn print_usage() {
   review-queue daemon --db PATH --socket PATH\n\
   review-queue submit WORKSPACE --topic KEY --title TEXT [--brief brief.json] [--json]\n\
   review-queue pr add https://github.com/OWNER/REPO/pull/NUMBER [--json]\n\
-  review-queue machine add --name NAME --endpoint SSH_TARGET [--json]\n\
+  review-queue machine add --name NAME --ssh SSH_TARGET [--remote-socket PATH] [--json]\n\
+  review-queue machine add --name NAME --loopback-socket PATH [--json]\n\
   review-queue machine ls [--json]\n\
   review-queue machine remove ID_OR_NAME [--json]\n\
   review-queue agent register --route ID --adapter KIND --agent ID [--endpoint URL] [--session ID] [--json]\n\
@@ -554,6 +588,112 @@ mod tests {
         assert_eq!(exit_code_for("pr_read_required"), CAPABILITY_REQUIRED);
         assert_eq!(exit_code_for("workspace_changed_during_capture"), CONFLICT);
         assert_eq!(exit_code_for("topic_required"), INVALID_INPUT);
+    }
+
+    #[test]
+    fn machine_add_parses_the_full_ui_machine_config_for_ssh_and_loopback() {
+        let ssh = machine_config_from_args(&vec![
+            "machine".into(),
+            "add".into(),
+            "--name".into(),
+            "buildbox".into(),
+            "--ssh".into(),
+            "review@buildbox".into(),
+            "--remote-socket".into(),
+            "/run/review-queue.sock".into(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(ssh.endpoint, MachineEndpoint::Ssh { ref target, ref remote_socket, adapter: SshAdapter::SystemOpenSsh } if target == "review@buildbox" && remote_socket == "/run/review-queue.sock")
+        );
+        let loopback = machine_config_from_args(&vec![
+            "machine".into(),
+            "add".into(),
+            "--name".into(),
+            "fixture".into(),
+            "--loopback-socket".into(),
+            "/tmp/fixture.sock".into(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(loopback.endpoint, MachineEndpoint::Loopback { ref socket_path } if socket_path == "/tmp/fixture.sock")
+        );
+        assert!(
+            machine_config_from_args(&vec![
+                "machine".into(),
+                "add".into(),
+                "--name".into(),
+                "bad".into(),
+                "--ssh".into(),
+                "host".into(),
+                "--loopback-socket".into(),
+                "/tmp/a.sock".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn representative_cli_failures_have_stable_complete_json_and_distinct_exit_codes() {
+        let cases = [
+            (
+                CliError {
+                    code: "app_unreachable".into(),
+                    what_happened: "App unavailable.".into(),
+                    data_safety: "Nothing changed.".into(),
+                    next_step: "Launch the app.".into(),
+                    exit_code: UNREACHABLE,
+                },
+                UNREACHABLE,
+            ),
+            (
+                CliError {
+                    code: "pr_read_required".into(),
+                    what_happened: "PR read is disconnected.".into(),
+                    data_safety: "No PR was fetched.".into(),
+                    next_step: "Connect PR read.".into(),
+                    exit_code: CAPABILITY_REQUIRED,
+                },
+                CAPABILITY_REQUIRED,
+            ),
+            (
+                CliError {
+                    code: "workspace_changed_during_capture".into(),
+                    what_happened: "Workspace changed.".into(),
+                    data_safety: "No torn round exists.".into(),
+                    next_step: "Retry capture.".into(),
+                    exit_code: CONFLICT,
+                },
+                CONFLICT,
+            ),
+            (
+                CliError {
+                    code: "invalid_machine_config".into(),
+                    what_happened: "Machine endpoint is invalid.".into(),
+                    data_safety: "Nothing was saved.".into(),
+                    next_step: "Correct the endpoint.".into(),
+                    exit_code: INVALID_INPUT,
+                },
+                INVALID_INPUT,
+            ),
+        ];
+        let mut exit_codes = std::collections::BTreeSet::new();
+        for (error, expected_exit) in cases {
+            let json = cli_error_json(&error);
+            for field in ["code", "what_happened", "data_safety", "next_step"] {
+                assert!(
+                    !json[field].as_str().unwrap_or_default().trim().is_empty(),
+                    "{field} must be nonempty"
+                );
+            }
+            assert_eq!(error.exit_code, expected_exit);
+            exit_codes.insert(error.exit_code);
+        }
+        assert_eq!(
+            exit_codes.len(),
+            4,
+            "representative recovery categories use distinct exit codes"
+        );
     }
 
     #[test]

@@ -110,9 +110,13 @@ pub fn dispatch(store: &mut Store, request: SocketRequest) -> SocketResponse {
         SocketRequest::CaptureLocal { request } => store
             .ingest_local_capture(&request)
             .and_then(|result| json(submission_result(result))),
-        SocketRequest::AddMachine { config } => store
-            .add_machine_config(&config)
-            .and_then(|(machine, created)| json(serde_json::json!({"machine": machine, "created": created}))),
+        SocketRequest::AddMachine { config } => {
+            store
+                .add_machine_config(&config)
+                .and_then(|(machine, created)| {
+                    json(serde_json::json!({"machine": machine, "created": created}))
+                })
+        }
         SocketRequest::ListMachines => store.machines().and_then(json),
         SocketRequest::RemoveMachine { id_or_name } => store
             .remove_machine(&id_or_name)
@@ -606,6 +610,42 @@ mod tests {
         );
         assert!(
             matches!(response, SocketResponse::Error { error } if error.code == "socket_operation_forbidden")
+        );
+    }
+
+    #[test]
+    fn machine_add_uses_the_full_config_and_is_idempotent() {
+        let config = MachineConfig {
+            name: "buildbox".into(),
+            endpoint: crate::machine::MachineEndpoint::Ssh {
+                target: "review@buildbox".into(),
+                remote_socket: "/run/review-queue.sock".into(),
+                adapter: crate::machine::SshAdapter::SystemOpenSsh,
+            },
+            source_type: crate::machine::MachineSourceType::ReviewQueueDaemon,
+        };
+        let mut store = Store::in_memory().unwrap();
+        let first = dispatch(
+            &mut store,
+            SocketRequest::AddMachine {
+                config: config.clone(),
+            },
+        );
+        let second = dispatch(&mut store, SocketRequest::AddMachine { config });
+        let data = |response: SocketResponse| match response {
+            SocketResponse::Ok { data } => data,
+            SocketResponse::Error { error } => panic!("machine add failed: {error}"),
+            SocketResponse::CapturePrepared { .. } => panic!("unexpected capture frame"),
+        };
+        let first = data(first);
+        let second = data(second);
+        assert_eq!(first["created"], true);
+        assert_eq!(second["created"], false);
+        assert_eq!(first["machine"]["id"], second["machine"]["id"]);
+        assert_eq!(first["machine"]["config"]["endpoint"]["kind"], "ssh");
+        assert_eq!(
+            first["machine"]["config"]["endpoint"]["remote_socket"],
+            "/run/review-queue.sock"
         );
     }
 

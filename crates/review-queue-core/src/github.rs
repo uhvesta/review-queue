@@ -241,6 +241,10 @@ fn reproduction_snapshot(
                 materialized: None,
             })
             .collect(),
+        // GitHub reproduction retains its existing cached full-file path.
+        // Connected-machine protocol snapshots additionally carry exact Git
+        // packs because their advertised source path is not locally usable.
+        repository_packs: Vec::new(),
     })
 }
 

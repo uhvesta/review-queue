@@ -17,7 +17,7 @@ use std::{
 
 use chrono::Utc;
 use review_queue_core::{
-    Collection, ReviewBrief, Round, SourceMetadata, Submission,
+    Collection, Round, SourceMetadata, Submission,
     machine::{
         CacheFreshness, MachineClient, MachineConfig, MachineEndpoint, MachineHealth,
         MachineItemDetail, MachineItemIndex, MachineRecord, MachineSnapshot, UnixSocketTransport,
@@ -345,13 +345,7 @@ pub fn materialize_machine_round(
             "{}:{}:{}",
             record.id, summary.remote_workspace_id, summary.topic_key
         ),
-        brief: ReviewBrief {
-            title: summary.title.clone(),
-            what: detail.description.clone(),
-            why: format!("Submitted from connected machine {}.", record.config.name),
-            approach_alternatives: String::new(),
-            testing: String::new(),
-        },
+        brief: detail.brief.clone(),
         manifest: snapshot.manifest.clone(),
         origin_route: detail.origin_route.clone(),
         source_metadata: Some(SourceMetadata::Machine {
@@ -383,10 +377,10 @@ pub fn materialize_machine_round(
 pub fn preview_machine_reproduction(
     request: MachineReproductionRequest,
     state: State<'_, AppState>,
-) -> Result<review_queue_core::machine::MachineReproductionPreview, CommandError> {
+) -> Result<review_queue_core::reproduction::ReproductionPreview, CommandError> {
     let store = state.0.lock().map_err(|_| state_unavailable())?;
     let snapshot = store.machine_snapshot(&request.round_id)?;
-    review_queue_core::machine::preview_snapshot_reproduction(&snapshot, request.destination)
+    review_queue_core::machine::preview_cached_git_reproduction(&snapshot, request.destination)
         .map_err(Into::into)
 }
 
@@ -394,7 +388,7 @@ pub fn preview_machine_reproduction(
 pub fn materialize_machine_reproduction(
     request: ConfirmMachineReproductionRequest,
     state: State<'_, AppState>,
-) -> Result<review_queue_core::machine::MachineReproductionResult, CommandError> {
+) -> Result<review_queue_core::reproduction::ReproductionResult, CommandError> {
     if !request.confirmation.confirmed
         || request.confirmation.token != format!("reproduce-machine:{}", request.round_id)
     {
@@ -407,7 +401,7 @@ pub fn materialize_machine_reproduction(
     }
     let store = state.0.lock().map_err(|_| state_unavailable())?;
     let snapshot = store.machine_snapshot(&request.round_id)?;
-    review_queue_core::machine::reproduce_snapshot(&snapshot, request.destination)
+    review_queue_core::machine::reproduce_cached_git_snapshot(&snapshot, request.destination)
         .map_err(Into::into)
 }
 
@@ -750,7 +744,13 @@ mod tests {
         };
         let detail = MachineItemDetail {
             summary,
-            description: "Description".into(),
+            brief: review_queue_core::ReviewBrief {
+                title: "Title".into(),
+                what: "Description".into(),
+                why: "Why".into(),
+                approach_alternatives: "Approach".into(),
+                testing: "Testing".into(),
+            },
             repository_count: 1,
             updated_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             origin_route: None,
@@ -776,6 +776,7 @@ mod tests {
                 created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             },
             files: vec![],
+            repository_packs: vec![],
         };
         assert_eq!(
             validate_materialization(&detail, &snapshot)
