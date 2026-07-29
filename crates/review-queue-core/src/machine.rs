@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -18,12 +19,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ActionableError, AgentRoute, Collection, DomainError, WorkspaceManifest,
+    ActionableError, AgentRoute, Collection, DomainError, ReviewBrief, WorkspaceManifest,
     diff::{DiffFile, DiffFileStatus, MaterializedDiff, PinnedFileContent, RepositoryDiff},
+    reproduction::{ReproductionPreview, ReproductionRepository, ReproductionResult},
     store::Store,
 };
 
-pub const MACHINE_PROTOCOL_VERSION: u32 = 1;
+pub const MACHINE_PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_REMOTE_SOCKET: &str = "/tmp/review-queue-daemon.sock";
 pub const MAX_MACHINE_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -233,7 +235,7 @@ pub struct MachineItemIndex {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MachineItemDetail {
     pub summary: MachineItemSummary,
-    pub description: String,
+    pub brief: ReviewBrief,
     pub repository_count: u32,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -264,6 +266,20 @@ pub struct MachineSnapshot {
     pub snapshot_version: String,
     pub manifest: WorkspaceManifest,
     pub files: Vec<MachineSnapshotFile>,
+    /// Self-contained Git object packs for each saved HEAD tree. Each pack
+    /// contains the exact commit plus every tree/blob reachable from that
+    /// commit's root tree. Parent history is represented as a shallow
+    /// boundary when it is not part of the pack.
+    #[serde(default)]
+    pub repository_packs: Vec<MachineRepositoryPack>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MachineRepositoryPack {
+    pub repository_id: String,
+    pub head_sha: String,
+    pub pack_base64: String,
+    pub shallow_boundary: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -795,7 +811,7 @@ fn dispatch_store_result(
                 .transpose()?;
             Ok(MachineResponse::ItemDetail(MachineItemDetail {
                 summary: round_summary(&round),
-                description: round.brief.what.clone(),
+                brief: round.brief.clone(),
                 repository_count: round.manifest.repositories.len() as u32,
                 updated_at: round.created_at,
                 origin_route,
@@ -816,7 +832,29 @@ fn dispatch_store_result(
                     "machine_snapshot_version_not_found",
                 ));
             }
-            Ok(MachineResponse::Snapshot(snapshot_from_round(&round)?))
+            let response = MachineResponse::Snapshot(snapshot_from_round(&round)?);
+            let encoded_len = serde_json::to_vec(&response)
+                .map_err(|_| {
+                    protocol_error(
+                        "The connected-machine snapshot could not be encoded.",
+                        "Upgrade or repair the remote daemon, then retry.",
+                        "machine_snapshot_encode_failed",
+                    )
+                })?
+                .len()
+                + 1;
+            if encoded_len > MAX_MACHINE_FRAME_BYTES {
+                return Err(error(
+                    format!(
+                        "The immutable connected-machine snapshot is larger than the {} MiB single-frame limit.",
+                        MAX_MACHINE_FRAME_BYTES / (1024 * 1024)
+                    ),
+                    "No local cache or remote review data was changed.",
+                    "Split the change into smaller review rounds or review it on the originating machine; chunked machine snapshots are not supported in this release.",
+                    "machine_snapshot_too_large",
+                ));
+            }
+            Ok(response)
         }
     }
 }
@@ -904,12 +942,255 @@ pub fn snapshot_from_round(round: &crate::Round) -> Result<MachineSnapshot, Doma
             });
         }
     }
-    Ok(MachineSnapshot {
+    let mut snapshot = MachineSnapshot {
         source_item_id: round.id.clone(),
         snapshot_version: round.manifest_hash.clone(),
         manifest: round.manifest.clone(),
         files,
+        repository_packs: Vec::new(),
+    };
+    for repository in &round.manifest.repositories {
+        snapshot
+            .repository_packs
+            .push(repository_pack(&round.manifest, repository)?);
+        let response_len = serde_json::to_vec(&MachineResponse::Snapshot(snapshot.clone()))
+            .map_err(|_| {
+                protocol_error(
+                    "The connected-machine snapshot could not be encoded.",
+                    "Upgrade or repair the remote daemon, then retry.",
+                    "machine_snapshot_encode_failed",
+                )
+            })?
+            .len()
+            + 1;
+        if response_len > MAX_MACHINE_FRAME_BYTES {
+            return Err(error(
+                format!(
+                    "The immutable connected-machine snapshot is larger than the {} MiB single-frame limit.",
+                    MAX_MACHINE_FRAME_BYTES / (1024 * 1024)
+                ),
+                "No local cache or remote review data was changed.",
+                "Split the change into smaller review rounds or review it on the originating machine; chunked machine snapshots are not supported in this release.",
+                "machine_snapshot_too_large",
+            ));
+        }
+    }
+    Ok(snapshot)
+}
+
+fn repository_pack(
+    manifest: &WorkspaceManifest,
+    repository: &crate::RepositorySnapshot,
+) -> Result<MachineRepositoryPack, DomainError> {
+    let configured_root = Path::new(&repository.root);
+    let root = if configured_root.is_absolute() {
+        configured_root.to_path_buf()
+    } else {
+        Path::new(&manifest.workspace_root).join(configured_root)
+    };
+    let resolved_head = git_small_output(
+        &root,
+        &["rev-parse", "--verify", &format!("{}^{{commit}}", repository.head_sha)],
+        &repository.repository_id,
+    )?;
+    if resolved_head != repository.head_sha {
+        return Err(error(
+            format!(
+                "Repository '{}' no longer resolves the saved connected-machine HEAD.",
+                repository.repository_id
+            ),
+            "No snapshot was served and the repository was not changed.",
+            "Restore the saved Git objects on the originating machine, then retry.",
+            "machine_snapshot_head_unavailable",
+        ));
+    }
+    let root_tree = git_small_output(
+        &root,
+        &["rev-parse", "--verify", &format!("{}^{{tree}}", repository.head_sha)],
+        &repository.repository_id,
+    )?;
+    let listed = bounded_git_output(
+        &root,
+        &[
+            "ls-tree",
+            "-r",
+            "-t",
+            "-z",
+            "--format=%(objectname)",
+            &repository.head_sha,
+        ],
+        MAX_MACHINE_FRAME_BYTES,
+        &repository.repository_id,
+    )?;
+    let mut object_ids = BTreeSet::from([repository.head_sha.clone(), root_tree]);
+    for object in listed.split(|byte| *byte == 0) {
+        if object.is_empty() {
+            continue;
+        }
+        let object = std::str::from_utf8(object).map_err(|_| {
+            protocol_error(
+                "Git returned an invalid object identity while building a machine snapshot.",
+                "Repair the originating repository, then retry.",
+                "machine_snapshot_git_objects_invalid",
+            )
+        })?;
+        if object.chars().any(|character| !character.is_ascii_hexdigit()) {
+            return Err(protocol_error(
+                "Git returned an invalid object identity while building a machine snapshot.",
+                "Repair the originating repository, then retry.",
+                "machine_snapshot_git_objects_invalid",
+            ));
+        }
+        object_ids.insert(object.to_owned());
+    }
+    let mut object_list = tempfile::NamedTempFile::new().map_err(|_| {
+        error(
+            "The daemon could not stage the immutable Git object list.",
+            "No snapshot was served and the originating repository was not changed.",
+            "Check temporary-directory permissions on the originating machine, then retry.",
+            "machine_snapshot_pack_staging_failed",
+        )
+    })?;
+    for object in object_ids {
+        writeln!(object_list, "{object}").map_err(|_| {
+            error(
+                "The daemon could not stage the immutable Git object list.",
+                "No snapshot was served and the originating repository was not changed.",
+                "Check temporary-directory permissions on the originating machine, then retry.",
+                "machine_snapshot_pack_staging_failed",
+            )
+        })?;
+    }
+    object_list.flush().map_err(|_| {
+        error(
+            "The daemon could not finalize the immutable Git object list.",
+            "No snapshot was served and the originating repository was not changed.",
+            "Check temporary-directory permissions on the originating machine, then retry.",
+            "machine_snapshot_pack_staging_failed",
+        )
+    })?;
+    let input = object_list.reopen().map_err(|_| {
+        error(
+            "The daemon could not read the immutable Git object list.",
+            "No snapshot was served and the originating repository was not changed.",
+            "Check temporary-directory permissions on the originating machine, then retry.",
+            "machine_snapshot_pack_staging_failed",
+        )
+    })?;
+    let mut child = Command::new("git")
+        .current_dir(&root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["pack-objects", "--stdout"])
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| machine_pack_error(&repository.repository_id))?;
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("piped Git pack output")
+        .take((MAX_MACHINE_FRAME_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| machine_pack_error(&repository.repository_id))?;
+    if bytes.len() > MAX_MACHINE_FRAME_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(machine_snapshot_oversize());
+    }
+    let status = child
+        .wait()
+        .map_err(|_| machine_pack_error(&repository.repository_id))?;
+    if !status.success() || bytes.is_empty() {
+        return Err(machine_pack_error(&repository.repository_id));
+    }
+    let parents = git_small_output(
+        &root,
+        &["rev-list", "--parents", "-n", "1", &repository.head_sha],
+        &repository.repository_id,
+    )?;
+    Ok(MachineRepositoryPack {
+        repository_id: repository.repository_id.clone(),
+        head_sha: repository.head_sha.clone(),
+        pack_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        shallow_boundary: parents.split_whitespace().count() > 1,
     })
+}
+
+fn bounded_git_output(
+    root: &Path,
+    args: &[&str],
+    limit: usize,
+    repository_id: &str,
+) -> Result<Vec<u8>, DomainError> {
+    let mut child = Command::new("git")
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| machine_pack_error(repository_id))?;
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("piped Git output")
+        .take((limit + 1) as u64)
+        .read_to_end(&mut output)
+        .map_err(|_| machine_pack_error(repository_id))?;
+    if output.len() > limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(machine_snapshot_oversize());
+    }
+    let status = child
+        .wait()
+        .map_err(|_| machine_pack_error(repository_id))?;
+    if !status.success() {
+        return Err(machine_pack_error(repository_id));
+    }
+    Ok(output)
+}
+
+fn git_small_output(
+    root: &Path,
+    args: &[&str],
+    repository_id: &str,
+) -> Result<String, DomainError> {
+    let output = bounded_git_output(root, args, 16 * 1024, repository_id)?;
+    String::from_utf8(output)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| machine_pack_error(repository_id))
+}
+
+fn machine_pack_error(repository_id: &str) -> DomainError {
+    error(
+        format!(
+            "The daemon could not package the saved Git objects for repository '{repository_id}'."
+        ),
+        "No snapshot was served and the originating repository was not changed.",
+        "Restore the saved Git commit and objects on the originating machine, then retry.",
+        "machine_snapshot_pack_failed",
+    )
+}
+
+fn machine_snapshot_oversize() -> DomainError {
+    error(
+        format!(
+            "The immutable connected-machine snapshot is larger than the {} MiB single-frame limit.",
+            MAX_MACHINE_FRAME_BYTES / (1024 * 1024)
+        ),
+        "No local cache or remote review data was changed.",
+        "Split the change into smaller review rounds or review it on the originating machine; chunked machine snapshots are not supported in this release.",
+        "machine_snapshot_too_large",
+    )
 }
 
 pub fn materialize_snapshot(snapshot: &MachineSnapshot) -> MaterializedDiff {

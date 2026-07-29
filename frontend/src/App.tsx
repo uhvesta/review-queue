@@ -108,6 +108,72 @@ const emptyBrief = (): ReviewBrief => ({
   testing: "",
 });
 
+const dialogFocusableSelector = [
+  "button:not([disabled])",
+  "[href]",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+function useDialogFocus(onClose: () => void) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const frame = window.requestAnimationFrame(() => {
+      const initial = dialog.querySelector<HTMLElement>(
+        "[data-dialog-initial-focus], [autofocus]",
+      ) ?? dialog.querySelector<HTMLElement>(dialogFocusableSelector) ?? dialog;
+      initial.focus();
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, []);
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onCloseRef.current();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = [...dialog.querySelectorAll<HTMLElement>(dialogFocusableSelector)]
+      .filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+    if (!focusable.length) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!dialog.contains(document.activeElement)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  return { ref: dialogRef, onKeyDown, tabIndex: -1 };
+}
+
 export function App() {
   const [rounds, setRounds] = useState<ReviewRound[]>([]);
   const [selected, setSelected] = useState<ReviewRound | null>(null);
@@ -513,6 +579,7 @@ function AddMachineDialog({
   const [socketPath, setSocketPath] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<CommandError | null>(null);
+  const dialog = useDialogFocus(onClose);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -532,7 +599,7 @@ function AddMachineDialog({
 
   return (
     <div className="modal-backdrop">
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="add-machine-title">
+      <section {...dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby="add-machine-title">
         <header><h2 id="add-machine-title">Add connected machine</h2><button aria-label="Close" onClick={onClose}>×</button></header>
         <form className="form" onSubmit={(event) => void submit(event)}>
           {error && <ErrorPanel error={error} />}
@@ -569,6 +636,7 @@ function AddGithubPullRequestDialog({
   const [url, setUrl] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<CommandError | null>(null);
+  const dialog = useDialogFocus(onClose);
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setWorking(true);
@@ -584,7 +652,7 @@ function AddGithubPullRequestDialog({
   };
   return (
     <div className="modal-backdrop">
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="add-pr-title">
+      <section {...dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby="add-pr-title">
         <header><h2 id="add-pr-title">Review pull request</h2><button aria-label="Close" onClick={onClose}>×</button></header>
         <form className="form" onSubmit={(event) => void submit(event)}>
           {error && <ErrorPanel error={error} />}
@@ -1496,6 +1564,7 @@ function FormalFeedbackDrawer({
   const [prepared, setPrepared] = useState<PreparedFeedbackPrompt | null>(null);
   const [working, setWorking] = useState(false);
   const [deliveryMessage, setDeliveryMessage] = useState("");
+  const dialog = useDialogFocus(onClose);
 
   const refreshComments = useCallback(async () => {
     try {
@@ -1520,7 +1589,6 @@ function FormalFeedbackDrawer({
     listAgentRoutes()
       .then((items) => {
         setRoutes(items);
-        if (!routeId && items.length === 1) setRouteId(items[0].id);
       })
       .catch((problem) => setError(toCommandError(problem)));
   }, [refreshComments]);
@@ -1596,7 +1664,7 @@ function FormalFeedbackDrawer({
 
   return (
     <div className="drawer-backdrop">
-      <aside className="feedback" role="dialog" aria-modal="true" aria-labelledby="feedback-title">
+      <aside {...dialog} className="feedback" role="dialog" aria-modal="true" aria-labelledby="feedback-title">
         <header><h2 id="feedback-title">Formal feedback</h2><button onClick={onClose} aria-label="Close formal feedback">×</button></header>
         <p><b>{comments.length} comments</b> · your <code>/ask</code> chat is never sent</p>
         <p>
@@ -2102,6 +2170,7 @@ function SubmitLocalDialog({
   const [preflightFresh, setPreflightFresh] = useState(false);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<CommandError | null>(null);
+  const dialog = useDialogFocus(onClose);
 
   const invalidatePreflight = () => setPreflightFresh(false);
   const update = (field: keyof ReviewBrief, value: string) => {
@@ -2152,7 +2221,7 @@ function SubmitLocalDialog({
 
   return (
     <div className="modal-backdrop">
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="submit-title">
+      <section {...dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby="submit-title">
         <header><h2 id="submit-title">Submit local review</h2><button onClick={onClose} aria-label="Close">×</button></header>
         <form className="form" onSubmit={submit}>
           <label>Workspace path<input value={workspacePath} onChange={(event) => { setWorkspacePath(event.target.value); setPreflight(null); setParticipating(new Set()); invalidatePreflight(); }} required autoFocus /></label>
@@ -2228,6 +2297,7 @@ function DetailsDialog({
   const [brief, setBrief] = useState(round.brief);
   const [error, setError] = useState<CommandError | null>(null);
   const [originRoute, setOriginRoute] = useState<AgentRoute | null>(null);
+  const dialog = useDialogFocus(onClose);
   useEffect(() => {
     if (!round.origin_route_id) {
       setOriginRoute(null);
@@ -2239,7 +2309,7 @@ function DetailsDialog({
   }, [round.origin_route_id]);
   return (
     <div className="modal-backdrop">
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="details-title">
+      <section {...dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby="details-title">
         <header><h2 id="details-title">Review round details</h2><button onClick={onClose} aria-label="Close">×</button></header>
         <div className="detail-grid">
           <p><b>Provenance</b>{round.collection} · topic {round.manifest.topic}</p>
@@ -2306,6 +2376,7 @@ function ReproductionDialog({
   const [completed, setCompleted] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<CommandError | null>(null);
+  const dialog = useDialogFocus(onClose);
 
   const inspect = async () => {
     setWorking(true);
@@ -2350,7 +2421,7 @@ function ReproductionDialog({
 
   return (
     <div className="modal-backdrop">
-      <section className="modal reproduction-dialog" role="dialog" aria-modal="true" aria-labelledby="reproduce-title">
+      <section {...dialog} className="modal reproduction-dialog" role="dialog" aria-modal="true" aria-labelledby="reproduce-title">
         <header><h2 id="reproduce-title">Reproduce review round</h2><button onClick={onClose} aria-label="Close">×</button></header>
         <div className="detail-grid">
           <label>Clean destination<input value={destination} onChange={(event) => { setDestination(event.target.value); setPreview(null); setCompleted(false); }} /></label>
@@ -2406,6 +2477,7 @@ function SettingsDialog({
   const [deviceFlowMessage, setDeviceFlowMessage] = useState("");
   const [devicePollDelay, setDevicePollDelay] = useState(5);
   const [, tick] = useState(0);
+  const dialog = useDialogFocus(onClose);
 
   useEffect(() => {
     if (!deviceFlow || deviceFlow.phase === "expired") return;
@@ -2532,7 +2604,7 @@ function SettingsDialog({
 
   return (
     <div className="modal-backdrop">
-      <section className="modal settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <section {...dialog} className="modal settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header><h2 id="settings-title">Application settings</h2><button onClick={onClose} aria-label="Close">×</button></header>
         <div className="detail-grid">
           <ConnectionRow label="Copilot /ask" status={health?.copilot} working={working} onConnect={() => void connect("copilot_app")} onDisconnect={(source) => void run(() => disconnectCapability("copilot_app", source))} />
@@ -2650,9 +2722,10 @@ function GithubPublishDialog({
   const [error, setError] = useState<CommandError | null>(null);
   const target = attempt.preview.target;
   const completed = attempt.status === "completed";
+  const dialog = useDialogFocus(onClose);
   return (
     <div className="modal-backdrop">
-      <section className="modal confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="publish-title">
+      <section {...dialog} className="modal confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="publish-title">
         <header><h2 id="publish-title">Publish GitHub review?</h2><button aria-label="Close" onClick={onClose}>×</button></header>
         <div className="detail-grid">
           <p><b>Target</b> {target.owner}/{target.repository} #{target.pull_number} at <code>{shortSha(target.head_sha)}</code></p>
@@ -2694,9 +2767,10 @@ function PurgeDialog({
   onConfirm: () => Promise<void>;
 }) {
   const approving = intent.kind === "approve_local";
+  const dialog = useDialogFocus(onCancel);
   return (
     <div className="modal-backdrop">
-      <section className="modal confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="purge-title">
+      <section {...dialog} className="modal confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="purge-title">
         <header><h2 id="purge-title">{approving ? "Approve and purge this local round?" : "Delete this review round?"}</h2></header>
         <div className="detail-grid">
           <p>This removes the queue placement, manifest references, brief, chats, comments, decisions, and deliveries stored by Review Queue.</p>

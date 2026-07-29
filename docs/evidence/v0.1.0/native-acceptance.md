@@ -18,6 +18,23 @@ explicit review question and its returned answer.
   record to exercise recovery, and deleted. Product credentials were not read
   or modified.
 
+## OAuth Device Flow and restart
+
+Using the bundled public client ID, the signed app completed app-owned Device
+Flow authorization for the capability-specific `PR read` and `PR publish`
+accounts. Settings identified the connected GitHub account as `uhvesta` and
+continued to show Copilot's existing-CLI sign-in as a distinct source.
+
+The signed app was then quit completely and relaunched. Both GitHub
+capabilities were recovered from their separate
+`com.reviewqueue.desktop` Keychain accounts, remained connected as `uhvesta`,
+and required no repeated browser approval. Keychain metadata showed the two
+account items were created independently. No token was read into the
+renderer, SQLite, evidence, shell output, or diagnostic artifact.
+
+The post-relaunch state is retained in
+[oauth-keychain-persisted.jpeg](oauth-keychain-persisted.jpeg).
+
 ## Local multi-repository capture
 
 The packaged UI captured staged, unstaged, and untracked changes from two

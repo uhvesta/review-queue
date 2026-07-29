@@ -22,6 +22,7 @@ use crate::store::{Store, SubmissionResult};
 use crate::{
     ActionableError, AgentRoute, Collection, DomainError,
     capture::{self, CaptureRequest},
+    machine::MachineConfig,
 };
 
 /// A local CLI request is deliberately small. This prevents a peer from making
@@ -48,8 +49,7 @@ pub enum SocketRequest {
         request: CaptureRequest,
     },
     AddMachine {
-        name: String,
-        endpoint: String,
+        config: MachineConfig,
     },
     ListMachines,
     RemoveMachine {
@@ -110,9 +110,9 @@ pub fn dispatch(store: &mut Store, request: SocketRequest) -> SocketResponse {
         SocketRequest::CaptureLocal { request } => store
             .ingest_local_capture(&request)
             .and_then(|result| json(submission_result(result))),
-        SocketRequest::AddMachine { name, endpoint } => store
-            .add_machine(&name, &endpoint)
-            .and_then(|(id, created)| json(serde_json::json!({"id": id, "created": created}))),
+        SocketRequest::AddMachine { config } => store
+            .add_machine_config(&config)
+            .and_then(|(machine, created)| json(serde_json::json!({"machine": machine, "created": created}))),
         SocketRequest::ListMachines => store.machines().and_then(json),
         SocketRequest::RemoveMachine { id_or_name } => store
             .remove_machine(&id_or_name)

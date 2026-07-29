@@ -3,12 +3,13 @@ set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
-matrix_path="$repo_root/docs/test-matrix.md"
+matrix_path="${REVIEW_QUEUE_MATRIX_PATH:-$repo_root/docs/test-matrix.md}"
 
 if [[ ! -f "$matrix_path" ]]; then
   echo "release gate failed: docs/test-matrix.md is missing" >&2
   exit 1
 fi
+matrix_dir="$(CDPATH= cd -- "$(dirname -- "$matrix_path")" && pwd)"
 
 failed_rows="$(
   awk -F '|' '
@@ -37,15 +38,7 @@ unknown_statuses="$(
     /^\|/ {
       status = $3
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", status)
-      if (
-        status != "Status" &&
-        status !~ /^-+$/ &&
-        status != "passing" &&
-        status != "passing with limitation" &&
-        status != "not started" &&
-        status != "blocked" &&
-        status != "failing"
-      ) {
+      if (status != "Status" && status !~ /^-+$/ && status != "passing" && status != "passing with limitation" && status != "not started" && status != "blocked" && status != "failing") {
         print status
       }
     }
@@ -84,15 +77,7 @@ incomplete_rows="$(
         value = $i
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
         lower = tolower(value)
-        if (
-          value == "" ||
-          lower == "n/a" ||
-          lower == "none" ||
-          lower == "todo" ||
-          lower == "tbd" ||
-          lower ~ /not started/ ||
-          lower ~ /blocked/
-        ) {
+        if (value == "" || lower == "n/a" || lower == "none" || lower == "todo" || lower == "tbd" || lower ~ /not started/ || lower ~ /blocked/) {
           print flow " (" labels[i] " missing)"
         }
       }
@@ -121,16 +106,82 @@ required_flows=(
   "Signed updater / relaunch"
   "Token-leak artifact scan"
 )
+
+validate_evidence_cell() {
+  local flow="$1"
+  local evidence="$2"
+  local lower
+  local remaining
+  local link_match
+  local link_target
+  local saw_local_link=0
+  local saw_missing_local_link=0
+  local placeholder_pattern='(^|[^[:alnum:]])(pending|await|awaiting|awaits|todo|tbd|not[[:space:]]+started|blocked)([^[:alnum:]]|$)'
+  local markdown_link_pattern='\[[^][]+\]\(([^()[:space:]]+)\)'
+
+  lower="$(printf '%s' "$evidence" | tr '[:upper:]' '[:lower:]')"
+  if [[ $lower =~ $placeholder_pattern ]]; then
+    echo "stable release gate failed: $flow (Evidence contains placeholder language)" >&2
+    return 1
+  fi
+
+  remaining="$evidence"
+  while [[ $remaining =~ $markdown_link_pattern ]]; do
+    link_match="${BASH_REMATCH[0]}"
+    link_target="${BASH_REMATCH[1]}"
+    remaining="${remaining#*"$link_match"}"
+
+    # Evidence is retained with the matrix. External URLs, anchors, and paths
+    # that escape the docs directory do not establish that a local artifact
+    # exists at release time.
+    if [[ "$link_target" == /* ||
+          "$link_target" == *:* ||
+          "$link_target" == \#* ||
+          "$link_target" == *\?* ||
+          "$link_target" == *\#* ||
+          "$link_target" =~ (^|/)\.\.(/|$) ]]; then
+      continue
+    fi
+
+    saw_local_link=1
+    if [[ -f "$matrix_dir/$link_target" && ! -L "$matrix_dir/$link_target" ]]; then
+      return 0
+    fi
+    saw_missing_local_link=1
+  done
+
+  if (( saw_missing_local_link )); then
+    echo "stable release gate failed: $flow (Evidence link target is missing or is not a retained regular file)" >&2
+  elif (( saw_local_link )); then
+    echo "stable release gate failed: $flow (Evidence has no usable retained local artifact link)" >&2
+  else
+    echo "stable release gate failed: $flow (Evidence must contain a Markdown link to a retained local artifact)" >&2
+  fi
+  return 1
+}
+
 for required_flow in "${required_flows[@]}"; do
-  if ! awk -F '|' -v wanted="$required_flow" '
+  matching_evidence="$(awk -F '|' -v wanted="$required_flow" '
     /^\|/ {
       flow = $2
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", flow)
-      if (flow == wanted) found = 1
+      if (flow == wanted) {
+        evidence = $8
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", evidence)
+        print evidence
+      }
     }
-    END { exit found ? 0 : 1 }
-  ' "$matrix_path"; then
+  ' "$matrix_path")"
+  matching_count="$(printf '%s\n' "$matching_evidence" | awk 'NF { count += 1 } END { print count + 0 }')"
+  if [[ "$matching_count" -eq 0 ]]; then
     echo "stable release gate failed: required flow is absent: $required_flow" >&2
+    exit 1
+  fi
+  if [[ "$matching_count" -ne 1 ]]; then
+    echo "stable release gate failed: required flow is duplicated: $required_flow" >&2
+    exit 1
+  fi
+  if ! validate_evidence_cell "$required_flow" "$matching_evidence"; then
     exit 1
   fi
 done

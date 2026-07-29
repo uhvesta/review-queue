@@ -67,6 +67,8 @@ jobs:
       - run: cargo install tauri-cli --version "2.11.4" --locked
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Run opt-in macOS Keychain integration tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -- --ignored
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - name: Compile universal app bundle with ad-hoc signing
         run: >-

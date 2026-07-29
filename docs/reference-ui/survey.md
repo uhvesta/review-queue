@@ -3,6 +3,38 @@
 This survey records interaction inspiration only. Review Queue does not copy
 source code, icons, artwork, text, or CSS from these projects.
 
+## Archived legacy product
+
+The clean-slate work began by running the packaged app from the prior
+`cmux-localreview` project and retaining a small visual archive:
+
+- [Legacy Queue Home](legacy-queue-home.jpeg)
+- [Legacy diff reviewer](legacy-reviewer.jpeg)
+- [Five-second legacy reviewer recording](legacy-reviewer.mov)
+
+The archive is reference material, not implementation input. It contains no
+credential values or tokens.
+
+Patterns worth retaining:
+
+- the dark, compact diff canvas;
+- a persistent repository/file navigation surface;
+- visible split/unified and Viewed controls;
+- explicit Queue Home navigation;
+- visually separate `/ask` and formal-review controls; and
+- actionable, inline connection-recovery copy.
+
+Patterns deliberately rejected by the clean-slate specification:
+
+- credentials or daemon discovery tokens in the renderer/data plane;
+- GitHub connections dominating Queue Home;
+- an unqueued “Review locally” PR path;
+- a separate AI-computed review-order feature;
+- vague “Send all comments to cmux” routing without a selected durable
+  `AgentRoute`;
+- remote daemon tokens stored by the app; and
+- the legacy Electron/HTTP/sidecar architecture.
+
 | Reference | Provenance | Pattern retained | Review Queue use |
 | --- | --- | --- | --- |
 | [Visual Studio Code](https://github.com/microsoft/vscode) | Microsoft, MIT | Stable three-pane workbench, file tree, diff editor, inline comment threads, collapsible side chat | Reviewer file tree, non-overlapping diff controls, anchored threads, right-side chat sheet |
