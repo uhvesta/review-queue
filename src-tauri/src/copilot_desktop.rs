@@ -1759,13 +1759,11 @@ mod tests {
 
     #[test]
     fn stale_persisted_option_requires_explicit_reset_before_session_start() {
-        let capabilities = AcpCliTransport::discovered_capabilities(&[
-            github_copilot_sdk::Model {
-                id: "sdk-model".into(),
-                name: "SDK model".into(),
-                ..Default::default()
-            },
-        ]);
+        let capabilities = AcpCliTransport::discovered_capabilities(&[github_copilot_sdk::Model {
+            id: "sdk-model".into(),
+            name: "SDK model".into(),
+            ..Default::default()
+        }]);
         let stale = selected_options(
             &capabilities,
             BTreeMap::from([("context_window".into(), "managed_80".into())]),

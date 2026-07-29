@@ -106,6 +106,7 @@ import {
   diffLineCounts,
   repositoryFileKey as fileKey,
 } from "./RepositoryFileTree";
+import { applicationVersion } from "./version";
 
 type Modal = "submit" | "github" | "details" | "reproduce" | "settings" | "machine" | null;
 type PurgeIntent = { round: ReviewRound; kind: "delete" | "approve_local" };
@@ -3622,6 +3623,7 @@ function SettingsDialog({
   const [error, setError] = useState<CommandError | null>(null);
   const [working, setWorking] = useState(false);
   const [update, setUpdate] = useState<UpdateCheck | null>(null);
+  const [appVersion, setAppVersion] = useState("");
   const [installedVersion, setInstalledVersion] = useState("");
   const [diagnosticsPath, setDiagnosticsPath] = useState("");
   const [codeCopied, setCodeCopied] = useState(false);
@@ -3635,6 +3637,20 @@ function SettingsDialog({
     const timer = window.setInterval(() => tick((value) => value + 1), 1000);
     return () => window.clearInterval(timer);
   }, [deviceFlow]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void applicationVersion()
+      .then((version) => {
+        if (!cancelled) setAppVersion(version);
+      })
+      .catch(() => {
+        if (!cancelled) setAppVersion("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const acceptHealth = (next: ConnectionHealth) => {
     setHealth(next);
@@ -3802,6 +3818,7 @@ function SettingsDialog({
           </section>
           <section>
             <b>Updates</b>
+            {appVersion && <p>Review Queue {appVersion}</p>}
             <p>Checks are read-only. Install and relaunch each require a separate click.</p>
             <div className="dialog-actions">
               <button disabled={working} onClick={() => void runPublicOperation(async () => {

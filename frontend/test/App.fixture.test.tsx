@@ -47,6 +47,23 @@ afterEach(() => {
 beforeEach(() => setViewport(1024));
 
 describe("fixture-backed reviewer recovery", () => {
+  it("shows the running app version without checking the update feed", async () => {
+    let checkForUpdate = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      checkForUpdate = vi.fn(api.checkForUpdate);
+      return { ...api, checkForUpdate };
+    });
+
+    await renderFixtureApp();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const dialog = await screen.findByRole("dialog", { name: "Application settings" });
+
+    expect(await within(dialog).findByText("Review Queue 0.1.0-fixture")).toBeVisible();
+    expect(checkForUpdate).not.toHaveBeenCalled();
+    expect(within(dialog).getByRole("button", { name: "Check for updates" })).toBeVisible();
+  });
+
   it("resolves a GitHub PR read-only before an explicit, exact confirmation queues it", async () => {
     let resolvePullRequest = vi.fn();
     let confirmPullRequest = vi.fn();
