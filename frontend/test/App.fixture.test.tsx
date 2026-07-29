@@ -15,8 +15,12 @@ async function renderFixtureApp() {
 }
 
 async function openPaginationReview() {
+  await openReview(paginationTitle);
+}
+
+async function openReview(title: string) {
   await renderFixtureApp();
-  const card = screen.getByText(paginationTitle).closest("article");
+  const card = screen.getByText(title).closest("article");
   if (!card) throw new Error("Fixture pagination review card was not rendered.");
   fireEvent.click(within(card).getByRole("button", { name: "Open review" }));
   expect((await screen.findAllByRole("region", { name: "Code diff" })).length).toBeGreaterThan(0);
@@ -149,5 +153,49 @@ describe("responsive reviewer escape hatches", () => {
     expect(files).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(files);
     expect(screen.getByRole("button", { name: "Close files" })).toHaveAttribute("aria-expanded", "true");
+  });
+});
+
+describe("diff anchor selection", () => {
+  it("creates a side-correct /ask anchor from a split-diff line", async () => {
+    const sendPrompt = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      return {
+        ...api,
+        sendCopilotPrompt: (...args: Parameters<typeof api.sendCopilotPrompt>) => {
+          sendPrompt(...args);
+          return api.sendCopilotPrompt(...args);
+        },
+      };
+    });
+
+    await openReview("Add retry backoff to sync worker");
+    fireEvent.click(screen.getByRole("button", { name: /split/i }));
+
+    const leftLine = screen.getAllByRole("button", { name: /select .* left line/i })[0];
+    expect(leftLine).toBeDefined();
+    fireEvent.click(leftLine);
+    expect(leftLine).toHaveClass("selected-code-line");
+
+    const hunk = leftLine.closest(".diff-hunk");
+    if (!hunk) throw new Error("The selected split line was not inside a diff hunk.");
+    fireEvent.click(within(hunk).getByRole("button", { name: "/ask" }));
+
+    await openChat();
+    fireEvent.click(await screen.findByRole("button", { name: "Start Copilot" }));
+    const input = await screen.findByRole("textbox", { name: "Ask a follow-up" });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Why did this line change?" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1));
+    expect(sendPrompt.mock.calls[0][3]).toMatchObject({
+      side: "LEFT",
+      workspace_relative_path: "notify-worker/src/worker/sync_client.py",
+      start_line: expect.any(Number),
+      end_line: expect.any(Number),
+    });
   });
 });

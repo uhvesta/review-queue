@@ -2359,33 +2359,34 @@ function DiffFileView({
 }
 
 function pairSplitLines(lines: DiffLine[], oldStart: number, newStart: number) {
-  type Numbered = { line: DiffLine; number: number };
+  type Indexed = { line: DiffLine; index: number };
+  type Numbered = Indexed & { number: number };
   const rows: Array<{ left: Numbered | null; right: Numbered | null }> = [];
   let oldLine = oldStart;
   let newLine = newStart;
-  let deletions: DiffLine[] = [];
-  let additions: DiffLine[] = [];
+  let deletions: Indexed[] = [];
+  let additions: Indexed[] = [];
   const flush = () => {
     const pairCount = Math.max(deletions.length, additions.length);
     for (let i = 0; i < pairCount; i++) {
       const del = deletions[i];
       const add = additions[i];
       rows.push({
-        left: del ? { line: del, number: oldLine++ } : null,
-        right: add ? { line: add, number: newLine++ } : null,
+        left: del ? { ...del, number: oldLine++ } : null,
+        right: add ? { ...add, number: newLine++ } : null,
       });
     }
     deletions = [];
     additions = [];
   };
-  for (const line of lines) {
-    if (line.type === "deletion") deletions.push(line);
-    else if (line.type === "addition") additions.push(line);
+  for (const [index, line] of lines.entries()) {
+    if (line.type === "deletion") deletions.push({ line, index });
+    else if (line.type === "addition") additions.push({ line, index });
     else {
       flush();
       rows.push({
-        left: { line, number: oldLine++ },
-        right: { line, number: newLine++ },
+        left: { line, index, number: oldLine++ },
+        right: { line, index, number: newLine++ },
       });
     }
   }
@@ -2412,7 +2413,11 @@ function DiffHunkView({
   onComment: (anchor: Anchor) => void;
   onAsk: (anchor: Anchor) => void;
 }) {
-  const [selection, setSelection] = useState<{ start: number; end: number } | null>(null);
+  const [selection, setSelection] = useState<{
+    side: "LEFT" | "RIGHT";
+    start: number;
+    end: number;
+  } | null>(null);
   let oldLine = hunk.old_start;
   let newLine = hunk.new_start;
   const numberedLines = hunk.lines.map((line, index) => ({
@@ -2421,7 +2426,9 @@ function DiffHunkView({
     oldNumber: line.type === "addition" ? null : oldLine++,
     newNumber: line.type === "deletion" ? null : newLine++,
   }));
-  const right = Boolean(file.new_path && file.new_blob_sha);
+  const defaultSide = file.new_path && file.new_blob_sha ? "RIGHT" : "LEFT";
+  const selectedSide = selection?.side ?? defaultSide;
+  const right = selectedSide === "RIGHT";
   const path = (right ? file.new_path : file.old_path) ?? "(unknown path)";
   const relevantKinds = right ? new Set(["context", "addition"]) : new Set(["context", "deletion"]);
   const selectedLines = numberedLines.filter(({ line, index }) =>
@@ -2453,6 +2460,51 @@ function DiffHunkView({
       && imported.end_line >= anchor.start_line
       && imported.start_line <= anchor.end_line;
   });
+  const selectLine = (
+    side: "LEFT" | "RIGHT",
+    index: number,
+    extend: boolean,
+  ) => {
+    setSelection((current) => extend && current?.side === side
+      ? {
+          side,
+          start: Math.min(current.start, index),
+          end: Math.max(current.end, index),
+        }
+      : { side, start: index, end: index });
+  };
+  const splitCell = (
+    side: "LEFT" | "RIGHT",
+    entry: ReturnType<typeof pairSplitLines>[number]["left"],
+  ) => {
+    if (!entry) {
+      return <div className="code-line split-diff-cell split-diff-empty" aria-hidden="true"><span /><code /></div>;
+    }
+    const sideAvailable = side === "RIGHT" ? Boolean(file.new_blob_sha) : Boolean(file.old_blob_sha);
+    const sidePath = (side === "RIGHT" ? file.new_path : file.old_path) ?? path;
+    const selected = selection?.side === side
+      && entry.index >= selection.start
+      && entry.index <= selection.end;
+    const prefix = entry.line.type === "addition" ? "+" : entry.line.type === "deletion" ? "-" : " ";
+    return (
+      <div
+        className={`code-line split-diff-cell ${entry.line.type} ${selected ? "selected-code-line" : ""}`}
+        role={sideAvailable ? "button" : undefined}
+        tabIndex={sideAvailable ? 0 : undefined}
+        aria-label={sideAvailable ? `Select ${sidePath} ${side.toLowerCase()} line ${entry.number}` : undefined}
+        onClick={sideAvailable ? (event) => selectLine(side, entry.index, event.shiftKey) : undefined}
+        onKeyDown={sideAvailable ? (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            selectLine(side, entry.index, event.shiftKey);
+          }
+        } : undefined}
+      >
+        <span>{entry.number}</span>
+        <code>{prefix}{entry.line.content}</code>
+      </div>
+    );
+  };
   return (
     <section className="diff-hunk">
       <div className="hunk-header">
@@ -2472,23 +2524,29 @@ function DiffHunkView({
       </div>
       {layout === "unified"
         ? numberedLines.map(({ line, index, oldNumber, newNumber }) => {
-            const selected = selection && index >= selection.start && index <= selection.end;
+            const lineSide = line.type === "deletion"
+              ? "LEFT"
+              : line.type === "addition"
+                ? "RIGHT"
+                : defaultSide;
+            const linePath = (lineSide === "RIGHT" ? file.new_path : file.old_path) ?? path;
+            const selected = selection?.side === lineSide
+              && index >= selection.start
+              && index <= selection.end;
             return (
               <div
                 className={`code-line ${line.type} ${selected ? "selected-code-line" : ""}`}
                 key={index}
                 role="button"
                 tabIndex={0}
-                aria-label={`Select ${path} line ${right ? newNumber ?? oldNumber : oldNumber ?? newNumber}`}
+                aria-label={`Select ${linePath} ${lineSide.toLowerCase()} line ${lineSide === "RIGHT" ? newNumber ?? oldNumber : oldNumber ?? newNumber}`}
                 onClick={(event) => {
-                  setSelection((current) => event.shiftKey && current
-                    ? { start: Math.min(current.start, index), end: Math.max(current.end, index) }
-                    : { start: index, end: index });
+                  selectLine(lineSide, index, event.shiftKey);
                 }}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" || event.key === " ") {
                     event.preventDefault();
-                    setSelection({ start: index, end: index });
+                    selectLine(lineSide, index, event.shiftKey);
                   }
                 }}
               >
@@ -2499,14 +2557,8 @@ function DiffHunkView({
           })
         : pairSplitLines(hunk.lines, hunk.old_start, hunk.new_start).map((row, index) => (
             <div className="split-diff-row" key={index}>
-              <div className={`code-line split-diff-cell ${row.left ? row.left.line.type : "split-diff-empty"}`}>
-                <span>{row.left?.number ?? ""}</span>
-                <code>{row.left ? (row.left.line.type === "deletion" ? "-" : " ") + row.left.line.content : ""}</code>
-              </div>
-              <div className={`code-line split-diff-cell ${row.right ? row.right.line.type : "split-diff-empty"}`}>
-                <span>{row.right?.number ?? ""}</span>
-                <code>{row.right ? (row.right.line.type === "addition" ? "+" : " ") + row.right.line.content : ""}</code>
-              </div>
+              {splitCell("LEFT", row.left)}
+              {splitCell("RIGHT", row.right)}
             </div>
           ))}
       {anchoredDiscussion.map((comment) => (
