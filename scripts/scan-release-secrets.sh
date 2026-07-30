@@ -10,12 +10,11 @@ fi
 credential_pattern='(github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|Bearer[[:space:]]+[A-Za-z0-9._~+/-]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)'
 
 scan_tmp="$(mktemp -d "${TMPDIR:-/tmp}/review-queue-secret-scan.XXXXXX")"
-mounted_images=()
+mounted_image=""
 cleanup() {
-  local mountpoint
-  for mountpoint in "${mounted_images[@]}"; do
-    hdiutil detach "$mountpoint" -quiet >/dev/null 2>&1 || true
-  done
+  if [[ -n "$mounted_image" ]]; then
+    hdiutil detach "$mounted_image" -quiet >/dev/null 2>&1 || true
+  fi
   rm -rf "$scan_tmp"
 }
 trap cleanup EXIT
@@ -64,10 +63,10 @@ scan_disk_image() {
   local mountpoint
   mountpoint="$(mktemp -d "$scan_tmp/dmg.XXXXXX")"
   hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" "$image" >/dev/null
-  mounted_images+=("$mountpoint")
+  mounted_image="$mountpoint"
   scan_tree "$mountpoint"
   hdiutil detach "$mountpoint" -quiet
-  mounted_images=("${mounted_images[@]:0:${#mounted_images[@]}-1}")
+  mounted_image=""
 }
 
 scan_path() {
