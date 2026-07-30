@@ -11,7 +11,10 @@ use std::{
 
 use review_queue_core::{
     AgentRoute, Anchor, Collection, Decision, DomainError, FormalComment, ReviewBrief, Round,
-    acp::{PreparedFeedbackPrompt, prepare_feedback_prompt},
+    acp::{
+        AcpDeliveryPolicy, AcpDeliveryReceipt, PreparedFeedbackPrompt, deliver_feedback_tcp,
+        prepare_feedback_prompt,
+    },
     adapters::{AskConversation, AskTurn, DiscoveredSessionOption},
     capture::{self, CaptureRequest},
     diff::{self, MaterializedDiff, PinnedFileContent},
@@ -271,6 +274,16 @@ pub struct PrepareFeedbackPromptRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmManualSubmissionRequest {
     pub delivery_id: String,
+    pub confirmation: Confirmation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliverFeedbackRequest {
+    pub round_id: String,
+    pub delivery_id: String,
+    pub route_id: String,
+    pub policy: AcpDeliveryPolicy,
     pub confirmation: Confirmation,
 }
 
@@ -563,13 +576,8 @@ pub fn purge_round(
     confirmation: Confirmation,
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    require_confirmation(&id, &confirmation, "purge")?;
-    state
-        .0
-        .lock()
-        .map_err(|_| unavailable())?
-        .purge(&id)
-        .map_err(Into::into)
+    let store = state.0.lock().map_err(|_| unavailable())?;
+    purge_round_with_confirmation(&store, &id, &confirmation)
 }
 
 /// Local approve is destructive by product design: after confirmation it
@@ -581,9 +589,26 @@ pub fn approve_local(
     confirmation: Confirmation,
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    require_confirmation(&id, &confirmation, "approve-local")?;
     let store = state.0.lock().map_err(|_| unavailable())?;
-    let round = store.round(&id)?;
+    approve_local_with_confirmation(&store, &id, &confirmation)
+}
+
+pub(crate) fn purge_round_with_confirmation(
+    store: &Store,
+    id: &str,
+    confirmation: &Confirmation,
+) -> Result<(), CommandError> {
+    require_confirmation(id, confirmation, "purge")?;
+    store.purge(id).map_err(Into::into)
+}
+
+pub(crate) fn approve_local_with_confirmation(
+    store: &Store,
+    id: &str,
+    confirmation: &Confirmation,
+) -> Result<(), CommandError> {
+    require_confirmation(id, confirmation, "approve-local")?;
+    let round = store.round(id)?;
     if round.source_adapter.approval != review_queue_core::adapters::ApprovalDisposition::PurgeRound
     {
         return Err(CommandError {
@@ -593,7 +618,7 @@ pub fn approve_local(
             next_step: "Use the source's decision action for this round.".into(),
         });
     }
-    store.approve_local(&id).map_err(Into::into)
+    store.approve_local(id).map_err(Into::into)
 }
 
 /// Remote approval records a local decision only. Publishing or preparing a
@@ -665,10 +690,8 @@ pub fn delete_formal_comment(
         .map_err(Into::into)
 }
 
-/// Persists an immutable feedback payload and prepares a copyable prompt.
-///
-/// Route/session state selects truthful manual handoff guidance only. This
-/// command has no provider, socket, terminal, or prompt-injection capability.
+/// Persists an immutable feedback payload and prepares the exact confirmed
+/// desktop delivery plus its copy/reproduction fallback.
 #[tauri::command]
 pub fn prepare_feedback_handoff(
     request: PrepareFeedbackPromptRequest,
@@ -685,6 +708,85 @@ pub fn prepare_feedback_handoff(
     // pending immutable payload, so historical rounds cannot prepare anew.
     let delivery = store.prepare_delivery(&request.round_id)?;
     prepare_feedback_prompt(&delivery, route.as_ref()).map_err(Into::into)
+}
+
+/// Performs the only ACP delivery operation. It is intentionally a Tauri-only
+/// command and is never registered on the CLI socket surface.
+#[tauri::command]
+pub async fn deliver_feedback(
+    request: DeliverFeedbackRequest,
+    state: State<'_, AppState>,
+) -> Result<AcpDeliveryReceipt, CommandError> {
+    let store = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || deliver_feedback_blocking(request, store))
+        .await
+        .map_err(|_| CommandError {
+            code: "acp_delivery_task_failed".into(),
+            message: "The desktop ACP delivery task stopped unexpectedly.".into(),
+            data_safety: "The immutable feedback remains saved and is not marked delivered.".into(),
+            next_step:
+                "Reopen Formal feedback, inspect the agent session, then retry or copy the prompt."
+                    .into(),
+        })?
+}
+
+pub(crate) fn deliver_feedback_blocking(
+    request: DeliverFeedbackRequest,
+    state: Arc<Mutex<Store>>,
+) -> Result<AcpDeliveryReceipt, CommandError> {
+    require_confirmation(&request.delivery_id, &request.confirmation, "acp-deliver")?;
+    let (delivery, route) = {
+        let store = state.lock().map_err(|_| unavailable())?;
+        store.round(&request.round_id)?;
+        let delivery = store
+            .pending_delivery(&request.round_id)?
+            .ok_or_else(|| CommandError {
+                code: "delivery_not_found".into(),
+                message: "No pending formal feedback delivery exists for this round.".into(),
+                data_safety: "No feedback was sent and no comment revision changed.".into(),
+                next_step: "Prepare the immutable delivery again, then review and confirm Send."
+                    .into(),
+            })?;
+        if delivery.id != request.delivery_id {
+            return Err(CommandError {
+                code: "delivery_confirmation_stale".into(),
+                message: "The confirmed formal feedback payload is no longer current.".into(),
+                data_safety: "No feedback was sent and the newer immutable delivery remains saved."
+                    .into(),
+                next_step:
+                    "Close this confirmation, review the current payload, and confirm it explicitly."
+                        .into(),
+            });
+        }
+        let route = store.route(&request.route_id)?;
+        store.claim_delivery_attempt(&delivery.id)?;
+        (delivery, route)
+    };
+
+    match deliver_feedback_tcp(&delivery, &route, request.policy) {
+        Ok(receipt) => {
+            state
+                .lock()
+                .map_err(|_| unavailable())?
+                .mark_delivery_acp_delivered(&delivery.id, request.policy.outcome())?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            let outcome = match error.error.code.as_str() {
+                "acp_endpoint_unreachable"
+                | "acp_endpoint_unavailable"
+                | "acp_route_disconnected"
+                | "acp_session_unavailable" => "acp_unreachable",
+                "acp_delivery_interrupted" | "acp_transport_unavailable" => "acp_interrupted",
+                "acp_delivery_rejected" => "acp_rejected",
+                _ => "acp_acknowledgement_invalid",
+            };
+            if let Ok(store) = state.lock() {
+                let _ = store.record_delivery_attempt_failure(&delivery.id, outcome);
+            }
+            Err(error.into())
+        }
+    }
 }
 
 #[tauri::command]

@@ -572,6 +572,10 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim_end().into()
     }
 
+    fn canonical_json_bytes(value: impl Serialize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::to_value(value).unwrap()).unwrap()
+    }
+
     fn capture_fixture() -> (tempfile::TempDir, CaptureRequest) {
         let workspace = tempfile::tempdir().unwrap();
         git(workspace.path(), &["init", "-q"]);
@@ -605,16 +609,29 @@ mod tests {
 
     #[test]
     fn external_effects_are_not_exposed_on_socket() {
-        let mut store = Store::in_memory().unwrap();
-        let response = dispatch(
-            &mut store,
+        assert!(
+            serde_json::from_str::<SocketRequest>(
+                r#"{"type":"deliver_feedback","round_id":"round","delivery_id":"delivery","route_id":"route","policy":"queue"}"#,
+            )
+            .is_err(),
+            "the credential-free CLI protocol must not expose ACP delivery"
+        );
+        for request in [
+            SocketRequest::Deliver {
+                round_id: "round".into(),
+            },
             SocketRequest::Publish {
                 round_id: "round".into(),
             },
-        );
-        assert!(
-            matches!(response, SocketResponse::Error { error } if error.code == "socket_operation_forbidden")
-        );
+        ] {
+            let encoded = serde_json::to_string(&request).unwrap();
+            let mut store = Store::in_memory().unwrap();
+            let response = dispatch(&mut store, request);
+            assert!(
+                matches!(response, SocketResponse::Error { error } if error.code == "socket_operation_forbidden"),
+                "socket must reject {encoded}"
+            );
+        }
     }
 
     #[test]
@@ -650,6 +667,77 @@ mod tests {
         assert_eq!(
             first["machine"]["config"]["endpoint"]["remote_socket"],
             "/run/review-queue.sock"
+        );
+    }
+
+    #[test]
+    fn socket_machine_add_returns_the_byte_identical_ui_record_and_existing_id() {
+        let config = MachineConfig {
+            name: "parity-box".into(),
+            endpoint: crate::machine::MachineEndpoint::Ssh {
+                target: "review@parity-box".into(),
+                remote_socket: "/run/review-queue.sock".into(),
+                adapter: crate::machine::SshAdapter::SystemOpenSsh,
+            },
+            source_type: crate::machine::MachineSourceType::ReviewQueueDaemon,
+        };
+        let mut store = Store::in_memory().unwrap();
+        let (ui_record, created) = store.add_machine_config(&config).unwrap();
+        assert!(created);
+
+        let socket = match dispatch(&mut store, SocketRequest::AddMachine { config }) {
+            SocketResponse::Ok { data } => data,
+            SocketResponse::Error { error } => panic!("machine add failed: {error}"),
+            SocketResponse::CapturePrepared { .. } => panic!("unexpected capture frame"),
+        };
+        assert_eq!(socket["created"], false);
+        assert_eq!(socket["machine"]["id"], ui_record.id);
+        assert_eq!(
+            canonical_json_bytes(&socket["machine"]),
+            canonical_json_bytes(&ui_record),
+            "CLI socket and UI/core paths must canonically serialize the same machine record"
+        );
+    }
+
+    #[test]
+    fn socket_submit_rerun_returns_the_byte_identical_ui_round_and_existing_id() {
+        let (workspace, mut request) = capture_fixture();
+        request.workspace_root = workspace.path().into();
+        let mut store = Store::in_memory().unwrap();
+        let preflight = store.preflight_local_capture(&request).unwrap();
+        request.origin_route_id = preflight.origin_route_id;
+        request.participating_repository_ids = preflight.participating_repository_ids;
+        request.preflight_token = Some(preflight.preflight_token);
+        let ui_round = match store.ingest_local_capture(&request).unwrap() {
+            SubmissionResult::Created(round) => round,
+            other => panic!("UI/core first submit should create, got {other:?}"),
+        };
+
+        // A real CLI rerun performs a fresh read-only preflight before sending
+        // the second capture request; preflight tokens are intentionally
+        // single-use snapshots of the exact current workspace.
+        request.participating_repository_ids.clear();
+        request.preflight_token = None;
+        let retry_preflight = store.preflight_local_capture(&request).unwrap();
+        request.origin_route_id = retry_preflight.origin_route_id;
+        request.participating_repository_ids = retry_preflight.participating_repository_ids;
+        request.preflight_token = Some(retry_preflight.preflight_token);
+        let socket = match dispatch(
+            &mut store,
+            SocketRequest::CaptureLocal {
+                request: request.clone(),
+            },
+        ) {
+            SocketResponse::Ok { data } => data,
+            SocketResponse::Error { error } => panic!("submit rerun failed: {error}"),
+            SocketResponse::CapturePrepared { .. } => panic!("unexpected capture frame"),
+        };
+        assert_eq!(socket["outcome"], "existing");
+        assert_eq!(socket["round"]["id"], ui_round.id);
+        assert_eq!(
+            canonical_json_bytes(&socket["round"]),
+            canonical_json_bytes(&ui_round),
+            "CLI socket and UI/core paths must canonically serialize the same immutable round"
         );
     }
 

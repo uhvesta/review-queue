@@ -6,6 +6,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -461,11 +462,9 @@ impl MachineRuntime {
                         });
                     }
                 }
-                let forward = format!("{}:{}", local_socket.display(), remote_socket);
+                let arguments = ssh_tunnel_arguments(&local_socket, remote_socket, target);
                 let child = Command::new("/usr/bin/ssh")
-                    .args(["-N", "-o", "ExitOnForwardFailure=yes", "-L"])
-                    .arg(&forward)
-                    .arg(target)
+                    .args(arguments)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -584,6 +583,17 @@ impl MachineRuntime {
             last_error: entry.last_error.clone(),
         })
     }
+}
+
+fn ssh_tunnel_arguments(local_socket: &Path, remote_socket: &str, target: &str) -> Vec<OsString> {
+    vec![
+        "-N".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-L".into(),
+        format!("{}:{remote_socket}", local_socket.display()).into(),
+        target.into(),
+    ]
 }
 
 fn machine_record(state: &State<'_, AppState>, id: &str) -> Result<MachineRecord, CommandError> {
@@ -786,5 +796,40 @@ mod tests {
                 .code,
             "machine_materialization_mismatch"
         );
+    }
+
+    #[test]
+    fn ssh_tunnel_uses_only_system_config_target_and_socket_forwarding() {
+        let arguments = ssh_tunnel_arguments(
+            Path::new("/tmp/review-queue-local.sock"),
+            "/tmp/review-queue-remote.sock",
+            "fixture-build-host",
+        );
+        assert_eq!(
+            arguments,
+            [
+                "-N",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-L",
+                "/tmp/review-queue-local.sock:/tmp/review-queue-remote.sock",
+                "fixture-build-host",
+            ]
+            .map(OsString::from)
+        );
+        let rendered = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for forbidden in [
+            "IdentityFile",
+            "password",
+            "passphrase",
+            "SSH_AUTH_SOCK",
+            "ProxyCommand",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
     }
 }

@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const paginationTitle = "Fix pagination cursor drift across core-api and web-frontend";
+const retryTitle = "Add retry backoff to sync worker";
 const githubTitle = "Improve error messages for expired tokens";
 const completedTitle = "Rename legacy config module path constant";
 const styles = readFileSync("src/styles.css", "utf8");
@@ -115,6 +116,88 @@ describe("fixture-backed reviewer recovery", () => {
     expect(fireEvent.keyDown(card, { key: "ArrowDown", altKey: true })).toBe(false);
     await waitFor(() => expect(moveRound).toHaveBeenCalledTimes(1));
     expect(moveRound).toHaveBeenCalledWith(expect.any(String), expect.any(Number));
+  });
+
+  it("runs request, complete, requeue, and delete only through explicit lifecycle actions", async () => {
+    let requestChanges = vi.fn();
+    let completeRound = vi.fn();
+    let requeueRound = vi.fn();
+    let purgeRound = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      requestChanges = vi.fn((...args: Parameters<typeof api.requestChanges>) =>
+        api.requestChanges(...args));
+      completeRound = vi.fn((...args: Parameters<typeof api.completeRound>) =>
+        api.completeRound(...args));
+      requeueRound = vi.fn((...args: Parameters<typeof api.requeueRound>) =>
+        api.requeueRound(...args));
+      purgeRound = vi.fn((...args: Parameters<typeof api.purgeRound>) =>
+        api.purgeRound(...args));
+      return { ...api, requestChanges, completeRound, requeueRound, purgeRound };
+    });
+
+    await openReview(retryTitle);
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+    await waitFor(() => expect(requestChanges).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Complete" }));
+    await screen.findByRole("heading", { name: "Queue Home" });
+    await waitFor(() => expect(completeRound).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /show completed .* old rounds/i }));
+    const completedCard = (await screen.findByText(retryTitle)).closest("article");
+    if (!completedCard) throw new Error("The completed lifecycle card was not rendered.");
+    expect(within(completedCard).getByText("completed")).toBeVisible();
+    fireEvent.click(within(completedCard).getByRole("button", { name: "Requeue" }));
+    await waitFor(() => expect(requeueRound).toHaveBeenCalledTimes(1));
+
+    const requeuedCard = (await screen.findByText(retryTitle)).closest("article");
+    if (!requeuedCard) throw new Error("The requeued lifecycle card was not rendered.");
+    expect(within(requeuedCard).getByText("queued")).toBeVisible();
+    const more = requeuedCard.querySelector("summary[aria-label^='More actions']");
+    if (!more) throw new Error("The lifecycle card did not expose more actions.");
+    fireEvent.click(more);
+    fireEvent.click(within(requeuedCard).getByRole("button", { name: "Delete" }));
+    const dialog = await screen.findByRole("alertdialog", { name: "Delete this review round?" });
+    expect(dialog).toHaveTextContent("Source files, repositories, and submission commits are never touched.");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(purgeRound).not.toHaveBeenCalled();
+    expect(screen.getByText(retryTitle)).toBeVisible();
+
+    fireEvent.click(within(requeuedCard).getByRole("button", { name: "Delete" }));
+    const confirm = await screen.findByRole("alertdialog", { name: "Delete this review round?" });
+    fireEvent.click(within(confirm).getByRole("button", { name: "Delete permanently" }));
+    await waitFor(() => expect(purgeRound).toHaveBeenCalledWith(expect.any(String), "delete"));
+    await waitFor(() => expect(screen.queryByText(retryTitle)).not.toBeInTheDocument());
+  });
+
+  it("cancels local approval without mutation and confirms the separate purge action", async () => {
+    let purgeRound = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      purgeRound = vi.fn((...args: Parameters<typeof api.purgeRound>) =>
+        api.purgeRound(...args));
+      return { ...api, purgeRound };
+    });
+
+    await openReview(paginationTitle);
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    const first = await screen.findByRole("alertdialog", {
+      name: "Approve and purge this local round?",
+    });
+    expect(first).toHaveTextContent("Source files, repositories, and submission commits are never touched.");
+    fireEvent.click(within(first).getByRole("button", { name: "Cancel" }));
+    expect(purgeRound).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    const second = await screen.findByRole("alertdialog", {
+      name: "Approve and purge this local round?",
+    });
+    fireEvent.click(within(second).getByRole("button", { name: "Approve and purge" }));
+    await waitFor(() =>
+      expect(purgeRound).toHaveBeenCalledWith(expect.any(String), "approve_local"));
+    await screen.findByRole("heading", { name: "Queue Home" });
+    expect(screen.queryByText(paginationTitle)).not.toBeInTheDocument();
   });
 
   it("offers an explicit switch from app OAuth back to the existing CLI sign-in", async () => {
@@ -269,6 +352,98 @@ describe("fixture-backed reviewer recovery", () => {
     });
   });
 
+  it("delivers formal feedback only after exact confirmation and never on cancel", async () => {
+    let deliver = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      deliver = vi.fn((...args: Parameters<typeof api.deliverFeedback>) =>
+        api.deliverFeedback(...args));
+      return { ...api, deliverFeedback: deliver };
+    });
+
+    await openPaginationReview();
+    fireEvent.click(screen.getByRole("button", { name: "Formal feedback" }));
+    const drawer = await screen.findByRole("dialog", { name: "Formal feedback" });
+    fireEvent.click(within(drawer).getByRole("button", { name: "Prepare immutable prompt" }));
+    const reviewSend = await within(drawer).findByRole("button", { name: "Review Send…" });
+
+    fireEvent.click(reviewSend);
+    let confirmation = await screen.findByRole("alertdialog", {
+      name: "Send formal feedback to originating agent?",
+    });
+    expect(within(confirmation).getByText(/2 undelivered comment revisions/i)).toBeVisible();
+    expect(within(confirmation).getByText(/Confirm Send performs one desktop-only ACP request/i)).toBeVisible();
+    fireEvent.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+    expect(deliver).not.toHaveBeenCalled();
+
+    fireEvent.click(reviewSend);
+    confirmation = await screen.findByRole("alertdialog", {
+      name: "Send formal feedback to originating agent?",
+    });
+    fireEvent.click(within(confirmation).getByRole("button", { name: "Confirm Send" }));
+    await waitFor(() => expect(deliver).toHaveBeenCalledTimes(1));
+    expect(deliver).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      "route-fixture-1",
+      "queue",
+    );
+    expect(await within(drawer).findByText(/Delivered once to the originating agent as receipt/i)).toBeVisible();
+  });
+
+  it("requires a busy-agent policy and keeps copy and reproduction recovery after failure", async () => {
+    const unreachable = {
+      code: "acp_endpoint_unreachable",
+      message: "The originating agent ACP endpoint could not be reached.",
+      data_safety: "The immutable feedback remains saved and its revisions are still undelivered.",
+      next_step: "Reconnect the agent, retry this explicit Send, or copy the prompt and reproduce the saved round.",
+    };
+    let deliver = vi.fn();
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      const busyRoutes = (await api.listAgentRoutes()).map((route) =>
+        route.id === "route-fixture-1" ? { ...route, status: "busy" } : route);
+      deliver = vi.fn().mockRejectedValue(unreachable);
+      return {
+        ...api,
+        listAgentRoutes: vi.fn().mockResolvedValue(busyRoutes),
+        prepareFeedbackHandoff: vi.fn(async (...args: Parameters<typeof api.prepareFeedbackHandoff>) => ({
+          ...await api.prepareFeedbackHandoff(...args),
+          route_status: "busy",
+          busy_policy_required: true,
+        })),
+        deliverFeedback: deliver,
+      };
+    });
+
+    await openPaginationReview();
+    fireEvent.click(screen.getByRole("button", { name: "Formal feedback" }));
+    const drawer = await screen.findByRole("dialog", { name: "Formal feedback" });
+    fireEvent.click(within(drawer).getByRole("button", { name: "Prepare immutable prompt" }));
+    const queue = await within(drawer).findByRole("radio", { name: "Queue until idle" });
+    const interrupt = within(drawer).getByRole("radio", { name: "Interrupt current turn" });
+    expect(queue).toBeChecked();
+    expect(interrupt).not.toBeChecked();
+    fireEvent.click(interrupt);
+    expect(interrupt).toBeChecked();
+    fireEvent.click(within(drawer).getByRole("button", { name: "Review Send…" }));
+    const confirmation = await screen.findByRole("alertdialog", {
+      name: "Send formal feedback to originating agent?",
+    });
+    fireEvent.click(within(confirmation).getByRole("button", { name: "Confirm Send" }));
+
+    await waitFor(() => expect(deliver).toHaveBeenCalledTimes(1));
+    expect(deliver.mock.calls[0][3]).toBe("interrupt");
+    const failure = await within(confirmation).findByRole("alert");
+    expect(failure).toHaveTextContent(unreachable.message);
+    expect(failure).toHaveTextContent(unreachable.data_safety);
+    expect(failure).toHaveTextContent(
+      "Choose Copy feedback prompt and submit it manually to the intended agent.",
+    );
+    expect(within(confirmation).getByRole("button", { name: "Copy immutable prompt" })).toBeVisible();
+    expect(within(confirmation).getByRole("button", { name: "Preview reproduction…" })).toBeVisible();
+  });
+
   it("opens cached GitHub review state without an implicit refresh, then refreshes only on click", async () => {
     let cachedRound = vi.fn();
     let refreshComments = vi.fn();
@@ -326,12 +501,13 @@ describe("fixture-backed reviewer recovery", () => {
     expect(screen.getByText(/Nice fix — can we also cover the "revoked" case/i)).toBeVisible();
   });
 
-  it("keeps the immutable diff visible and retries a failed Viewed update", async () => {
+  it("renders the complete recovery contract, keeps the diff visible, and retries explicitly", async () => {
     let setViewed = vi.fn();
+    const staleError = { ...recoverableError, code: "github_round_stale" };
     vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
       const api = await importOriginal<typeof import("../src/api.fixture")>();
       setViewed = vi.fn()
-        .mockRejectedValueOnce(recoverableError)
+        .mockRejectedValueOnce(staleError)
         .mockImplementation(api.setFileViewed);
       return { ...api, setFileViewed: setViewed };
     });
@@ -342,7 +518,12 @@ describe("fixture-backed reviewer recovery", () => {
     if (!markViewed) throw new Error("The selected file did not expose its Viewed action.");
     fireEvent.click(markViewed);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(recoverableError.data_safety);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(staleError.data_safety);
+    expect(alert).toHaveTextContent("Why this matters:");
+    expect(alert).toHaveTextContent("Refresh into new round");
+    expect(alert).toHaveTextContent("Diagnostics:");
+    expect(alert).toHaveTextContent("Back:");
     expect(screen.getAllByRole("region", { name: "Code diff" }).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "Dismiss" })).toBeVisible();
 
@@ -648,6 +829,17 @@ describe("fixture-backed reviewer recovery", () => {
     fireEvent.click(within(publishDialog).getByRole("button", { name: "Publish APPROVE" }));
     expect(await within(publishDialog).findByText(/Published once as GitHub review/i)).toBeVisible();
     expect(within(publishDialog).getByText("1 threaded reply published.")).toBeVisible();
+  });
+
+  it("keeps publish unreachable without a decision and explains the one enabling action", async () => {
+    await openReview(githubTitle);
+    const publish = screen.getByRole("button", { name: "Publish review" });
+    await waitFor(() => expect(publish).toBeDisabled());
+    expect(publish).toHaveAttribute(
+      "title",
+      "Record Approve or Request changes before publishing",
+    );
+    expect(screen.queryByRole("alertdialog", { name: "Publish GitHub review?" })).not.toBeInTheDocument();
   });
 
   it("does not let a late decision from a replaced GitHub round enable publishing", async () => {

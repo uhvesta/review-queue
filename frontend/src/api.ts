@@ -21,6 +21,8 @@ import type {
   DeviceFlowPublicState,
   DeviceFlowPollResult,
   AgentRoute,
+  AcpDeliveryPolicy,
+  AcpDeliveryReceipt,
   PreparedFeedbackPrompt,
   UpdateCheck,
   MachineEndpoint,
@@ -317,6 +319,26 @@ export async function confirmManualFeedbackSubmission(deliveryId: string): Promi
       confirmation: {
         confirmed: true,
         token: `manual-submit:${deliveryId}`,
+      },
+    },
+  });
+}
+
+export async function deliverFeedback(
+  roundId: string,
+  deliveryId: string,
+  routeId: string,
+  policy: AcpDeliveryPolicy,
+): Promise<AcpDeliveryReceipt> {
+  return invoke("deliver_feedback", {
+    request: {
+      roundId,
+      deliveryId,
+      routeId,
+      policy,
+      confirmation: {
+        confirmed: true,
+        token: `acp-deliver:${deliveryId}`,
       },
     },
   });

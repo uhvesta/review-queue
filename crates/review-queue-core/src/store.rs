@@ -253,6 +253,13 @@ impl Store {
             "UPDATE conversations SET session_state='history_only', history_only_reason=COALESCE(history_only_reason, 'The app restarted; the Copilot provider session was not resumed.'), provider_session_label=NULL WHERE session_state='can_continue' AND provider_session_label IS NOT NULL",
             [],
         )?;
+        // An in-process ACP send can never be resumed after process death.
+        // Preserve its immutable idempotency key and make an explicit retry
+        // possible instead of silently delivering on launch.
+        self.conn.execute(
+            "UPDATE deliveries SET outcome='acp_interrupted' WHERE delivered_at IS NULL AND outcome='acp_sending'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -1711,8 +1718,8 @@ impl Store {
         Ok(())
     }
 
-    /// Persists an immutable, idempotent manual-handoff payload. It contains
-    /// the current decision and only revisions that have not already been
+    /// Persists an immutable, idempotent delivery payload. It contains the
+    /// current decision and only revisions not already acknowledged by ACP or
     /// confirmed as manually submitted.
     pub fn prepare_delivery(&mut self, round_id: &str) -> Result<DurableDelivery, DomainError> {
         let round = self.round(round_id)?;
@@ -1754,7 +1761,8 @@ impl Store {
         Ok(delivery)
     }
 
-    /// Returns the latest immutable delivery awaiting manual confirmation.
+    /// Returns the latest immutable delivery awaiting ACP acknowledgement or
+    /// manual fallback confirmation.
     ///
     /// Early preview builds could persist a decision-only delivery. Such an
     /// object can never form a valid feedback prompt, so it is retired
@@ -1809,11 +1817,105 @@ impl Store {
             .map_err(db_error)
     }
 
+    /// Claims one pending delivery for the explicit desktop Send action.
+    /// Concurrent clicks cannot start a second transport call, while a failed
+    /// or restart-interrupted attempt can be retried with the same key.
+    pub fn claim_delivery_attempt(&self, delivery_id: &str) -> Result<(), DomainError> {
+        let (round_id, delivered_at, outcome): (String, Option<String>, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT round_id,delivered_at,outcome FROM deliveries WHERE id=?1",
+                params![delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(db_error)?
+            .ok_or_else(|| delivery_not_found("Choose a delivery from the saved history."))?;
+        ensure_mutable(&self.round(&round_id)?)?;
+        if delivered_at.is_some() {
+            return Err(DomainError::actionable(
+                "That formal feedback delivery is already complete.",
+                "No duplicate delivery was started.",
+                "Refresh Formal feedback to inspect its saved receipt.",
+                "delivery_already_completed",
+            ));
+        }
+        if outcome.as_deref() == Some("acp_sending") {
+            return Err(DomainError::actionable(
+                "That formal feedback delivery is already in progress.",
+                "No duplicate delivery was started.",
+                "Wait for the current Send to finish, then refresh Formal feedback.",
+                "delivery_in_progress",
+            ));
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE deliveries SET outcome='acp_sending'
+                 WHERE id=?1 AND delivered_at IS NULL
+                   AND COALESCE(outcome,'') != 'acp_sending'",
+                params![delivery_id],
+            )
+            .map_err(db_error)?;
+        if changed != 1 {
+            return Err(DomainError::actionable(
+                "That formal feedback delivery could not be claimed.",
+                "No duplicate delivery was started and the immutable payload remains saved.",
+                "Refresh Formal feedback, then retry the explicit Send.",
+                "delivery_claim_failed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Persists a token-free failure vocabulary without marking any formal
+    /// revision delivered. Retry therefore reuses the same immutable payload
+    /// and idempotency key.
+    pub fn record_delivery_attempt_failure(
+        &self,
+        delivery_id: &str,
+        outcome: &str,
+    ) -> Result<(), DomainError> {
+        validate_delivery_outcome(outcome, false)?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE deliveries SET outcome=?1 WHERE id=?2 AND delivered_at IS NULL",
+                params![outcome, delivery_id],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Err(delivery_not_found(
+                "Refresh Formal feedback and inspect its saved delivery history.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Completes a confirmed desktop ACP delivery and advances exactly the
+    /// immutable formal revisions carried by its payload.
+    pub fn mark_delivery_acp_delivered(
+        &mut self,
+        delivery_id: &str,
+        outcome: &str,
+    ) -> Result<(), DomainError> {
+        validate_delivery_outcome(outcome, true)?;
+        self.mark_delivery_completed(delivery_id, outcome)
+    }
+
     /// Records the user's explicit confirmation that they manually submitted
     /// the prepared prompt. This never communicates with an agent.
     pub fn mark_delivery_manually_submitted(
         &mut self,
         delivery_id: &str,
+    ) -> Result<(), DomainError> {
+        self.mark_delivery_completed(delivery_id, "manual_submission_confirmed")
+    }
+
+    fn mark_delivery_completed(
+        &mut self,
+        delivery_id: &str,
+        outcome: &str,
     ) -> Result<(), DomainError> {
         let round_id = self
             .conn
@@ -1824,14 +1926,7 @@ impl Store {
             )
             .optional()
             .map_err(db_error)?
-            .ok_or_else(|| {
-                DomainError::actionable(
-                    "That feedback delivery no longer exists.",
-                    "No comment state changed.",
-                    "Choose a delivery from the saved handoff history.",
-                    "delivery_not_found",
-                )
-            })?;
+            .ok_or_else(|| delivery_not_found("Choose a delivery from the saved history."))?;
         ensure_mutable(&self.round(&round_id)?)?;
         let tx = self.conn.transaction().map_err(db_error)?;
         let (payload_json, delivered_at): (String, Option<String>) = tx
@@ -1843,12 +1938,7 @@ impl Store {
             .optional()
             .map_err(db_error)?
             .ok_or_else(|| {
-                DomainError::actionable(
-                    "That feedback delivery no longer exists.",
-                    "No comment state changed.",
-                    "Create a new delivery from the formal feedback drawer.",
-                    "delivery_not_found",
-                )
+                delivery_not_found("Create a new delivery from the Formal feedback drawer.")
             })?;
         if delivered_at.is_some() {
             tx.commit().map_err(db_error)?;
@@ -1860,9 +1950,9 @@ impl Store {
         }
         tx.execute(
             "UPDATE deliveries
-             SET delivered_at = ?1, outcome='manual_submission_confirmed'
-             WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), delivery_id],
+             SET delivered_at = ?1, outcome=?2
+             WHERE id = ?3",
+            params![Utc::now().to_rfc3339(), outcome, delivery_id],
         )
         .map_err(db_error)?;
         tx.commit().map_err(db_error)
@@ -2454,6 +2544,38 @@ fn db_error(error: impl std::fmt::Display) -> DomainError {
         "Retry the action; if it persists, open redacted diagnostics.",
         "database_error",
     )
+}
+
+fn delivery_not_found(next_step: &str) -> DomainError {
+    DomainError::actionable(
+        "That formal feedback delivery no longer exists.",
+        "No comment revision or delivery state changed.",
+        next_step,
+        "delivery_not_found",
+    )
+}
+
+fn validate_delivery_outcome(outcome: &str, completed: bool) -> Result<(), DomainError> {
+    let valid = if completed {
+        matches!(
+            outcome,
+            "acp_delivered_queue" | "acp_delivered_interrupt" | "manual_submission_confirmed"
+        )
+    } else {
+        matches!(
+            outcome,
+            "acp_unreachable" | "acp_interrupted" | "acp_rejected" | "acp_acknowledgement_invalid"
+        )
+    };
+    if !valid {
+        return Err(DomainError::actionable(
+            "The formal feedback outcome was not recognized.",
+            "The immutable delivery remains saved and no comment revision changed.",
+            "Refresh Formal feedback and retry the explicit action.",
+            "delivery_outcome_invalid",
+        ));
+    }
+    Ok(())
 }
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -3501,6 +3623,73 @@ mod tests {
         assert_eq!(
             delivered[0].outcome.as_deref(),
             Some("manual_submission_confirmed")
+        );
+    }
+
+    #[test]
+    fn acp_attempt_state_survives_failure_and_restart_without_replay() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let (round_id, delivery_id, idempotency_key) = {
+            let mut store = Store::open(database.path()).unwrap();
+            let mut input = submission("acp-restart", "a");
+            input.collection = Collection::Github;
+            let round = match store.submit(input).unwrap() {
+                SubmissionResult::Created(round) => round,
+                _ => unreachable!(),
+            };
+            store.request_changes(&round.id).unwrap();
+            store
+                .create_formal_comment(
+                    &round.id,
+                    "round",
+                    "Keep this exact revision pending.",
+                    None,
+                )
+                .unwrap();
+            let delivery = store.prepare_delivery(&round.id).unwrap();
+            store.claim_delivery_attempt(&delivery.id).unwrap();
+            assert_eq!(
+                store
+                    .claim_delivery_attempt(&delivery.id)
+                    .unwrap_err()
+                    .error
+                    .code,
+                "delivery_in_progress"
+            );
+            (round.id, delivery.id, delivery.idempotency_key)
+        };
+
+        let mut reopened = Store::open(database.path()).unwrap();
+        let interrupted = reopened.delivery_history(&round_id).unwrap();
+        assert_eq!(interrupted[0].outcome.as_deref(), Some("acp_interrupted"));
+        let retry = reopened.prepare_delivery(&round_id).unwrap();
+        assert_eq!(retry.id, delivery_id);
+        assert_eq!(retry.idempotency_key, idempotency_key);
+        reopened.claim_delivery_attempt(&delivery_id).unwrap();
+        reopened
+            .record_delivery_attempt_failure(&delivery_id, "acp_unreachable")
+            .unwrap();
+        assert_eq!(
+            reopened.delivery_history(&round_id).unwrap()[0]
+                .outcome
+                .as_deref(),
+            Some("acp_unreachable")
+        );
+        assert_eq!(
+            reopened.formal_comments(&round_id).unwrap()[0].delivered_revision,
+            None
+        );
+
+        reopened.claim_delivery_attempt(&delivery_id).unwrap();
+        reopened
+            .mark_delivery_acp_delivered(&delivery_id, "acp_delivered_queue")
+            .unwrap();
+        let completed = reopened.delivery_history(&round_id).unwrap();
+        assert!(completed[0].delivered_at.is_some());
+        assert_eq!(completed[0].outcome.as_deref(), Some("acp_delivered_queue"));
+        assert_eq!(
+            reopened.formal_comments(&round_id).unwrap()[0].delivered_revision,
+            Some(1)
         );
     }
 

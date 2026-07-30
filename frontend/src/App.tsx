@@ -51,6 +51,7 @@ import {
   setFileViewed,
   setPublicClientId,
   prepareFeedbackHandoff,
+  deliverFeedback,
   confirmManualFeedbackSubmission,
   startDeviceFlow,
   submitLocal,
@@ -73,6 +74,7 @@ import type {
   AskTurn,
   Anchor,
   AgentRoute,
+  AcpDeliveryPolicy,
   CommandError,
   ConnectionHealth,
   DeviceFlowPublicState,
@@ -108,6 +110,7 @@ import {
   diffLineCounts,
   repositoryFileKey as fileKey,
 } from "./RepositoryFileTree";
+import { recoveryCopyFor } from "./recoveryCopy";
 import { applicationVersion } from "./version";
 
 type Modal = "submit" | "github" | "details" | "reproduce" | "settings" | "machine" | null;
@@ -2462,6 +2465,8 @@ function FormalFeedbackDrawer({
   const [routeId, setRouteId] = useState(round.origin_route_id ?? "");
   const [decision, setDecision] = useState<"approve" | "request_changes" | null>(null);
   const [prepared, setPrepared] = useState<PreparedFeedbackPrompt | null>(null);
+  const [deliveryPolicy, setDeliveryPolicy] = useState<AcpDeliveryPolicy>("queue");
+  const [reviewingSend, setReviewingSend] = useState(false);
   const [working, setWorking] = useState(false);
   const [deliveryMessage, setDeliveryMessage] = useState("");
   const dialog = useDialogFocus(onClose);
@@ -2530,6 +2535,8 @@ function FormalFeedbackDrawer({
         routeId || null,
       ));
       setDeliveryMessage("");
+      setDeliveryPolicy("queue");
+      setReviewingSend(false);
       setCopied(false);
       setError(null);
     } catch (problem) {
@@ -2556,6 +2563,31 @@ function FormalFeedbackDrawer({
     }
   };
 
+  const sendPrepared = async () => {
+    if (readOnly || !prepared?.delivery_available || !routeId) return;
+    setWorking(true);
+    try {
+      const receipt = await deliverFeedback(
+        round.id,
+        prepared.delivery_id,
+        routeId,
+        deliveryPolicy,
+      );
+      setDeliveryMessage(
+        `Delivered once to the originating agent as receipt ${receipt.receipt_id}.`,
+      );
+      setReviewingSend(false);
+      setPrepared(null);
+      setCopied(false);
+      await refreshComments();
+      setError(null);
+    } catch (problem) {
+      setError(toCommandError(problem));
+    } finally {
+      setWorking(false);
+    }
+  };
+
   const prepareDisabledReason = !comments.length
     ? "Add at least one formal comment before preparing feedback."
     : !decision
@@ -2564,6 +2596,7 @@ function FormalFeedbackDrawer({
   const selectedRoute = routes.find((route) => route.id === routeId) ?? null;
 
   return (
+    <>
     <div className="drawer-backdrop">
       <aside {...dialog} className="feedback" role="dialog" aria-modal="true" aria-labelledby="feedback-title">
         <header><h2 id="feedback-title">Formal feedback</h2><button onClick={onClose} aria-label="Close formal feedback">×</button></header>
@@ -2574,13 +2607,13 @@ function FormalFeedbackDrawer({
         {readOnly && <p className="notice">{readOnlyReason || "This historical round is read-only."} Saved comments and handoffs remain available to inspect and copy.</p>}
         <label>
           Originating session
-          <select value={routeId} onChange={(event) => { setRouteId(event.target.value); setPrepared(null); setCopied(false); }}>
+          <select value={routeId} onChange={(event) => { setRouteId(event.target.value); setPrepared(null); setReviewingSend(false); setCopied(false); }}>
             <option value="">Closed or unavailable — reproduce first</option>
             {routes.map((route) => <option key={route.id} value={route.id}>{route.agent_id} · {route.status} · {route.session_id ?? "no session"}</option>)}
           </select>
         </label>
         {selectedRoute && <AgentRouteDetails route={selectedRoute} />}
-        <p className="safe-copy">Route status is informational. Review Queue never queues, interrupts, types, or injects a prompt into this session.</p>
+        <p className="safe-copy">Review Queue contacts this route only after an explicit Send confirmation. Copy and reproduction remain available without contacting the agent.</p>
         {loading && <p>Loading saved drafts…</p>}
         {comments.map((comment) => (
           <article className="formal-comment" key={comment.id}>
@@ -2650,15 +2683,15 @@ function FormalFeedbackDrawer({
           </form>
         )}
         <section className="delivery-history">
-          <h3>Manual handoff history</h3>
-          {history.length === 0 && <p className="muted">No immutable handoff has been prepared.</p>}
+          <h3>Delivery history</h3>
+          {history.length === 0 && <p className="muted">No immutable delivery has been prepared.</p>}
           {history.map((entry) => (
             <article key={entry.delivery.id}>
               <p>
                 <b>{entry.delivery.payload.decision.replace("_", " ")}</b> · {entry.delivery.payload.comments.length} comment revisions
               </p>
               <small>
-                Prepared {new Date(entry.created_at).toLocaleString()} · {entry.outcome?.replaceAll("_", " ") ?? "awaiting manual confirmation"}
+                Prepared {new Date(entry.created_at).toLocaleString()} · {entry.outcome?.replaceAll("_", " ") ?? "awaiting confirmed delivery"}
                 {entry.delivered_at ? ` · confirmed ${new Date(entry.delivered_at).toLocaleString()}` : ""}
               </small>
               <button onClick={() => void copyText(feedbackPromptFromHistory(entry), entry.delivery.id)}>
@@ -2678,6 +2711,31 @@ function FormalFeedbackDrawer({
             <p><b>Immutable prepared prompt</b> · <code>{prepared.idempotency_key}</code></p>
             <textarea readOnly value={prepared.prompt} aria-label="Immutable prepared feedback prompt" />
             <p className="safe-copy">{prepared.guidance}</p>
+            {prepared.busy_policy_required && (
+              <fieldset>
+                <legend>Busy agent policy</legend>
+                <label>
+                  <input
+                    type="radio"
+                    name="acp-delivery-policy"
+                    value="queue"
+                    checked={deliveryPolicy === "queue"}
+                    onChange={() => setDeliveryPolicy("queue")}
+                  />
+                  Queue until idle
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="acp-delivery-policy"
+                    value="interrupt"
+                    checked={deliveryPolicy === "interrupt"}
+                    onChange={() => setDeliveryPolicy("interrupt")}
+                  />
+                  Interrupt current turn
+                </label>
+              </fieldset>
+            )}
             {prepared.reproduction_required && (
               <button disabled={readOnly} onClick={onReproduce}>Preview and confirm reproduction…</button>
             )}
@@ -2695,15 +2753,41 @@ function FormalFeedbackDrawer({
           ) : (
             <>
               <button disabled={working} onClick={() => void copyText(prepared.prompt)}>{copied ? "Copied" : "Copy prepared prompt"}</button>
-              <button disabled={working || readOnly} title={readOnly ? readOnlyReason : ""} onClick={() => void confirmSubmitted(prepared.delivery_id)}>
-                {working ? "Recording…" : "I submitted it manually"}
-              </button>
+              {prepared.delivery_available ? (
+                <button
+                  className="primary"
+                  disabled={working || readOnly}
+                  title={readOnly ? readOnlyReason : ""}
+                  onClick={() => { setError(null); setReviewingSend(true); }}
+                >
+                  Review Send…
+                </button>
+              ) : (
+                <button disabled={working || readOnly} title={readOnly ? readOnlyReason : ""} onClick={() => void confirmSubmitted(prepared.delivery_id)}>
+                  {working ? "Recording…" : "I submitted it manually"}
+                </button>
+              )}
             </>
           )}
         </div>
-        <p className="safe-copy">{deliveryMessage || "Preparing and copying do not contact an agent. Only you can submit the prompt."}</p>
+        <p className="safe-copy">{deliveryMessage || "Preparing, reviewing, copying, and reproducing do not contact an agent. Only Confirm Send performs one ACP delivery attempt."}</p>
       </aside>
     </div>
+    {reviewingSend && prepared && selectedRoute && (
+      <AcpDeliveryDialog
+        prepared={prepared}
+        route={selectedRoute}
+        policy={deliveryPolicy}
+        commentCount={prepared.comment_count}
+        working={working}
+        error={error}
+        onCancel={() => { if (!working) setReviewingSend(false); }}
+        onConfirm={sendPrepared}
+        onCopy={() => copyText(prepared.prompt)}
+        onReproduce={onReproduce}
+      />
+    )}
+    </>
   );
 }
 
@@ -3760,7 +3844,9 @@ function SettingsDialog({
         acceptHealth(await retryConnection());
         setError({
           code: `device_flow_${result.phase}`,
-          message: result.message,
+          message: result.phase === "account_mismatch" && result.account
+            ? `${result.message} GitHub approved the public account ${result.account}.`
+            : result.message,
           data_safety: "No review data changed and no credential was retained for this attempt.",
           next_step: result.phase === "account_mismatch"
             ? "Disconnect the capability and start a new flow with the intended GitHub account."
@@ -4049,6 +4135,61 @@ function GithubPublishDialog({
   );
 }
 
+function AcpDeliveryDialog({
+  prepared,
+  route,
+  policy,
+  commentCount,
+  working,
+  error,
+  onCancel,
+  onConfirm,
+  onCopy,
+  onReproduce,
+}: {
+  prepared: PreparedFeedbackPrompt;
+  route: AgentRoute;
+  policy: AcpDeliveryPolicy;
+  commentCount: number;
+  working: boolean;
+  error: CommandError | null;
+  onCancel: () => void;
+  onConfirm: () => Promise<void>;
+  onCopy: () => Promise<void>;
+  onReproduce: () => void;
+}) {
+  const dialog = useDialogFocus(onCancel);
+  return (
+    <div className="modal-backdrop">
+      <section {...dialog} className="modal confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="acp-delivery-title">
+        <header>
+          <h2 id="acp-delivery-title">Send formal feedback to originating agent?</h2>
+          <button aria-label="Close" disabled={working} onClick={onCancel}>×</button>
+        </header>
+        <div className="detail-grid">
+          <p><b>Target</b> {route.agent_id} · session <code>{route.session_id}</code> · {route.status}</p>
+          <p><b>Delivery</b> {commentCount} undelivered comment revision{commentCount === 1 ? "" : "s"} · {policy === "interrupt" ? "Interrupt current turn" : "Queue until idle"}</p>
+          <p><b>Idempotency key</b> <code>{prepared.idempotency_key}</code></p>
+          <p className="safe-copy">Confirm Send performs one desktop-only ACP request. Opening, reviewing, copying, canceling, and restarting never deliver. The CLI socket cannot send feedback.</p>
+          {error && <ErrorPanel error={error} />}
+          {error && (
+            <div className="inline-actions">
+              <button disabled={working} onClick={() => void onCopy()}>Copy immutable prompt</button>
+              <button disabled={working} onClick={onReproduce}>Preview reproduction…</button>
+            </div>
+          )}
+          <div className="dialog-actions">
+            <button disabled={working} onClick={onCancel} autoFocus>Cancel</button>
+            <button className="primary" disabled={working} onClick={() => void onConfirm()}>
+              {working ? "Sending…" : "Confirm Send"}
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function PurgeDialog({
   intent,
   onCancel,
@@ -4075,9 +4216,29 @@ function PurgeDialog({
 }
 
 function ErrorPanel({ error, onRetry }: { error: CommandError; onRetry?: () => Promise<void> }) {
+  const contract = recoveryCopyFor(error.code);
+  const whatHappened = contract?.what_happened ?? error.message;
+  const whyItMatters = error.why_it_matters ?? contract?.why_it_matters;
+  const dataSafety = contract?.data_safety ?? error.data_safety;
+  const diagnosticsRoute = error.diagnostics_route ?? contract?.diagnostics_route;
+  const cancelRoute = error.cancel_route ?? contract?.cancel_route;
+  const nextAction = contract?.next_action ?? error.next_step;
+  const backendDetail = contract && error.message.trim() !== whatHappened.trim()
+    ? error.message
+    : null;
+  const backendSafetyDetail = contract && error.data_safety.trim() !== dataSafety.trim()
+    ? error.data_safety
+    : null;
   return (
     <section className="error-panel" role="alert">
-      <b>{error.message}</b><p>{error.data_safety}</p><p>Next: {error.next_step}</p>
+      <b>{whatHappened}</b>
+      {backendDetail && <p>Details: {backendDetail}</p>}
+      {whyItMatters && <p>Why this matters: {whyItMatters}</p>}
+      <p>Data safety: <span>{dataSafety}</span></p>
+      {backendSafetyDetail && <p>Operation safety detail: {backendSafetyDetail}</p>}
+      <p>Next: {nextAction}</p>
+      {diagnosticsRoute && <p>Diagnostics: {diagnosticsRoute}</p>}
+      {cancelRoute && <p>Back: {cancelRoute}</p>}
       {onRetry && <button onClick={() => void onRetry()}>Retry</button>}
     </section>
   );
@@ -4288,6 +4449,9 @@ function toCommandError(problem: unknown): CommandError {
         message: candidate.message,
         data_safety: dataSafety,
         next_step: nextStep,
+        why_it_matters: candidate.why_it_matters,
+        diagnostics_route: candidate.diagnostics_route,
+        cancel_route: candidate.cancel_route,
       };
     }
   }

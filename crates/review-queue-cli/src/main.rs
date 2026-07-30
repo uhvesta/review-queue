@@ -2,7 +2,7 @@ use std::{
     env,
     path::PathBuf,
     process::ExitCode,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::Context;
@@ -33,8 +33,73 @@ struct CliError {
     exit_code: u8,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RecoveryCopyContract {
+    schema_version: u32,
+    contract: String,
+    entries: Vec<RecoveryCopy>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RecoveryCopy {
+    state: String,
+    codes: Vec<String>,
+    what_happened: String,
+    why_it_matters: String,
+    data_safety: String,
+    next_action: String,
+    diagnostics_route: String,
+    cancel_route: String,
+}
+
+fn recovery_copy_contract() -> &'static RecoveryCopyContract {
+    static CONTRACT: OnceLock<RecoveryCopyContract> = OnceLock::new();
+    CONTRACT.get_or_init(|| {
+        let contract: RecoveryCopyContract = serde_json::from_str(include_str!(
+            "../../../frontend/src/recovery-copy-contract.json"
+        ))
+        .expect("the checked-in Rev3 recovery-copy contract must be valid JSON");
+        assert_eq!(contract.schema_version, 3);
+        assert_eq!(contract.contract, "rev3_section_8_error_and_recovery");
+        for entry in &contract.entries {
+            assert!(!entry.state.trim().is_empty());
+            assert!(!entry.codes.is_empty());
+            assert!(!entry.what_happened.trim().is_empty());
+            assert!(!entry.why_it_matters.trim().is_empty());
+            assert!(!entry.data_safety.trim().is_empty());
+            assert!(!entry.next_action.trim().is_empty());
+            assert!(!entry.diagnostics_route.trim().is_empty());
+            assert!(!entry.cancel_route.trim().is_empty());
+        }
+        contract
+    })
+}
+
+fn recovery_copy_for(code: &str) -> Option<&'static RecoveryCopy> {
+    recovery_copy_contract()
+        .entries
+        .iter()
+        .find(|entry| entry.codes.iter().any(|candidate| candidate == code))
+}
+
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(copy) = recovery_copy_for(&self.code) {
+            write!(
+                f,
+                "{} Why this matters: {} Data safety: {} Next: {} Diagnostics: {} Back: {}",
+                copy.what_happened,
+                copy.why_it_matters,
+                copy.data_safety,
+                copy.next_action,
+                copy.diagnostics_route,
+                copy.cancel_route,
+            )?;
+            if self.what_happened.trim() != copy.what_happened.trim() {
+                write!(f, " Details: {}", self.what_happened)?;
+            }
+            return Ok(());
+        }
         write!(
             f,
             "{} {} Next: {}",
@@ -80,13 +145,53 @@ fn main() -> ExitCode {
 }
 
 fn cli_error_json(error: &CliError) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "status": "error",
         "code": error.code,
         "what_happened": error.what_happened,
         "data_safety": error.data_safety,
         "next_step": error.next_step,
-    })
+    });
+    if let Some(copy) = recovery_copy_for(&error.code) {
+        let object = value
+            .as_object_mut()
+            .expect("CLI error JSON is always an object");
+        object.insert(
+            "what_happened".into(),
+            serde_json::Value::String(copy.what_happened.clone()),
+        );
+        object.insert(
+            "why_it_matters".into(),
+            serde_json::Value::String(copy.why_it_matters.clone()),
+        );
+        object.insert(
+            "recovery_state".into(),
+            serde_json::Value::String(copy.state.clone()),
+        );
+        object.insert(
+            "data_safety".into(),
+            serde_json::Value::String(copy.data_safety.clone()),
+        );
+        object.insert(
+            "next_step".into(),
+            serde_json::Value::String(copy.next_action.clone()),
+        );
+        object.insert(
+            "diagnostics_route".into(),
+            serde_json::Value::String(copy.diagnostics_route.clone()),
+        );
+        object.insert(
+            "cancel_route".into(),
+            serde_json::Value::String(copy.cancel_route.clone()),
+        );
+        if error.what_happened.trim() != copy.what_happened.trim() {
+            object.insert(
+                "detail".into(),
+                serde_json::Value::String(error.what_happened.clone()),
+            );
+        }
+    }
+    value
 }
 
 fn run(args: Vec<String>) -> anyhow::Result<()> {
@@ -124,7 +229,8 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
         }
         "machine" => match args.get(1).map(String::as_str) {
             Some("add") => {
-                let config = machine_config_from_args(&args)?;
+                let config =
+                    machine_config_from_args(&args).map_err(invalid_machine_config_error)?;
                 print_response(call(SocketRequest::AddMachine { config })?, json)
             }
             Some("ls") => print_response(call(SocketRequest::ListMachines)?, json),
@@ -511,6 +617,20 @@ fn submit_transport_error(error: anyhow::Error) -> anyhow::Error {
         Err(error) => error,
     }
 }
+
+fn invalid_machine_config_error(error: anyhow::Error) -> anyhow::Error {
+    CliError {
+        code: "invalid_machine_config".into(),
+        what_happened: format!("The machine configuration is invalid: {error}."),
+        data_safety:
+            "No machine configuration was saved, no tunnel started, and no credential or review data changed."
+                .into(),
+        next_step: "Correct the named machine field in the error, then add the machine again."
+            .into(),
+        exit_code: INVALID_INPUT,
+    }
+    .into()
+}
 fn print_response(response: SocketResponse, json: bool) -> anyhow::Result<()> {
     match response {
         SocketResponse::Ok { data } => {
@@ -544,7 +664,9 @@ fn exit_code_for(code: &str) -> u8 {
         && matches!(
             code,
             "pr_read_required"
+                | "pr_read_capability_required"
                 | "pr_publish_required"
+                | "pr_publish_capability_required"
                 | "copilot_connection_required"
                 | "capability_required"
         )
@@ -637,6 +759,10 @@ mod tests {
     #[test]
     fn exit_codes_distinguish_capability_conflict_and_input_failures() {
         assert_eq!(exit_code_for("pr_read_required"), CAPABILITY_REQUIRED);
+        assert_eq!(
+            exit_code_for("pr_read_capability_required"),
+            CAPABILITY_REQUIRED
+        );
         assert_eq!(exit_code_for("workspace_changed_during_capture"), CONFLICT);
         assert_eq!(exit_code_for("topic_required"), INVALID_INPUT);
     }
@@ -789,6 +915,91 @@ mod tests {
             4,
             "representative recovery categories use distinct exit codes"
         );
+    }
+
+    #[test]
+    fn section_8_cli_failures_use_the_shared_complete_recovery_contract() {
+        let error = CliError {
+            code: "github_publish_rejected".into(),
+            what_happened: "GitHub rejected this publish attempt.".into(),
+            data_safety: "The formal drafts remain saved.".into(),
+            next_step: "This backend copy is intentionally replaced by the contract.".into(),
+            exit_code: INVALID_INPUT,
+        };
+        let json = cli_error_json(&error);
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["code"], "github_publish_rejected");
+        assert_eq!(json["recovery_state"], "publish_rejected");
+        assert_eq!(
+            json["next_step"],
+            "Refresh the pull-request head and reconnect PR publish before preparing one new publish attempt."
+        );
+        for field in [
+            "what_happened",
+            "why_it_matters",
+            "recovery_state",
+            "data_safety",
+            "next_step",
+            "diagnostics_route",
+            "cancel_route",
+        ] {
+            assert!(
+                !json[field].as_str().unwrap_or_default().trim().is_empty(),
+                "{field} must be nonempty"
+            );
+        }
+        let terminal = error.to_string();
+        assert!(terminal.contains("Why this matters:"));
+        assert!(terminal.contains("Diagnostics:"));
+        assert!(terminal.contains("Back:"));
+    }
+
+    #[test]
+    fn rev3_cli_json_snapshot_covers_exactly_all_18_recovery_states() {
+        let expected_states = [
+            "keychain_unavailable",
+            "device_code_expired_or_cancelled",
+            "wrong_github_account",
+            "copilot_unavailable",
+            "model_unavailable",
+            "network_unavailable",
+            "pr_stale",
+            "snapshot_unavailable",
+            "acp_busy_or_disconnected",
+            "remote_tunnel_failed",
+            "publish_rejected",
+            "workspace_changed_during_capture",
+            "submission_commit_failed",
+            "publish_without_decision_unreachable",
+            "upstream_comment_refresh_failed",
+            "cli_app_or_data_plane_unreachable",
+            "cli_required_capability_not_connected",
+            "invalid_machine_config",
+        ];
+        assert_eq!(
+            recovery_copy_contract()
+                .entries
+                .iter()
+                .map(|entry| entry.state.as_str())
+                .collect::<Vec<_>>(),
+            expected_states
+        );
+        for entry in &recovery_copy_contract().entries {
+            let error = CliError {
+                code: entry.codes[0].clone(),
+                what_happened: entry.what_happened.clone(),
+                data_safety: entry.data_safety.clone(),
+                next_step: entry.next_action.clone(),
+                exit_code: exit_code_for(&entry.codes[0]),
+            };
+            let json = cli_error_json(&error);
+            assert_eq!(json["recovery_state"], entry.state);
+            assert_eq!(json["why_it_matters"], entry.why_it_matters);
+            assert_eq!(json["data_safety"], entry.data_safety);
+            assert_eq!(json["next_step"], entry.next_action);
+            assert_eq!(json["diagnostics_route"], entry.diagnostics_route);
+            assert_eq!(json["cancel_route"], entry.cancel_route);
+        }
     }
 
     #[test]

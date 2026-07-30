@@ -4,10 +4,12 @@
 //! keychain access, remote adapters, and filesystem capture belong on this
 //! side of the boundary; the `review-queue-core` crate remains token-free.
 
+mod acp_acceptance;
 mod commands;
 mod copilot_desktop;
 mod diagnostics;
 mod github_desktop;
+mod lifecycle_acceptance;
 mod machines;
 
 use std::{
@@ -26,7 +28,13 @@ use review_queue_desktop::{
 use tauri::Manager;
 
 fn main() {
+    if let Some(exit_code) = acp_acceptance::run_from_args() {
+        std::process::exit(exit_code);
+    }
     if let Some(exit_code) = run_packaged_keychain_acceptance_from_args() {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = lifecycle_acceptance::run_from_args() {
         std::process::exit(exit_code);
     }
     tauri::Builder::default()
@@ -88,6 +96,7 @@ fn main() {
             commands::edit_formal_comment,
             commands::delete_formal_comment,
             commands::prepare_feedback_handoff,
+            commands::deliver_feedback,
             commands::list_agent_routes,
             commands::list_feedback_delivery_history,
             commands::confirm_manual_feedback_submission,

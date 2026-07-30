@@ -6,6 +6,14 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "macos")]
+use std::{
+    net::{TcpListener, TcpStream},
+    os::unix::fs::FileTypeExt,
+    path::Path,
+    process::Child,
+};
+
 use chrono::Utc;
 use review_queue_core::{
     AgentRoute, Collection, ReviewBrief, Submission,
@@ -228,5 +236,337 @@ fn shipped_daemon_serves_machine_protocol_and_complete_reviewer_snapshot() {
     assert_eq!(
         fs::read_to_string(reproduction.join("added.txt")).unwrap(),
         "newly added\n"
+    );
+}
+
+#[cfg(target_os = "macos")]
+struct ProcessGuard {
+    child: Child,
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessGuard {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn assert_running(&mut self, label: &str) {
+        assert!(
+            self.child.try_wait().unwrap().is_none(),
+            "{label} exited before the integration completed"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_socket(path: &Path, child: &mut ProcessGuard, label: &str) {
+    for _ in 0..300 {
+        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+            return;
+        }
+        child.assert_running(label);
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("{label} did not create {}", path.display());
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_tcp(port: u16, child: &mut ProcessGuard) {
+    for _ in 0..300 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        child.assert_running("ephemeral sshd");
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("ephemeral sshd did not listen on port {port}");
+}
+
+#[cfg(target_os = "macos")]
+fn checked_command(program: &str, arguments: &[&str]) {
+    let output = Command::new(program).args(arguments).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{program} {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn system_openssh_agent_tunnel_reaches_the_shipped_daemon_without_storing_credentials() {
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime = temporary.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let repository = temporary.path().join("remote-source");
+    fs::create_dir(&repository).unwrap();
+    git(&repository, &["init"]);
+    git(
+        &repository,
+        &["config", "user.email", "review@example.test"],
+    );
+    git(&repository, &["config", "user.name", "Review SSH Test"]);
+    fs::write(repository.join("remote.txt"), "base\n").unwrap();
+    git(&repository, &["add", "remote.txt"]);
+    git(&repository, &["commit", "-m", "base"]);
+    fs::write(repository.join("remote.txt"), "through ssh tunnel\n").unwrap();
+
+    let manifest = capture(&CaptureRequest {
+        workspace_root: repository.clone(),
+        topic: "ssh-tunnel".into(),
+        brief: ReviewBrief {
+            title: "SSH tunnel fixture".into(),
+            what: "Serve a real immutable review through the shipped daemon.".into(),
+            why: "The desktop tunnel must honor the user's OpenSSH config and agent.".into(),
+            approach_alternatives: "A loopback-only transport test cannot prove SSH behavior."
+                .into(),
+            testing: "Fetch health, index, detail, and snapshot over Unix forwarding.".into(),
+        },
+        origin_route_id: None,
+        participating_repository_ids: Vec::new(),
+        preflight_token: None,
+    })
+    .unwrap();
+    let source_head = git_output(&repository, &["rev-parse", "HEAD"]);
+    let source_status = git_output(
+        &repository,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+
+    let database = temporary.path().join("remote-daemon.sqlite3");
+    let mut store = Store::open(&database).unwrap();
+    store
+        .submit(Submission {
+            collection: Collection::Local,
+            topic_identity: "ssh-tunnel-fixture".into(),
+            brief: ReviewBrief {
+                title: "SSH tunnel fixture".into(),
+                what: "Serve a real immutable review through the shipped daemon.".into(),
+                why: "The desktop tunnel must honor the user's OpenSSH config and agent.".into(),
+                approach_alternatives: "A loopback-only transport test cannot prove SSH behavior."
+                    .into(),
+                testing: "Fetch health, index, detail, and snapshot over Unix forwarding.".into(),
+            },
+            manifest,
+            origin_route: None,
+            source_metadata: None,
+            source_adapter: None,
+        })
+        .unwrap();
+    drop(store);
+
+    let remote_socket = runtime.join("remote-daemon.sock");
+    let daemon = Command::new(env!("CARGO_BIN_EXE_review-queue"))
+        .args(["daemon", "--db"])
+        .arg(&database)
+        .arg("--socket")
+        .arg(&remote_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut daemon = ProcessGuard::new(daemon);
+    wait_for_socket(&remote_socket, &mut daemon, "shipped daemon");
+
+    let host_key = temporary.path().join("sshd-host-key");
+    let user_key = temporary.path().join("ssh-agent-key");
+    checked_command(
+        "/usr/bin/ssh-keygen",
+        &[
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-f",
+            host_key.to_str().unwrap(),
+        ],
+    );
+    checked_command(
+        "/usr/bin/ssh-keygen",
+        &[
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-f",
+            user_key.to_str().unwrap(),
+        ],
+    );
+    let authorized_keys = temporary.path().join("authorized_keys");
+    fs::copy(user_key.with_extension("pub"), &authorized_keys).unwrap();
+
+    let agent_socket = runtime.join("ssh-agent.sock");
+    let agent = Command::new("/usr/bin/ssh-agent")
+        .args(["-D", "-a"])
+        .arg(&agent_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut agent = ProcessGuard::new(agent);
+    wait_for_socket(&agent_socket, &mut agent, "ephemeral ssh-agent");
+    let add_output = Command::new("/usr/bin/ssh-add")
+        .arg(&user_key)
+        .env("SSH_AUTH_SOCK", &agent_socket)
+        .output()
+        .unwrap();
+    assert!(
+        add_output.status.success(),
+        "ssh-add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let username = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let sshd_config = temporary.path().join("sshd_config");
+    fs::write(
+        &sshd_config,
+        format!(
+            "Port {port}\n\
+             ListenAddress 127.0.0.1\n\
+             AddressFamily inet\n\
+             HostKey {}\n\
+             PidFile {}\n\
+             AuthorizedKeysFile {}\n\
+             PasswordAuthentication no\n\
+             KbdInteractiveAuthentication no\n\
+             UsePAM no\n\
+             PubkeyAuthentication yes\n\
+             StrictModes no\n\
+             AllowUsers {username}\n\
+             LogLevel ERROR\n",
+            host_key.display(),
+            temporary.path().join("sshd.pid").display(),
+            authorized_keys.display(),
+        ),
+    )
+    .unwrap();
+    let sshd = Command::new("/usr/sbin/sshd")
+        .args(["-D", "-e", "-f"])
+        .arg(&sshd_config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut sshd = ProcessGuard::new(sshd);
+    wait_for_tcp(port, &mut sshd);
+
+    let host_alias = "review-queue-ephemeral";
+    let ssh_config = temporary.path().join("ssh_config");
+    fs::write(
+        &ssh_config,
+        format!(
+            "Host {host_alias}\n\
+               HostName 127.0.0.1\n\
+               Port {port}\n\
+               User {username}\n\
+               IdentityAgent {}\n\
+               BatchMode yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+               LogLevel ERROR\n",
+            agent_socket.display()
+        ),
+    )
+    .unwrap();
+
+    let local_socket = runtime.join("desktop-tunnel.sock");
+    let forward = format!("{}:{}", local_socket.display(), remote_socket.display());
+    let ssh = Command::new("/usr/bin/ssh")
+        .arg("-F")
+        .arg(&ssh_config)
+        .args(["-N", "-o", "ExitOnForwardFailure=yes", "-L"])
+        .arg(&forward)
+        .arg(host_alias)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut ssh = ProcessGuard::new(ssh);
+    wait_for_socket(&local_socket, &mut ssh, "OpenSSH Unix-socket tunnel");
+
+    let config = MachineConfig {
+        name: "Ephemeral SSH fixture".into(),
+        endpoint: MachineEndpoint::Ssh {
+            target: host_alias.into(),
+            remote_socket: remote_socket.to_string_lossy().into_owned(),
+            adapter: review_queue_core::machine::SshAdapter::SystemOpenSsh,
+        },
+        source_type: MachineSourceType::ReviewQueueDaemon,
+    };
+    let desktop_database = temporary.path().join("desktop.sqlite3");
+    let desktop_store = Store::open(&desktop_database).unwrap();
+    desktop_store.add_machine_config(&config).unwrap();
+    drop(desktop_store);
+    let persisted = fs::read(&desktop_database).unwrap();
+    let private_key = fs::read(&user_key).unwrap();
+    assert!(!bytes_contain(&persisted, &private_key));
+    assert!(!bytes_contain(
+        &persisted,
+        agent_socket.to_string_lossy().as_bytes()
+    ));
+    assert!(!bytes_contain(
+        &persisted,
+        user_key.to_string_lossy().as_bytes()
+    ));
+
+    let mut client = MachineClient::new(config, UnixSocketTransport::new(&local_socket)).unwrap();
+    let health = client.fetch_health(Utc::now()).unwrap();
+    assert_eq!(health.protocol_version, MACHINE_PROTOCOL_VERSION);
+    let index = client.fetch_index(Utc::now()).unwrap();
+    assert_eq!(index.items.len(), 1);
+    let item = &index.items[0];
+    let detail = client
+        .fetch_item_detail(&item.source_item_id, Utc::now())
+        .unwrap();
+    assert_eq!(detail.summary.snapshot_version, item.snapshot_version);
+    let snapshot = client
+        .fetch_snapshot(&item.source_item_id, &item.snapshot_version, Utc::now())
+        .unwrap();
+    assert_eq!(snapshot.source_item_id, item.source_item_id);
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(git_output(&repository, &["rev-parse", "HEAD"]), source_head);
+    assert_eq!(
+        git_output(
+            &repository,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        source_status
     );
 }

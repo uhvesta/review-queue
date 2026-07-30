@@ -317,6 +317,9 @@ export interface CommandError {
   message: string;
   data_safety: string;
   next_step: string;
+  why_it_matters?: string;
+  diagnostics_route?: string;
+  cancel_route?: string;
 }
 
 export interface LocalSubmissionRequest {
@@ -482,15 +485,27 @@ export interface DeliveryHistoryEntry {
 export interface PreparedFeedbackPrompt {
   delivery_id: string;
   idempotency_key: string;
+  comment_count: number;
   prompt: string;
   route_id?: string | null;
   agent_id?: string | null;
   session_id?: string | null;
   route_status?: string | null;
   handoff_path: "existing_session" | "reproduce_and_start_fresh";
-  manual_submission_required: true;
+  manual_submission_required: boolean;
+  delivery_available: boolean;
+  busy_policy_required: boolean;
   reproduction_required: boolean;
   guidance: string;
+}
+
+export type AcpDeliveryPolicy = "queue" | "interrupt";
+
+export interface AcpDeliveryReceipt {
+  delivery_id: string;
+  idempotency_key: string;
+  receipt_id: string;
+  policy: AcpDeliveryPolicy;
 }
 
 export interface SessionOption {

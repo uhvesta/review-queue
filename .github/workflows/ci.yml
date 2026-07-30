@@ -69,9 +69,17 @@ jobs:
       - run: cargo install tauri-cli --version "2.11.4" --locked
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Exercise the shipped daemon through a real OpenSSH agent tunnel
+        run: >-
+          cargo test -p review-queue --test machine_daemon
+          system_openssh_agent_tunnel_reaches_the_shipped_daemon_without_storing_credentials
       - name: Run opt-in macOS Keychain integration tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked -- --ignored
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Verify release-readiness gate fixtures
+        run: bash scripts/test-check-release-readiness.sh
+      - name: Verify release secret scanner fixtures
+        run: bash scripts/test-scan-release-secrets.sh
       - name: Compile universal app bundle with ad-hoc signing
         run: >-
           cargo tauri build

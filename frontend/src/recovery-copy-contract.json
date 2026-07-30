@@ -1,0 +1,186 @@
+{
+  "schema_version": 3,
+  "contract": "rev3_section_8_error_and_recovery",
+  "entries": [
+    {
+      "state": "keychain_unavailable",
+      "codes": ["keychain_unavailable", "keychain_access_launch_failed"],
+      "what_happened": "Review Queue could not access credential records in the login Keychain.",
+      "why_it_matters": "Credential-backed GitHub and Copilot actions cannot continue without the protected capability record.",
+      "data_safety": "No plaintext credential fallback was used, and review data remains unchanged.",
+      "next_action": "Open Keychain Access, select and unlock the login keychain, then choose Retry connection.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Close Application settings to return to the unchanged queue."
+    },
+    {
+      "state": "device_code_expired_or_cancelled",
+      "codes": ["device_flow_expired", "device_flow_denied", "device_flow_not_pending", "device_flow_not_saved"],
+      "what_happened": "The GitHub Device Flow expired, was denied, or no longer has a pending request.",
+      "why_it_matters": "The old public code cannot authorize a connection and must never be reused.",
+      "data_safety": "The pending record was removed and no credential or review data changed.",
+      "next_action": "Choose Start fresh flow to request a new public code.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Close Application settings to leave the capability disconnected."
+    },
+    {
+      "state": "wrong_github_account",
+      "codes": ["device_flow_account_mismatch"],
+      "what_happened": "GitHub approved the flow for an account other than the expected account shown by Review Queue.",
+      "why_it_matters": "Using the wrong identity could read from or publish to a repository as an unintended account.",
+      "data_safety": "The returned credential was discarded and no GitHub request or review-data change followed.",
+      "next_action": "Disconnect this capability, then reconnect it with the intended GitHub account.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Close Application settings to keep the capability disconnected."
+    },
+    {
+      "state": "copilot_unavailable",
+      "codes": ["copilot_authentication_unavailable", "copilot_connection_required", "existing_copilot_cli_unavailable"],
+      "what_happened": "The selected Copilot authentication source is unavailable.",
+      "why_it_matters": "Review Queue cannot start the explicitly requested /ask session without validating that selected source.",
+      "data_safety": "No prompt was sent, no credential was changed, and the local draft remains saved.",
+      "next_action": "Open Application settings, connect the displayed Copilot source, then explicitly retry the prompt.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Close chat to return to the review without sending the draft."
+    },
+    {
+      "state": "model_unavailable",
+      "codes": ["copilot_model_unavailable", "copilot_option_value_unavailable"],
+      "what_happened": "The selected Copilot model or saved model option is not available.",
+      "why_it_matters": "Sending with a silently substituted model would change the user's explicit provider choice.",
+      "data_safety": "No prompt was sent and the conversation draft and transcript remain saved.",
+      "next_action": "Refresh Copilot capabilities and select one supported model.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Close chat to keep the draft without starting a provider request."
+    },
+    {
+      "state": "network_unavailable",
+      "codes": ["copilot_network_unavailable", "device_flow_unavailable", "device_flow_poll_unavailable", "github_client_unavailable"],
+      "what_happened": "The explicitly requested remote operation could not reach its provider.",
+      "why_it_matters": "Review Queue cannot safely infer whether a remote read or prompt attempt can proceed.",
+      "data_safety": "Local drafts remain saved and no automatic retry or prompt replay will occur.",
+      "next_action": "Check network access, then explicitly retry the same operation once.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Dismiss the error to continue reviewing cached local data."
+    },
+    {
+      "state": "pr_stale",
+      "codes": ["github_round_stale", "github_intake_preview_stale", "github_head_moved", "github_pull_request_not_open"],
+      "what_happened": "The pull request head or open state no longer matches this immutable review round.",
+      "why_it_matters": "Publishing or reviewing mutable upstream content would detach comments from the exact code that was inspected.",
+      "data_safety": "The old round and formal drafts remain saved as outdated, and no GitHub write occurred.",
+      "next_action": "Choose Refresh into new round and review the current pull-request head.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Return to Queue Home to keep viewing the old round as outdated."
+    },
+    {
+      "state": "snapshot_unavailable",
+      "codes": ["machine_snapshot_head_unavailable", "machine_materialization_mismatch", "snapshot_unavailable"],
+      "what_happened": "The immutable snapshot needed for this review is unavailable or no longer matches its source item.",
+      "why_it_matters": "Falling back to a mutable worktree would show code other than the recorded review round.",
+      "data_safety": "No mutable fallback was used, no source file changed, and cached review metadata remains available.",
+      "next_action": "Choose Reproduce from source to restore the recorded snapshot.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Return to Queue Home without opening a different source state."
+    },
+    {
+      "state": "acp_busy_or_disconnected",
+      "codes": ["acp_route_busy", "acp_route_disconnected", "feedback_route_unavailable", "acp_endpoint_unreachable", "acp_endpoint_unavailable", "acp_endpoint_invalid", "acp_endpoint_not_loopback", "acp_session_unavailable", "acp_interrupt_not_applicable", "acp_delivery_interrupted", "acp_transport_unavailable", "acp_acknowledgement_unavailable", "acp_acknowledgement_invalid", "acp_acknowledgement_mismatch", "acp_delivery_rejected", "acp_receipt_missing", "acp_delivery_encode_failed"],
+      "what_happened": "The originating agent route is busy, disconnected, or no longer reachable.",
+      "why_it_matters": "Review Queue cannot deliver formal feedback exactly once to an unavailable session.",
+      "data_safety": "Formal drafts remain saved and no delivery, terminal typing, or keystroke injection occurred.",
+      "next_action": "Choose Copy feedback prompt and submit it manually to the intended agent.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Close the delivery drawer to keep the formal drafts queued."
+    },
+    {
+      "state": "remote_tunnel_failed",
+      "codes": ["machine_tunnel_failed", "machine_ssh_start_failed", "machine_tunnel_status_failed", "machine_not_connected"],
+      "what_happened": "Review Queue could not establish or retain the configured connected-machine tunnel.",
+      "why_it_matters": "The remote queue and immutable snapshots cannot be refreshed through an unverified transport.",
+      "data_safety": "Cached rounds remain available and no remote data or credential changed.",
+      "next_action": "Inspect the configured SSH target and daemon socket, then choose Reconnect.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Disconnect the machine to continue with cached local rounds only."
+    },
+    {
+      "state": "publish_rejected",
+      "codes": ["github_publish_rejected", "github_publish_state_conflict"],
+      "what_happened": "GitHub rejected or could not safely confirm the explicit publish request.",
+      "why_it_matters": "A blind retry could duplicate feedback or publish against a changed pull-request head.",
+      "data_safety": "Formal drafts remain saved and Review Queue will not retry the GitHub write automatically.",
+      "next_action": "Refresh the pull-request head and reconnect PR publish before preparing one new publish attempt.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Close the publish dialog to keep all formal drafts local."
+    },
+    {
+      "state": "workspace_changed_during_capture",
+      "codes": ["workspace_changed_during_capture", "preflight_stale", "repository_selection_stale"],
+      "what_happened": "The workspace, selected repositories, or Git state changed after capture preflight.",
+      "why_it_matters": "Continuing would bind the review round to source state other than the exact state the user approved.",
+      "data_safety": "No torn review round was saved and Review Queue made no additional source-file change.",
+      "next_action": "Wait for the workspace to become stable, then run capture preflight again.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Cancel submission to keep the workspace and queue unchanged."
+    },
+    {
+      "state": "submission_commit_failed",
+      "codes": ["submission_commit_failed", "capture_compensation_required"],
+      "what_happened": "Review Queue could not create or safely finalize a submission snapshot commit.",
+      "why_it_matters": "A review round cannot be trusted unless every repository snapshot and its queue record are committed atomically.",
+      "data_safety": "Source files and original staging indexes were preserved; any owned partial snapshot was rolled back when safe.",
+      "next_action": "Fix the reported Git or hook failure, then submit the same workspace again.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Cancel submission to leave the existing queue and workspace state in place."
+    },
+    {
+      "state": "publish_without_decision_unreachable",
+      "codes": ["decision_required"],
+      "what_happened": "Publish review is unavailable because no Approve or Request changes decision is recorded.",
+      "why_it_matters": "GitHub review publishing requires an explicit formal decision and must never infer one from comments or UI state.",
+      "data_safety": "The publish control remains disabled, formal drafts stay local, and no GitHub write can occur.",
+      "next_action": "Choose either Approve or Request changes for this round.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Return to the review without recording a decision or publishing."
+    },
+    {
+      "state": "upstream_comment_refresh_failed",
+      "codes": ["github_request_failed", "github_response_invalid", "github_graphql_request_failed", "github_graphql_response_invalid", "github_graphql_response_error", "github_graphql_response_missing_data", "github_review_threads_missing", "github_review_threads_cursor_missing", "github_comment_time_invalid", "github_read_rejected"],
+      "what_happened": "Review Queue could not refresh the pull request's upstream discussion.",
+      "why_it_matters": "The reviewer cannot claim that its imported GitHub comments or resolution state are current.",
+      "data_safety": "Existing cached comments and local formal drafts remain saved, and no GitHub write occurred.",
+      "next_action": "Check PR read access, then choose Refresh comments once.",
+      "diagnostics_route": "Application settings → Privacy and diagnostics → Open redacted diagnostics.",
+      "cancel_route": "Dismiss the refresh error to continue with clearly cached discussion."
+    },
+    {
+      "state": "cli_app_or_data_plane_unreachable",
+      "codes": ["app_unreachable"],
+      "what_happened": "The CLI could not reach the running Review Queue desktop data plane.",
+      "why_it_matters": "The token-free CLI cannot read or enqueue review state without the owner-only desktop socket.",
+      "data_safety": "The CLI did not obtain credentials or mutate source files, commits, or review data.",
+      "next_action": "Launch the Review Queue desktop app, then rerun the same CLI command.",
+      "diagnostics_route": "Run review-queue diagnose after the desktop app is reachable.",
+      "cancel_route": "Exit the CLI command to leave local source and queue state unchanged."
+    },
+    {
+      "state": "cli_required_capability_not_connected",
+      "codes": ["pr_read_capability_required", "pr_read_required", "pr_publish_capability_required", "pr_publish_required", "capability_required", "source_capability_required"],
+      "what_happened": "The CLI request requires a desktop-owned capability that is not connected.",
+      "why_it_matters": "The token-free CLI cannot accept a credential or silently expand its authority.",
+      "data_safety": "No provider request, credential change, or queue mutation occurred.",
+      "next_action": "Open Application settings and connect the capability named by the error.",
+      "diagnostics_route": "Run review-queue diagnose to confirm the token-free data plane remains reachable.",
+      "cancel_route": "Exit the CLI command to keep the capability disconnected."
+    },
+    {
+      "state": "invalid_machine_config",
+      "codes": ["invalid_machine_config", "machine_name_invalid", "machine_ssh_target_invalid", "machine_endpoint_invalid", "machine_config_conflict", "machine_credentials_forbidden"],
+      "what_happened": "The connected-machine name, SSH target, socket path, or endpoint combination is invalid.",
+      "why_it_matters": "Saving ambiguous transport data could connect to the wrong daemon or place credential material in token-free configuration.",
+      "data_safety": "No machine configuration was saved, no tunnel started, and no credential or review data changed.",
+      "next_action": "Correct the named machine field in the error, then add the machine again.",
+      "diagnostics_route": "Run review-queue diagnose to verify the local token-free data plane.",
+      "cancel_route": "Cancel machine setup to keep the current source list unchanged."
+    }
+  ]
+}

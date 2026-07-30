@@ -1865,6 +1865,45 @@ mod tests {
     }
 
     #[test]
+    fn cli_pr_add_and_ui_confirm_return_the_byte_identical_existing_round() {
+        let mut store = Store::in_memory().unwrap();
+        let mut desktop = desktop();
+
+        // `queue` is the one-step path used by the token-free CLI handler.
+        let cli = desktop
+            .queue(&mut store, "https://github.com/o/r/pull/1")
+            .unwrap();
+        assert_eq!(cli.outcome, "created");
+        let cli_retry = desktop
+            .queue(&mut store, "https://github.com/o/r/pull/1")
+            .unwrap();
+        assert_eq!(cli_retry.outcome, "existing");
+        assert_eq!(cli_retry.round.id, cli.round.id);
+        assert_eq!(
+            serde_json::to_vec(&cli_retry.round).unwrap(),
+            serde_json::to_vec(&cli.round).unwrap(),
+            "an idempotent CLI rerun must return the original record"
+        );
+
+        // Preview + confirm is the desktop UI path. Repeating the same
+        // immutable PR head must return the original ID and exact record.
+        let preview = desktop.preview("https://github.com/o/r/pull/1").unwrap();
+        let ui = desktop.confirm_queue(&mut store, &preview).unwrap();
+        assert_eq!(ui.outcome, "existing");
+        assert_eq!(ui.round.id, cli.round.id);
+        assert_eq!(
+            serde_json::to_vec(&ui.round).unwrap(),
+            serde_json::to_vec(&cli.round).unwrap(),
+            "CLI and UI intake must serialize one byte-identical persisted round"
+        );
+        assert_eq!(store.list(None, true).unwrap().len(), 1);
+
+        let cli_record = serde_json::to_string(&cli).unwrap();
+        assert!(!cli_record.contains("read-secret"));
+        assert!(!cli_record.contains("publish-secret"));
+    }
+
+    #[test]
     fn refresh_is_pull_only_persists_staleness_and_preserves_local_drafts() {
         let mut store = Store::in_memory().unwrap();
         let mut desktop = desktop();
