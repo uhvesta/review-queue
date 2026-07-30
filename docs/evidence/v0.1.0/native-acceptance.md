@@ -168,7 +168,7 @@ Retained evidence:
 - `difit-native-reviewer-560.png`
 
 That retained packaged-app run used the then-current 9/9 fixture suite. The
-current suite is 33/33 and additionally covers refreshed-round state
+current suite is 34/34 and additionally covers refreshed-round state
 isolation, cached-machine rematerialization, PR-intake confirmation, global
 hunk navigation, inline conversations, keyboard diff navigation, cached
 GitHub discussion without implicit network access, viewport-safe dialogs,
@@ -303,3 +303,35 @@ Keychain-backed GitHub capabilities still connected as `uhvesta`. This is
 only the retained pre-update baseline; no update check, installation, or
 relaunch was attempted because the disposable `0.1.0` feed does not yet
 exist. Evidence: `updater-before-rc-auth.jpeg`.
+
+## App-owned Copilot OAuth and `/ask`
+
+The signed app completed app-owned Copilot OAuth as `uhvesta` and used the
+grant for active conversation `5627350d...`. One explicit `/ask` request
+completed as exactly one turn with one idempotency key. After a complete quit
+and relaunch, the conversation still contained that single completed turn and
+reported zero in-flight requests, with no replay or duplicate submission.
+
+Settings then switched Copilot back to the existing CLI sign-in. The app-owned
+grant remained retained and available without exporting or displaying its
+credential. Evidence: `copilot-app-oauth-ask-complete.jpeg`.
+
+## Exact GitHub mirror, import, and publication
+
+The packaged app opened GitHub round `6e7fb133...` at immutable head
+`9d21e8bd...`, cached it, and reopened the reviewer while GitHub was made
+unreachable through a proxy. The cached snapshot remained usable without an
+implicit remote read. Imported discussion preserved the upstream identities
+of PR comment `5124939624`, inline comment `3679034978`, and review summary
+`4814144577`. Empty repository-root and lowercase-side payloads exposed two
+rendering regressions during this acceptance pass; both were fixed before the
+retained run. Evidence: `github-imported-discussion.jpeg`.
+
+One confirmed publication created APPROVED review `4814281693` and reply
+`3679134377`. The GitHub REST reply response included a
+`pull_request_review_id`, and the upstream discussion lists its COMMENTED
+container as review `4814281740`; that container belongs to the one reply write
+and is not a second approval. After a complete restart, both completed
+publication receipts retained their unchanged upstream IDs, and retry
+reconciled them without creating another review or reply. Evidence:
+`github-publish-receipt.jpeg`.

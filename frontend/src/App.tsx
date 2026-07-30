@@ -265,6 +265,20 @@ export function App() {
     }
   };
 
+  const mutateSelected = async (id: string, action: () => Promise<unknown>) => {
+    setError(null);
+    try {
+      await action();
+      const next = await getRound(id);
+      await refresh();
+      setSelected(next);
+      return true;
+    } catch (problem) {
+      setError(toCommandError(problem));
+      return false;
+    }
+  };
+
   const openRoundModal = async (round: ReviewRound, target: "details" | "reproduce") => {
     setError(null);
     try {
@@ -315,8 +329,8 @@ export function App() {
           onDetails={() => setModal("details")}
           onReproduce={() => setModal("reproduce")}
           onSettings={() => setModal("settings")}
-          onRequestChanges={() => mutate(() => requestChanges(selected.id))}
-          onApproveRemote={() => mutate(() => approveRemote(selected.id))}
+          onRequestChanges={() => mutateSelected(selected.id, () => requestChanges(selected.id))}
+          onApproveRemote={() => mutateSelected(selected.id, () => approveRemote(selected.id))}
           onComplete={() => mutate(() => completeRound(selected.id))}
           onPurge={(kind) => setPurgeIntent({ round: selected, kind })}
           onGithubRoundRefreshed={async (round) => {
@@ -1121,8 +1135,8 @@ function Reviewer({
   onDetails: () => void;
   onReproduce: () => void;
   onSettings: () => void;
-  onRequestChanges: () => void;
-  onApproveRemote: () => void;
+  onRequestChanges: () => Promise<boolean>;
+  onApproveRemote: () => Promise<boolean>;
   onComplete: () => void;
   onPurge: (kind: "delete" | "approve_local") => void;
   onGithubRoundRefreshed: (round: ReviewRound) => Promise<void>;
@@ -1888,11 +1902,22 @@ function Reviewer({
               className="approve"
               disabled={readOnly}
               title={readOnly ? reason : purgesOnApproval ? "Approval purges this local round after confirmation" : "Records a local decision; it does not publish or deliver"}
-              onClick={() => purgesOnApproval ? onPurge("approve_local") : onApproveRemote()}
+              onClick={() => purgesOnApproval
+                ? onPurge("approve_local")
+                : void onApproveRemote().then((saved) => {
+                    if (saved) setGithubDecision("approve");
+                  })}
             >
               Approve
             </button>
-            <button className="changes" disabled={readOnly} title={readOnly ? reason : ""} onClick={onRequestChanges}>
+            <button
+              className="changes"
+              disabled={readOnly}
+              title={readOnly ? reason : ""}
+              onClick={() => void onRequestChanges().then((saved) => {
+                if (saved) setGithubDecision("request_changes");
+              })}
+            >
               Request changes
             </button>
             <button
@@ -3024,7 +3049,7 @@ function DiffHunkView({
     itemAnchor
       && itemAnchor.repository_id === file.repository_id
       && itemAnchor.workspace_relative_path === workspacePathForSide(side)
-      && itemAnchor.side === side
+      && itemAnchor.side.toUpperCase() === side
       && itemAnchor.end_line === line,
   );
   const renderInlineThreads = (side: "LEFT" | "RIGHT", line: number) => {
@@ -3689,6 +3714,13 @@ function SettingsDialog({
   const dialog = useDialogFocus(onClose);
 
   useEffect(() => {
+    if (health || !initialHealth) return;
+    setHealth(initialHealth);
+    setDeviceFlow(initialHealth.pendingDeviceFlow ?? null);
+    setClientId(initialHealth.publicClientId ?? "");
+  }, [health, initialHealth]);
+
+  useEffect(() => {
     if (!deviceFlow || deviceFlow.phase === "expired") return;
     const timer = window.setInterval(() => tick((value) => value + 1), 1000);
     return () => window.clearInterval(timer);
@@ -4092,7 +4124,7 @@ function githubFilesToDiff(round: ReviewRound, files: GithubMaterializedFile[]):
   return {
     repositories: [{
       repository_id: repositoryId,
-      root: repository?.root ?? ".",
+      root: repository?.root || ".",
       base_sha: repository?.base_sha ?? "",
       head_sha: repository?.head_sha ?? "",
       files: files.map((file) => ({

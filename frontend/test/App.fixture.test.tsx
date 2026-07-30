@@ -154,6 +154,40 @@ describe("fixture-backed reviewer recovery", () => {
     expect(within(dialog).getByRole("button", { name: "Stop using existing sign-in" })).toBeVisible();
   });
 
+  it("adopts connection health that resolves after Settings opens", async () => {
+    let resolveHealth: (health: Awaited<ReturnType<typeof import("../src/api.fixture").connectionStatus>>) => void = () => {};
+    vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
+      const api = await importOriginal<typeof import("../src/api.fixture")>();
+      const health = await api.connectionStatus();
+      const deferred = new Promise<typeof health>((resolve) => {
+        resolveHealth = resolve;
+      });
+      return {
+        ...api,
+        connectionStatus: vi.fn().mockReturnValue(deferred),
+      };
+    });
+
+    await renderFixtureApp();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const dialog = await screen.findByRole("dialog", { name: "Application settings" });
+
+    expect(within(dialog).getAllByText("Checking connection…")).toHaveLength(3);
+    expect(within(dialog).getAllByText("checking…")).toHaveLength(4);
+
+    const api = await import("../src/api.fixture");
+    await act(async () => {
+      resolveHealth(await api.retryConnection());
+    });
+
+    await waitFor(() => {
+      expect(within(dialog).queryByText("Checking connection…")).not.toBeInTheDocument();
+      expect(within(dialog).queryByText("checking…")).not.toBeInTheDocument();
+    });
+    expect(within(dialog).getByRole("button", { name: "Stop using existing sign-in" })).toBeVisible();
+    expect(within(dialog).getByText(/healthy ·/i)).toBeVisible();
+  });
+
   it("resolves a GitHub PR read-only before an explicit, exact confirmation queues it", async () => {
     let resolvePullRequest = vi.fn();
     let confirmPullRequest = vi.fn();
@@ -240,10 +274,27 @@ describe("fixture-backed reviewer recovery", () => {
     let refreshComments = vi.fn();
     vi.doMock("../src/api.fixture.ts", async (importOriginal) => {
       const api = await importOriginal<typeof import("../src/api.fixture")>();
+      const listRounds = vi.fn(async (...args: Parameters<typeof api.listRounds>) =>
+        (await api.listRounds(...args)).map((round) => round.brief.title === githubTitle
+          ? {
+              ...round,
+              manifest: {
+                ...round.manifest,
+                repositories: round.manifest.repositories.map((repository) => ({
+                  ...repository,
+                  root: "",
+                })),
+              },
+            }
+          : round));
       cachedRound = vi.fn(async (...args: Parameters<typeof api.cachedGithubRound>) => {
         const cached = await api.cachedGithubRound(...args);
         return {
           ...cached,
+          imported_comments: cached.imported_comments.map((comment) => ({
+            ...comment,
+            anchor: comment.anchor ? { ...comment.anchor, side: comment.anchor.side.toLowerCase() } : null,
+          })),
           last_staleness: {
             ...cached.last_staleness!,
             observed_head_sha: "e".repeat(64),
@@ -253,6 +304,7 @@ describe("fixture-backed reviewer recovery", () => {
       refreshComments = vi.fn(api.refreshGithubComments);
       return {
         ...api,
+        listRounds,
         cachedGithubRound: cachedRound,
         refreshGithubComments: refreshComments,
       };
@@ -264,6 +316,8 @@ describe("fixture-backed reviewer recovery", () => {
     expect(refreshComments).not.toHaveBeenCalled();
     expect(screen.getAllByRole("region", { name: "Code diff" }).length).toBeGreaterThan(0);
     expect(screen.getByText(/Nice fix — can we also cover the "revoked" case/i)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reply formally" })).toBeVisible();
+    expect(screen.queryByLabelText(/Threads at \//i)).not.toBeInTheDocument();
     expect(screen.getByText(/Head moved from/i)).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh comments" }));
@@ -578,13 +632,9 @@ describe("fixture-backed reviewer recovery", () => {
 
     fireEvent.click(within(drawer).getByRole("button", { name: "Close formal feedback" }));
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
-    await screen.findByRole("heading", { name: "Queue Home" });
-    const reopenedCard = screen.getByText(githubTitle).closest("article");
-    if (!reopenedCard) throw new Error("The GitHub review card did not remain queued after recording approval.");
-    fireEvent.click(within(reopenedCard).getByRole("button", { name: "Open review" }));
-    await screen.findAllByRole("region", { name: "Code diff" });
     const publish = screen.getByRole("button", { name: "Publish review" });
     await waitFor(() => expect(publish).toBeEnabled());
+    expect(screen.getByRole("button", { name: /Queue Home/ })).toBeVisible();
     fireEvent.click(publish);
 
     const publishDialog = await screen.findByRole("alertdialog", { name: "Publish GitHub review?" });
@@ -794,7 +844,8 @@ describe("fixture-backed reviewer recovery", () => {
     expect(screen.getByRole("button", { name: "Check head" })).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
-    await screen.findByRole("heading", { name: "Queue Home" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Publish review" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: /Queue Home/ })).toBeVisible();
     expect(screen.queryByRole("alertdialog", { name: /Approve and purge/i })).not.toBeInTheDocument();
   });
 });
