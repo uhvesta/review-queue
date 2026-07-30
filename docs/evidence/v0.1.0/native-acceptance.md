@@ -1,0 +1,408 @@
+# Review Queue 0.1.0 native acceptance record
+
+This record contains redacted acceptance evidence from the signed universal
+macOS app. It intentionally contains no OAuth token, Device Flow device code,
+Keychain payload, updater private key, or prompt transcript beyond the single
+explicit review question and its returned answer.
+
+## Packaged app and Keychain
+
+- Bundle: `Review Queue.app`, universal `arm64 x86_64`.
+- Identity: Developer ID Application, team `7H66Q22DJD`.
+- `codesign --verify --deep --strict`, `spctl --assess --type execute`, and
+  `xcrun stapler validate` passed.
+- The signed executable was quit and relaunched between the two disposable
+  Keychain phases.
+- A disposable `com.reviewqueue.desktop.acceptance.*` service was written,
+  read after restart, isolated by capability account, given a malformed pending
+  record to exercise recovery, and deleted. Product credentials were not read
+  or modified.
+
+## OAuth Device Flow and restart
+
+Using the bundled public client ID, the signed app completed app-owned Device
+Flow authorization for the capability-specific `PR read` and `PR publish`
+accounts. Settings identified the connected GitHub account as `uhvesta` and
+continued to show Copilot's existing-CLI sign-in as a distinct source.
+
+The signed app was then quit completely and relaunched. Both GitHub
+capabilities were recovered from their separate
+`com.reviewqueue.desktop` Keychain accounts, remained connected as `uhvesta`,
+and required no repeated browser approval. Keychain metadata showed the two
+account items were created independently. No token was read into the
+renderer, SQLite, evidence, shell output, or diagnostic artifact.
+
+The post-relaunch state is retained in
+[oauth-keychain-persisted.jpeg](oauth-keychain-persisted.jpeg).
+
+## Local multi-repository capture
+
+The packaged UI captured staged, unstaged, and untracked changes from two
+repositories under `/private/tmp/review-queue-acceptance-workspace`.
+
+- Review round: `594c05b7-6b2e-4fb1-a36e-0f2252d303e8`
+- Snapshot: `9c43aa299a373d49853ccedfd2699c228d0d855594bc5ac88392db76f362bc5d`
+- `app` saved commit: `3db9e11fe6e0538eaa28b46220f9e9beaab54346`
+- `packages/parser` saved commit:
+  `50a3c25cfeabb3f76ce0390f192001ee21688f65`
+- Both source repositories were clean after capture.
+- Both commit messages used the canonical subject
+  `release-acceptance: Validate signed release workflow` and retained the
+  complete What, Why, Approach / Alternatives, and Testing brief.
+
+## Copilot streaming, cancel, and restart
+
+The signed app selected the existing `uhvesta` Copilot sign-in only after the
+official SDK read-only model probe passed. The session used discovered model
+`auto` and context policy `managed_80`.
+
+For the selected `app/new-review.txt:1` line, the explicit question was:
+
+> In one sentence, explain why this added line belongs in the immutable review
+> snapshot.
+
+The completed SDK response was:
+
+> It belongs in the immutable review snapshot because it records the exact
+> acceptance-state content at review time, preserving a tamper-evident audit
+> trail of what was approved for release.
+
+A second long follow-up visibly streamed and was cancelled. After quitting and
+relaunching the signed app, the transcript still contained exactly two turns
+with statuses `completed,cancelled`; it was history-only, the provider session
+was not resumed, and no prompt replay occurred. Clear chat archived that
+transcript and opened a new empty conversation without sending a prompt.
+
+## Connected-machine immutable review
+
+The shipped daemon served one fixture over an owner-only local Unix socket;
+the native app used its explicit `Local daemon socket` connection type, with no
+SSH credential or network listener.
+
+- Machine:
+  `machine-d0670836d029da335af0357a563ae511539c5a89440d2b5478c4cc99b086d147`
+- Source item: `0627e45f-9e44-4924-8a0a-f2b05d1cfd85`
+- Snapshot:
+  `a0d09b124c2e420dfba1f5a9f70abbdd0090ba6b6b7672003795f92dd5846256`
+- Base commit: `7a1c58153bcb83cb74b6c277f9e1fe47038dc3c3`
+- Head commit: `7ad6ea69bf72482e10f224153215c94c0c41c9e1`
+
+Before Refresh, the UI showed zero cached items and stated that remote reads
+occur only on Connect, Refresh, or Open review. Refresh cached exactly one
+metadata item. Open review then fetched the complete immutable snapshot and
+rendered the full pinned file:
+
+```text
+baseline: connected-machine acceptance fixture
+candidate: preserve this exact immutable machine snapshot
+```
+
+The reproduction preview created nothing. Confirmation materialized a clean
+detached checkout at the exact head commit while the daemon source repository
+remained clean on `main`. The final reproduction state is retained in
+[connected-machine-reproduced.jpeg](connected-machine-reproduced.jpeg).
+
+## Manual originating-agent handoff
+
+The reviewer recorded Request changes with one immutable line-anchored formal
+comment. Because the originating session was marked closed or unavailable, the
+app required reproduction before manual submission.
+
+- Feedback idempotency key:
+  `f582ce2d-d11b-4eb7-8364-50ad7bf6b0ac`
+- The preview created nothing.
+- Confirmation reproduced detached, clean clones at both saved commit SHAs
+  under
+  `/private/tmp/review-queue-acceptance-workspace-review-594c05b7`.
+- A fresh `gpt-5.6-terra` subagent was manually given the immutable prompt in
+  that workspace. It verified both detached SHAs and both clean worktrees,
+  retained the anchored line verbatim, and proposed adding any clarification
+  separately.
+- Only after that response did the user-side acceptance driver click
+  “I submitted it manually.” The app persisted
+  `manual submission confirmed`; it never queued, interrupted, typed, injected,
+  or sent the prompt itself.
+
+The final in-app record is retained in
+[manual-handoff-confirmed.jpeg](manual-handoff-confirmed.jpeg).
+
+## Automated validation
+
+After the final frontend cancellation and handoff-history fixes:
+
+- Frontend TypeScript/Vite build passed.
+- Rust formatting passed for the workspace and desktop manifests.
+- Workspace tests: 92 passed.
+- Desktop tests: 37 passed; two opt-in Keychain tests then passed explicitly.
+- Strict workspace and desktop Clippy passed with warnings denied.
+
+## Post-acceptance difit UI migration
+
+The current working tree was rebuilt as a universal macOS `.app` with ad-hoc
+signing and updater artifacts disabled. `codesign --verify --deep --strict`
+passed. This was a no-op UI acceptance run, not a notarized production release.
+
+The packaged app reopened the existing immutable multi-repository
+`release-acceptance` round and retained the configured public GitHub Client ID.
+Because the validation bundle had a new ad-hoc signature, macOS requested
+Keychain ACL approval; the run chose Deny, preserving the stored credential,
+and verified the actionable Keychain recovery state instead of changing auth.
+The existing Copilot CLI sign-in remained visible and distinct.
+
+Validated in the packaged app:
+
+- Queue Home retained local rounds and connected-machine state.
+- The reviewer rendered all three files continuously with sticky per-file
+  headers and repository-qualified tree entries.
+- The window resized to the 560px minimum; Files and Chat both collapsed to
+  labelled toolbar controls, and each opened and closed successfully.
+- Unified state, Viewed progress, Full file, hunk actions, formal decisions,
+  and the wrapping narrow decision bar remained reachable.
+- Settings opened as a modal, displayed the persisted public Client ID and
+  actionable Keychain recovery, and closed with Escape without mutating data.
+
+Retained evidence:
+
+- `difit-native-queue-home.png`
+- `difit-native-reviewer.png`
+- `difit-native-reviewer-560.png`
+
+That retained packaged-app run used the then-current 9/9 fixture suite. The
+current suite is 34/34 and additionally covers refreshed-round state
+isolation, cached-machine rematerialization, PR-intake confirmation, global
+hunk navigation, inline conversations, keyboard diff navigation, cached
+GitHub discussion without implicit network access, viewport-safe dialogs,
+collapsed-pane accessibility, scoped queue shortcuts, and explicit Copilot
+authentication-source switching.
+Browser-fixture screenshots at 1280px, 1024px, and 560px are retained
+alongside the native images.
+
+## Current-tree native difit and Keychain responsiveness follow-up
+
+The current tree was rebuilt as an arm64 debug `.app`, deep ad-hoc signed, and
+launched against the retained native database. This remains a no-op UI check,
+not production release evidence. The first launch exposed that a Keychain ACL
+wait could hold a synchronous connection-health command on the Tauri main
+thread. Credential and connection operations now run on Tauri's blocking
+runtime: the Keychain remains the only credential store, but an ACL wait no
+longer freezes Queue Home or the reviewer.
+
+The rebuilt app became accessibility-responsive in about three seconds while
+the ad-hoc credential check remained unresolved. It reopened the persisted
+two-repository `release-acceptance` round and verified:
+
+- the current compact Queue Home and source rail;
+- continuous multi-file review with inline formal and `/ask` conversations;
+- Unified/Split roving tabs and global cross-file hunk navigation;
+- Split rendering with an explicit horizontally scrollable minimum width;
+- Full file mode while Unified remains the selected layout tab; and
+- formal decisions and Chat remaining visually separate from inline `/ask`.
+
+The same current bundle was then signed with the available Developer ID
+identity and relaunched as a fresh process. Queue Home remained usable while
+connection health resolved asynchronously; PR read became enabled without a
+browser flow. Application settings then showed Copilot existing-sign-in,
+PR-read, and PR-publish all connected as `uhvesta`, the configured public
+Client ID `Ov23li9NHgxO6prQz5f7`, and a healthy capability-scoped Keychain.
+The Updates section showed the running version `0.1.0` without reading the
+update feed.
+No credential value was read, copied, logged, or moved outside Keychain.
+
+Retained current-tree screenshots:
+
+- `difit-current-queue.jpeg`
+- `difit-current-reviewer.jpeg`
+- `difit-current-split.jpeg`
+- `difit-current-full-file.jpeg`
+- `current-signed-auth-persisted.jpeg`
+- `current-signed-settings-version.jpeg`
+
+## Current-tree stale Copilot option recovery
+
+Source commit `8b6cba8` was rebuilt as an arm64 debug app and signed with the
+Developer ID Application identity for team `7H66Q22DJD`. Strict deep
+signature verification passed. The signed executable SHA-256 was
+`291a47ded58b65edb16d5622288581e76393b0d67af10372301280525ab9a248`.
+This is current-tree native acceptance evidence, not the notarized release
+artifact.
+
+The active empty conversation
+`e361ab52-8c46-4ba7-8fdf-a22698a4bab7` in round
+`594c05b7-6b2e-4fb1-a36e-0f2252d303e8` initially contained the legacy
+selection `context_window=managed_80` and zero turns. Opening Chat showed the
+exact saved key/value, the SDK's unsupported reason, and stated that the value
+would not be sent. The only start action was **Reset unavailable options and
+start Copilot**.
+
+One explicit reset:
+
+- started the existing-CLI provider session;
+- removed only the unavailable selection;
+- retained Context window as honestly unsupported; and
+- left the same conversation at exactly zero turns.
+
+The reviewer then selected `app/new-review.txt:1` on the RIGHT side and sent
+one explicit question. It completed once with repository `app`, line range
+`1–1`, a 40-character pinned blob SHA, model `auto`, and no
+`context_window` option stamp. SQLite metadata showed the turn count changed
+from zero to one and the sole turn was `completed`.
+
+After a full quit and relaunch of the same signed bundle, the conversation was
+`history_only`, its provider label was cleared, and the turn count remained
+exactly one with state `completed`. The saved migrated Context window
+selection remained null. Reopening the round displayed the persisted anchored
+turn, disabled the input with the restart reason, and issued no prompt.
+
+Retained evidence:
+
+- `copilot-stale-option-disclosure.jpeg`
+- `copilot-stale-option-reset.jpeg`
+- `copilot-anchored-ask.jpeg`
+- `copilot-stale-option-restart.jpeg`
+
+## Current-head explicit Copilot source switching
+
+Product source commit `897aae3` was rebuilt as an arm64 debug app and signed
+with the Developer ID Application identity for team `7H66Q22DJD`. Strict deep
+signature verification passed, the bundle reported version `0.1.0`, and the
+signed executable SHA-256 was
+`4094b4c03e5ce6c604b9fda6141f680678cd3f9375171b8cf19bfdc7a4528f30`.
+This remains signed native acceptance evidence rather than a published
+release artifact.
+
+Settings initially showed the existing Copilot CLI source, PR read, and PR
+publish connected as `uhvesta`, the configured public Client ID
+`Ov23li9NHgxO6prQz5f7`, and a healthy capability-scoped Keychain. Selecting
+**Stop using existing sign-in** did not change the CLI credential or either
+GitHub capability. It exposed both **Connect app** and the explicit
+**Use existing CLI sign-in** recovery action. Selecting the latter performed
+the read-only CLI validation, cleared only Review Queue's source preference,
+and restored the existing source as `uhvesta`.
+
+A complete quit and relaunch retained the restored Copilot source, both
+GitHub capabilities, the public Client ID, local rounds, and the connected
+machine. No Device Flow, provider prompt, GitHub request, or credential
+export was used for this check.
+
+Retained evidence:
+
+- `copilot-source-choice.jpeg`
+- `copilot-source-restored.jpeg`
+
+## Installed updater baseline
+
+The retained `v0.1.0-rc.1` candidate was reverified before installation:
+all seven checksum entries passed, Gatekeeper reported `Notarized Developer
+ID`, and the DMG staple validated. With `/Applications/Review Queue.app`
+confirmed absent, the exact candidate was installed there without
+overwriting another app. The installed bundle passed strict deep signature
+verification and Gatekeeper assessment and reports version `0.1.0-rc.1`.
+
+The installed candidate launched with the existing queue state and both
+Keychain-backed GitHub capabilities still connected as `uhvesta`. This is
+only the retained pre-update baseline; no update check, installation, or
+relaunch was attempted because the disposable `0.1.0` feed does not yet
+exist. Evidence: `updater-before-rc-auth.jpeg`.
+
+## App-owned Copilot OAuth and `/ask`
+
+The signed app completed app-owned Copilot OAuth as `uhvesta` and used the
+grant for active conversation `5627350d...`. One explicit `/ask` request
+completed as exactly one turn with one idempotency key. After a complete quit
+and relaunch, the conversation still contained that single completed turn and
+reported zero in-flight requests, with no replay or duplicate submission.
+
+Settings then switched Copilot back to the existing CLI sign-in. The app-owned
+grant remained retained and available without exporting or displaying its
+credential. Evidence: `copilot-app-oauth-ask-complete.jpeg`.
+
+## Exact GitHub mirror, import, and publication
+
+The packaged app opened GitHub round `6e7fb133...` at immutable head
+`9d21e8bd...`, cached it, and reopened the reviewer while GitHub was made
+unreachable through a proxy. The cached snapshot remained usable without an
+implicit remote read. Imported discussion preserved the upstream identities
+of PR comment `5124939624`, inline comment `3679034978`, and review summary
+`4814144577`. Empty repository-root and lowercase-side payloads exposed two
+rendering regressions during this acceptance pass; both were fixed before the
+retained run. Evidence: `github-imported-discussion.jpeg`.
+
+One confirmed publication created APPROVED review `4814281693` and reply
+`3679134377`. The GitHub REST reply response included a
+`pull_request_review_id`, and the upstream discussion lists its COMMENTED
+container as review `4814281740`; that container belongs to the one reply write
+and is not a second approval. After a complete restart, both completed
+publication receipts retained their unchanged upstream IDs, and retry
+reconciled them without creating another review or reply. Evidence:
+`github-publish-receipt.jpeg`.
+
+## Rev3 packaged ACP delivery
+
+The notarized universal app built from
+`04ad09cade3f5097ef66c0e7f689cf84af8556c9` ran the production desktop ACP
+confirmation/claim/transport/outcome path in two separate executable
+processes.
+
+Phase one performed one explicit desktop confirmation. A fake loopback ACP
+agent accepted revision 1 once, retained its immutable key, and deliberately
+dropped the acknowledgement. Review Queue recorded the ambiguous
+acknowledgement failure without marking the revision delivered.
+
+Phase two reopened the same disposable SQLite store. Opening after restart
+sent nothing. An explicit retry reused the original delivery and key; the
+restarted fake agent suppressed the duplicate acceptance and returned its
+receipt. Editing the delivered comment created revision 2, and a second
+explicit Send used a new key carrying only revision 2. The final durable
+comment state recorded delivered revision 2.
+
+The retained [sanitized JSONL](packaged-acp-delivery.jsonl) contains only
+boolean/count/revision summaries. The disposable database, prompt, comment
+body, raw envelope, identifiers, endpoint, key, and fake-agent dedupe state
+were removed.
+
+## Rev3 packaged lifecycle and ranking
+
+The same notarized universal executable ran two restart-separated lifecycle
+phases against two disposable Git repositories and a disposable product
+database.
+
+It submitted and resubmitted a multi-repository topic, retained the
+superseded round, exercised Request changes, Complete, Requeue and rank
+movement, canceled both destructive confirmations with zero mutation, then
+reopened the database in a new process and confirmed Delete plus local
+Approve purges. Lifecycle history contained only
+`request_changes`, `complete`, `requeue`, `purge`, and `approve_local` as
+appropriate. Active ranks were identical across restart. Repository HEAD,
+tree, and complete porcelain status remained unchanged by every lifecycle
+operation.
+
+Evidence: [packaged lifecycle JSONL](packaged-lifecycle.jsonl).
+
+## Real OpenSSH connected-machine path
+
+The current signed-candidate pipeline passed a real macOS OpenSSH path using
+an ephemeral agent, unprivileged SSH server, system `ssh -N -L` Unix-socket
+forward, and the shipped standalone daemon. Health, index, item detail, and
+the immutable snapshot crossed that tunnel. Neither private-key material nor
+key/agent paths entered the desktop-form machine database, and the remote
+source repository remained unchanged.
+
+Evidence: [real SSH tunnel record](real-ssh-tunnel.md).
+
+## Rev3 CLI parity and recovery contract
+
+Real CLI binaries now cover `pr add`, `machine add`, and `submit` reruns. Each
+returns the existing ID with a success exit code and exact JSON echo; core/UI
+comparisons serialize the same persisted records byte-for-byte. Secret-shaped
+environment values never enter the owner-only socket, which still rejects
+delivery and publish operations.
+
+The shared recovery catalog contains exactly all 18 §8 states with 75 unique
+backend-code mappings. UI and CLI JSON use the same non-generic what/why/data
+safety/one-next-action/diagnostics/back contract. Real CLI integrations retain
+distinct exit codes for unreachable app, missing capability, and invalid
+machine configuration. Publish remains unreachable and disabled with its
+exact enabling action until a decision is recorded.
+
+The signed-candidate build and full validation are recorded in
+[the Rev3 acceptance candidate](rev3-acceptance-candidate.md).

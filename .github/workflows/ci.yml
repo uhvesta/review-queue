@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust format, test, and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  frontend:
+    name: Frontend test, typecheck, and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  desktop:
+    name: Tauri tests and universal macOS compile
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Ensure universal macOS targets are installed
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: cargo install tauri-cli --version "2.11.4" --locked
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Exercise the shipped daemon through a real OpenSSH agent tunnel
+        run: >-
+          cargo test -p review-queue --test machine_daemon
+          system_openssh_agent_tunnel_reaches_the_shipped_daemon_without_storing_credentials
+      - name: Run opt-in macOS Keychain integration tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -- --ignored
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Verify release-readiness gate fixtures
+        run: bash scripts/test-check-release-readiness.sh
+      - name: Verify release secret scanner fixtures
+        run: bash scripts/test-scan-release-secrets.sh
+      - name: Compile universal app bundle with ad-hoc signing
+        run: >-
+          cargo tauri build
+          --target universal-apple-darwin
+          --bundles app
+          --config '{"bundle":{"createUpdaterArtifacts":false,"macOS":{"signingIdentity":"-"}}}'
+        working-directory: src-tauri

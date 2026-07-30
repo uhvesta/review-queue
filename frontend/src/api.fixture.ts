@@ -1,0 +1,2611 @@
+// Dev-only fixture backend for `npm run dev:fixture` (Vite --mode fixture).
+//
+// This module is a structural drop-in replacement for `./api.ts`: it exports the exact same
+// named functions with the exact same signatures, but instead of calling into Tauri it reads
+// and mutates static, hand-written, in-memory fixture data. It exists purely so `App.tsx` can
+// be visually QA'd in a plain browser without a working Tauri backend.
+//
+// IMPORTANT: this file is never imported by `App.tsx` directly and is never part of the
+// production build. It is only reachable via the `resolve.alias` Vite adds when run with
+// `--mode fixture` (see vite.config.ts). Do not import it from `App.tsx` or `api.ts`.
+
+import type {
+  Collection,
+  AskConversation,
+  AskTurn,
+  Anchor,
+  FormalComment,
+  DeliveryHistoryEntry,
+  LocalSubmissionRequest,
+  LocalPreflight,
+  MaterializedDiff,
+  ReviewBrief,
+  ReviewRound,
+  ReproductionPreview,
+  ReproductionResult,
+  PinnedFileContent,
+  SubmissionOutcome,
+  ViewedFile,
+  ConnectionHealth,
+  ConnectionSource,
+  DeviceFlowPublicState,
+  DeviceFlowPollResult,
+  AgentRoute,
+  AcpDeliveryPolicy,
+  AcpDeliveryReceipt,
+  PreparedFeedbackPrompt,
+  UpdateCheck,
+  MachineEndpoint,
+  MachineIndexResult,
+  MachineStatus,
+  MachineItemSummary,
+  GithubOpenedPullRequest,
+  GithubCachedRound,
+  GithubPullRequestIntakePreview,
+  GithubPublishAttempt,
+  GithubCommentRefreshResult,
+  CopilotCapabilities,
+  CopilotPollResult,
+  CopilotSessionInfo,
+  SessionOption,
+  UpdateInstall,
+  DiagnosticsExport,
+  RepositorySnapshot,
+  WorkspaceManifest,
+  DiffFile,
+  DiffHunk,
+  DiffLine,
+  DiffFileStatus,
+  RepositoryDiff,
+  MachineRecord,
+  GithubPullRequestMetadata,
+  GithubMaterializedFile,
+  ImportedComment,
+  CopilotCapabilityGroup,
+  CommandError,
+  AgentRouteProvenance,
+  Lifecycle,
+  SourceAdapterContract,
+} from "./types";
+
+/* ------------------------------------------------------------------------------------------ *
+ * Small helpers
+ * ------------------------------------------------------------------------------------------ */
+
+let idCounter = 0;
+function nextId(prefix: string): string {
+  idCounter += 1;
+  return `${prefix}-${String(idCounter).padStart(3, "0")}`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function minutesAgoIso(minutes: number): string {
+  return new Date(Date.now() - minutes * 60_000).toISOString();
+}
+
+function sourceAdapter(collection: Collection): SourceAdapterContract {
+  if (collection === "github") {
+    return {
+      adapter_id: "github_pull_request_mirror",
+      capabilities: { capabilities: ["publish", "upstream_discussion", "remote_refresh"] },
+      approval: "record_decision",
+    };
+  }
+  if (collection === "machine") {
+    return {
+      adapter_id: "connected_daemon_workspace",
+      capabilities: { capabilities: ["originating_agent", "remote_refresh"] },
+      approval: "record_decision",
+    };
+  }
+  return {
+    adapter_id: "local_workspace_snapshot",
+    capabilities: { capabilities: ["originating_agent", "acp_delivery"] },
+    approval: "purge_round",
+  };
+}
+
+// Deterministic pseudo-hex "sha" generator so blob/commit shas look realistic and stay
+// stable across repeated calls for the same logical (round, path, side) tuple.
+function fakeSha(seed: string): string {
+  let h1 = 0xdeadbeef ^ seed.length;
+  let h2 = 0x41c6ce57 ^ seed.length;
+  for (let i = 0; i < seed.length; i += 1) {
+    const ch = seed.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  const hex = (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
+  return (hex + hex).slice(0, 40);
+}
+
+function fixtureCommandError(code: string, message: string, dataSafety: string, nextStep: string): CommandError {
+  return { code, message, data_safety: dataSafety, next_step: nextStep };
+}
+
+function fail(code: string, message: string): never {
+  throw fixtureCommandError(
+    code,
+    message,
+    "This is dev fixture data; nothing real was affected.",
+    "Pick a fixture round or item from the visible list.",
+  );
+}
+
+/* ------------------------------------------------------------------------------------------ *
+ * Diff construction helpers
+ * ------------------------------------------------------------------------------------------ */
+
+function line(type: DiffLine["type"], content: string): DiffLine {
+  return { type, content };
+}
+
+// Computes old/new hunk span sizes from a hand-written line sequence, so fixture authors only
+// need to supply the lines (in the standard "old = context+deletion order, new =
+// context+addition order" convention) plus the starting line numbers.
+function makeHunk(repositoryId: string, oldStart: number, newStart: number, header: string, lines: DiffLine[]): DiffHunk {
+  const old_lines = lines.filter((entry) => entry.type !== "addition").length;
+  const new_lines = lines.filter((entry) => entry.type !== "deletion").length;
+  return { repository_id: repositoryId, old_start: oldStart, old_lines, new_start: newStart, new_lines, header, lines };
+}
+
+function renderPatch(hunks: DiffHunk[]): string {
+  return hunks
+    .map((hunk) => {
+      const header = `@@ -${hunk.old_start},${hunk.old_lines} +${hunk.new_start},${hunk.new_lines} @@${hunk.header ? ` ${hunk.header}` : ""}`;
+      const body = hunk.lines.map((entry) => {
+        const marker = entry.type === "addition" ? "+" : entry.type === "deletion" ? "-" : " ";
+        return `${marker}${entry.content}`;
+      });
+      return [header, ...body].join("\n");
+    })
+    .join("\n");
+}
+
+const fileContentStore = new Map<string, PinnedFileContent>();
+function contentKey(roundId: string, repositoryId: string, path: string, side: "LEFT" | "RIGHT"): string {
+  return `${roundId}\u0000${repositoryId}\u0000${path}\u0000${side}`;
+}
+function registerContent(
+  roundId: string,
+  repositoryId: string,
+  path: string,
+  side: "LEFT" | "RIGHT",
+  content: string | null,
+  blobSha: string,
+  isBinary: boolean,
+): void {
+  fileContentStore.set(contentKey(roundId, repositoryId, path, side), {
+    repository_id: repositoryId,
+    path,
+    side,
+    blob_sha: blobSha,
+    is_binary: isBinary,
+    content,
+  });
+}
+
+function makeTextFile(opts: {
+  roundId: string;
+  repositoryId: string;
+  oldPath: string | null;
+  newPath: string | null;
+  status: DiffFileStatus;
+  oldContent: string | null;
+  newContent: string | null;
+  hunks: DiffHunk[];
+}): DiffFile {
+  const oldBlob = opts.oldPath ? fakeSha(`${opts.roundId}:${opts.repositoryId}:${opts.oldPath}:old`) : null;
+  const newBlob = opts.newPath ? fakeSha(`${opts.roundId}:${opts.repositoryId}:${opts.newPath}:new`) : null;
+  if (opts.oldPath && oldBlob) registerContent(opts.roundId, opts.repositoryId, opts.oldPath, "LEFT", opts.oldContent, oldBlob, false);
+  if (opts.newPath && newBlob) registerContent(opts.roundId, opts.repositoryId, opts.newPath, "RIGHT", opts.newContent, newBlob, false);
+  return {
+    repository_id: opts.repositoryId,
+    old_path: opts.oldPath,
+    new_path: opts.newPath,
+    old_blob_sha: oldBlob,
+    new_blob_sha: newBlob,
+    status: opts.status,
+    is_binary: false,
+    patch: renderPatch(opts.hunks),
+    hunks: opts.hunks,
+  };
+}
+
+function makeBinaryFile(opts: { roundId: string; repositoryId: string; path: string; status: DiffFileStatus }): DiffFile {
+  const oldBlob = fakeSha(`${opts.roundId}:${opts.repositoryId}:${opts.path}:old-binary`);
+  const newBlob = fakeSha(`${opts.roundId}:${opts.repositoryId}:${opts.path}:new-binary`);
+  registerContent(opts.roundId, opts.repositoryId, opts.path, "LEFT", null, oldBlob, true);
+  registerContent(opts.roundId, opts.repositoryId, opts.path, "RIGHT", null, newBlob, true);
+  return {
+    repository_id: opts.repositoryId,
+    old_path: opts.path,
+    new_path: opts.path,
+    old_blob_sha: oldBlob,
+    new_blob_sha: newBlob,
+    status: opts.status,
+    is_binary: true,
+    patch: "Binary files differ",
+    hunks: [],
+  };
+}
+
+/* ------------------------------------------------------------------------------------------ *
+ * ROUND A — "Add retry backoff to sync worker" (local, queued, single repo, simple)
+ * ------------------------------------------------------------------------------------------ */
+
+const ROUND_RETRY = "round-local-retry-backoff";
+const REPO_NOTIFY = "repo-notify-worker";
+
+const retrySyncClientOld = [
+  '"""Sync worker client for pushing local review state upstream."""',
+  "",
+  "import time",
+  "",
+  "DEFAULT_TIMEOUT_SECONDS = 5",
+  "MAX_ATTEMPTS = 1",
+  "",
+  "",
+  "class SyncClient:",
+  "    def __init__(self, endpoint: str, timeout: int = DEFAULT_TIMEOUT_SECONDS):",
+  "        self.endpoint = endpoint",
+  "        self.timeout = timeout",
+  "",
+  "    def push(self, payload: dict) -> bool:",
+  "        response = self._send(payload)",
+  "        return response.ok",
+  "",
+  "    def _send(self, payload: dict):",
+  "        return self._transport.post(self.endpoint, json=payload, timeout=self.timeout)",
+].join("\n");
+
+const retrySyncClientNew = [
+  '"""Sync worker client for pushing local review state upstream."""',
+  "",
+  "import time",
+  "",
+  "DEFAULT_TIMEOUT_SECONDS = 5",
+  "MAX_ATTEMPTS = 4",
+  "BACKOFF_BASE_SECONDS = 0.5",
+  "",
+  "",
+  "class SyncClient:",
+  "    def __init__(self, endpoint: str, timeout: int = DEFAULT_TIMEOUT_SECONDS):",
+  "        self.endpoint = endpoint",
+  "        self.timeout = timeout",
+  "",
+  "    def push(self, payload: dict) -> bool:",
+  "        for attempt in range(1, MAX_ATTEMPTS + 1):",
+  "            response = self._send(payload)",
+  "            if response.ok:",
+  "                return True",
+  "            time.sleep(BACKOFF_BASE_SECONDS * attempt)",
+  "        return False",
+  "",
+  "    def _send(self, payload: dict):",
+  "        return self._transport.post(self.endpoint, json=payload, timeout=self.timeout)",
+].join("\n");
+
+const retryHunk1 = makeHunk(REPO_NOTIFY, 5, 5, "class SyncClient:", [
+  line("context", "DEFAULT_TIMEOUT_SECONDS = 5"),
+  line("deletion", "MAX_ATTEMPTS = 1"),
+  line("addition", "MAX_ATTEMPTS = 4"),
+  line("addition", "BACKOFF_BASE_SECONDS = 0.5"),
+  line("context", ""),
+]);
+
+const retryHunk2 = makeHunk(REPO_NOTIFY, 14, 15, "def push", [
+  line("context", "    def push(self, payload: dict) -> bool:"),
+  line("deletion", "        response = self._send(payload)"),
+  line("deletion", "        return response.ok"),
+  line("addition", "        for attempt in range(1, MAX_ATTEMPTS + 1):"),
+  line("addition", "            response = self._send(payload)"),
+  line("addition", "            if response.ok:"),
+  line("addition", "                return True"),
+  line("addition", "            time.sleep(BACKOFF_BASE_SECONDS * attempt)"),
+  line("addition", "        return False"),
+  line("context", ""),
+]);
+
+const retryFile = makeTextFile({
+  roundId: ROUND_RETRY,
+  repositoryId: REPO_NOTIFY,
+  oldPath: "src/worker/sync_client.py",
+  newPath: "src/worker/sync_client.py",
+  status: "modified",
+  oldContent: retrySyncClientOld,
+  newContent: retrySyncClientNew,
+  hunks: [retryHunk1, retryHunk2],
+});
+
+const retryBaseSha = fakeSha(`${ROUND_RETRY}:${REPO_NOTIFY}:base`);
+const retryHeadSha = fakeSha(`${ROUND_RETRY}:${REPO_NOTIFY}:head`);
+
+const retryManifest: WorkspaceManifest = {
+  workspace_id: nextId("workspace"),
+  workspace_root: "/Users/fixture/dev/notify-worker",
+  topic: "retry-backoff",
+  repositories: [
+    {
+      repository_id: REPO_NOTIFY,
+      root: "notify-worker",
+      branch: "feature/retry-backoff",
+      base_sha: retryBaseSha,
+      head_sha: retryHeadSha,
+      remote_fingerprint: null,
+      object_checksum: fakeSha(`${ROUND_RETRY}:checksum`),
+    },
+  ],
+  before_fingerprint: fakeSha(`${ROUND_RETRY}:before`),
+  after_fingerprint: fakeSha(`${ROUND_RETRY}:after`),
+  created_at: minutesAgoIso(115),
+  origin_route_id: null,
+};
+
+const roundRetry: ReviewRound = {
+  id: ROUND_RETRY,
+  collection: "local",
+  source_adapter: sourceAdapter("local"),
+  topic_identity: "retry-backoff",
+  manifest_hash: fakeSha(`${ROUND_RETRY}:manifest`),
+  brief: {
+    title: "Add retry backoff to sync worker",
+    what: "Retries a failed push up to 4 times with a small linear backoff instead of failing immediately.",
+    why: "Sync worker calls were failing hard on transient network blips during large review submissions.",
+    approach_alternatives: "Considered exponential backoff; linear backoff keeps worst-case latency predictable for a 4-attempt ceiling.",
+    testing: "Added a unit test that fails the first two attempts via a stub transport and asserts the third succeeds.",
+  },
+  manifest: retryManifest,
+  rank: 0,
+  lifecycle: "queued",
+  superseded_by: null,
+  created_at: minutesAgoIso(115),
+  origin_route_id: null,
+  source_metadata: null,
+};
+
+const retryDiff: MaterializedDiff = {
+  repositories: [
+    {
+      repository_id: REPO_NOTIFY,
+      root: "notify-worker",
+      base_sha: retryBaseSha,
+      head_sha: retryHeadSha,
+      files: [retryFile],
+    },
+  ],
+};
+
+/* ------------------------------------------------------------------------------------------ *
+ * ROUND B — "Fix pagination cursor drift" (local, changes_requested, multi-repo, comprehensive)
+ * ------------------------------------------------------------------------------------------ */
+
+const ROUND_PAGINATION = "round-local-pagination-cursor";
+const REPO_CORE_API = "repo-core-api";
+const REPO_WEB_FRONTEND = "repo-web-frontend";
+
+// --- core-api/src/pagination/cursor.py — modified, 2 hunks -----------------------------------
+
+const cursorPyOld = [
+  '"""Cursor encode/decode helpers for paginated list endpoints."""',
+  "",
+  "import base64",
+  "import json",
+  "",
+  "",
+  "def encode_cursor(offset: int, last_id: str) -> str:",
+  '    payload = {"o": offset, "id": last_id}',
+  "    raw = json.dumps(payload)",
+  "    return base64.urlsafe_b64encode(raw.encode()).decode()",
+  "",
+  "",
+  "def decode_cursor(cursor: str) -> dict:",
+  "    raw = base64.urlsafe_b64decode(cursor.encode())",
+  "    payload = json.loads(raw)",
+  '    return {"offset": payload["o"], "last_id": payload["id"]}',
+  "",
+  "",
+  "def next_cursor(current: dict, page: list) -> str | None:",
+  "    if not page:",
+  "        return None",
+  '    offset = current["offset"] + len(page)',
+  '    return encode_cursor(offset, page[-1]["id"])',
+].join("\n");
+
+const cursorPyNew = [
+  '"""Cursor encode/decode helpers for paginated list endpoints."""',
+  "",
+  "import base64",
+  "import json",
+  "",
+  "CURSOR_VERSION = 2",
+  "",
+  "",
+  "def encode_cursor(offset: int, last_id: str) -> str:",
+  '    payload = {"v": CURSOR_VERSION, "o": offset, "id": last_id}',
+  "    raw = json.dumps(payload)",
+  "    return base64.urlsafe_b64encode(raw.encode()).decode()",
+  "",
+  "",
+  "def decode_cursor(cursor: str) -> dict:",
+  "    raw = base64.urlsafe_b64decode(cursor.encode())",
+  "    payload = json.loads(raw)",
+  '    if payload.get("v") != CURSOR_VERSION:',
+  '        raise ValueError("unsupported cursor version: " + str(payload.get("v")))',
+  '    return {"offset": payload["o"], "last_id": payload["id"]}',
+  "",
+  "",
+  "def next_cursor(current: dict, page: list) -> str | None:",
+  "    if not page:",
+  "        return None",
+  '    offset = current["offset"] + len(page)',
+  '    return encode_cursor(offset, page[-1]["id"])',
+].join("\n");
+
+const cursorHunk1 = makeHunk(REPO_CORE_API, 5, 5, "def encode_cursor(offset: int, last_id: str) -> str:", [
+  line("context", ""),
+  line("addition", "CURSOR_VERSION = 2"),
+  line("addition", ""),
+  line("context", ""),
+  line("context", "def encode_cursor(offset: int, last_id: str) -> str:"),
+  line("deletion", '    payload = {"o": offset, "id": last_id}'),
+  line("addition", '    payload = {"v": CURSOR_VERSION, "o": offset, "id": last_id}'),
+  line("context", "    raw = json.dumps(payload)"),
+  line("context", "    return base64.urlsafe_b64encode(raw.encode()).decode()"),
+]);
+
+const cursorHunk2 = makeHunk(REPO_CORE_API, 11, 13, "def decode_cursor(cursor: str) -> dict:", [
+  line("context", ""),
+  line("context", ""),
+  line("context", "def decode_cursor(cursor: str) -> dict:"),
+  line("context", "    raw = base64.urlsafe_b64decode(cursor.encode())"),
+  line("context", "    payload = json.loads(raw)"),
+  line("addition", '    if payload.get("v") != CURSOR_VERSION:'),
+  line("addition", '        raise ValueError("unsupported cursor version: " + str(payload.get("v")))'),
+  line("context", '    return {"offset": payload["o"], "last_id": payload["id"]}'),
+]);
+
+const cursorFile = makeTextFile({
+  roundId: ROUND_PAGINATION,
+  repositoryId: REPO_CORE_API,
+  oldPath: "src/pagination/cursor.py",
+  newPath: "src/pagination/cursor.py",
+  status: "modified",
+  oldContent: cursorPyOld,
+  newContent: cursorPyNew,
+  hunks: [cursorHunk1, cursorHunk2],
+});
+const cursorNewBlob = cursorFile.new_blob_sha as string;
+
+// --- core-api/src/pagination/legacy_cursor.py — deleted --------------------------------------
+
+const legacyCursorPy = [
+  '"""Deprecated legacy pagination cursor format, kept for old client compatibility."""',
+  "",
+  "import base64",
+  "",
+  "",
+  "def encode_legacy_cursor(offset: int) -> str:",
+  "    return base64.urlsafe_b64encode(str(offset).encode()).decode()",
+  "",
+  "",
+  "def decode_legacy_cursor(cursor: str) -> int:",
+  "    return int(base64.urlsafe_b64decode(cursor.encode()).decode())",
+].join("\n");
+
+const legacyCursorHunk = makeHunk(REPO_CORE_API, 1, 1, "", [
+  line("deletion", '"""Deprecated legacy pagination cursor format, kept for old client compatibility."""'),
+  line("deletion", ""),
+  line("deletion", "import base64"),
+  line("deletion", ""),
+  line("deletion", ""),
+  line("deletion", "def encode_legacy_cursor(offset: int) -> str:"),
+  line("deletion", "    return base64.urlsafe_b64encode(str(offset).encode()).decode()"),
+  line("deletion", ""),
+  line("deletion", ""),
+  line("deletion", "def decode_legacy_cursor(cursor: str) -> int:"),
+  line("deletion", "    return int(base64.urlsafe_b64decode(cursor.encode()).decode())"),
+]);
+
+const legacyCursorFile = makeTextFile({
+  roundId: ROUND_PAGINATION,
+  repositoryId: REPO_CORE_API,
+  oldPath: "src/pagination/legacy_cursor.py",
+  newPath: null,
+  status: "deleted",
+  oldContent: legacyCursorPy,
+  newContent: null,
+  hunks: [legacyCursorHunk],
+});
+
+// --- web-frontend/src/hooks/usePagination.ts — added ------------------------------------------
+
+const usePaginationTs = [
+  'import { useCallback, useState } from "react";',
+  "",
+  "export interface PaginationCursor {",
+  "  cursor: string | null;",
+  "  hasMore: boolean;",
+  "}",
+  "",
+  "export function usePagination<T>(fetchPage: (cursor: string | null) => Promise<{ items: T[]; cursor: PaginationCursor }>) {",
+  "  const [items, setItems] = useState<T[]>([]);",
+  "  const [cursor, setCursor] = useState<PaginationCursor>({ cursor: null, hasMore: true });",
+  "  const [loading, setLoading] = useState(false);",
+  "",
+  "  const loadMore = useCallback(async () => {",
+  "    if (loading || !cursor.hasMore) return;",
+  "    setLoading(true);",
+  "    try {",
+  "      const page = await fetchPage(cursor.cursor);",
+  "      setItems((current) => [...current, ...page.items]);",
+  "      setCursor(page.cursor);",
+  "    } finally {",
+  "      setLoading(false);",
+  "    }",
+  "  }, [cursor, fetchPage, loading]);",
+  "",
+  "  return { items, loadMore, loading, hasMore: cursor.hasMore };",
+  "}",
+].join("\n");
+
+const usePaginationHunk = makeHunk(REPO_WEB_FRONTEND, 0, 1, "", usePaginationTs.split("\n").map((text) => line("addition", text)));
+
+const usePaginationFile = makeTextFile({
+  roundId: ROUND_PAGINATION,
+  repositoryId: REPO_WEB_FRONTEND,
+  oldPath: null,
+  newPath: "src/hooks/usePagination.ts",
+  status: "added",
+  oldContent: null,
+  newContent: usePaginationTs,
+  hunks: [usePaginationHunk],
+});
+const usePaginationBlob = usePaginationFile.new_blob_sha as string;
+
+// --- web-frontend/public/assets/pagination-diagram.png — binary, modified --------------------
+
+const paginationDiagramFile = makeBinaryFile({
+  roundId: ROUND_PAGINATION,
+  repositoryId: REPO_WEB_FRONTEND,
+  path: "public/assets/pagination-diagram.png",
+  status: "modified",
+});
+
+// --- web-frontend/packages/very/deeply/nested/.../component.ts — modified, long path ---------
+
+const LONG_PATH = "packages/very/deeply/nested/directory/structure/module/component.ts";
+
+const componentTsOld = [
+  'import { formatDistanceToNow } from "../../../../../../shared/date";',
+  "",
+  "export function Component({ updatedAt }: { updatedAt: string }) {",
+  "  return <span>{formatDistanceToNow(updatedAt)}</span>;",
+  "}",
+].join("\n");
+
+const componentTsNew = [
+  'import { formatDistanceToNow } from "../../../../../../shared/date";',
+  "",
+  "export function Component({ updatedAt }: { updatedAt: string }) {",
+  "  return <span title={updatedAt}>{formatDistanceToNow(updatedAt)}</span>;",
+  "}",
+].join("\n");
+
+const componentHunk = makeHunk(REPO_WEB_FRONTEND, 1, 1, "", [
+  line("context", 'import { formatDistanceToNow } from "../../../../../../shared/date";'),
+  line("context", ""),
+  line("context", "export function Component({ updatedAt }: { updatedAt: string }) {"),
+  line("deletion", "  return <span>{formatDistanceToNow(updatedAt)}</span>;"),
+  line("addition", "  return <span title={updatedAt}>{formatDistanceToNow(updatedAt)}</span>;"),
+  line("context", "}"),
+]);
+
+const componentFile = makeTextFile({
+  roundId: ROUND_PAGINATION,
+  repositoryId: REPO_WEB_FRONTEND,
+  oldPath: LONG_PATH,
+  newPath: LONG_PATH,
+  status: "modified",
+  oldContent: componentTsOld,
+  newContent: componentTsNew,
+  hunks: [componentHunk],
+});
+
+const coreApiBaseSha = fakeSha(`${ROUND_PAGINATION}:${REPO_CORE_API}:base`);
+const coreApiHeadSha = fakeSha(`${ROUND_PAGINATION}:${REPO_CORE_API}:head`);
+const webFrontendBaseSha = fakeSha(`${ROUND_PAGINATION}:${REPO_WEB_FRONTEND}:base`);
+const webFrontendHeadSha = fakeSha(`${ROUND_PAGINATION}:${REPO_WEB_FRONTEND}:head`);
+
+const paginationManifest: WorkspaceManifest = {
+  workspace_id: nextId("workspace"),
+  workspace_root: "/Users/fixture/dev/web-platform",
+  topic: "pagination-cursor-fix",
+  repositories: [
+    {
+      repository_id: REPO_CORE_API,
+      root: "core-api",
+      branch: "feature/pagination-cursor-fix",
+      base_sha: coreApiBaseSha,
+      head_sha: coreApiHeadSha,
+      remote_fingerprint: null,
+      object_checksum: fakeSha(`${ROUND_PAGINATION}:${REPO_CORE_API}:checksum`),
+    },
+    {
+      repository_id: REPO_WEB_FRONTEND,
+      root: "web-frontend",
+      branch: "feature/pagination-cursor-fix",
+      base_sha: webFrontendBaseSha,
+      head_sha: webFrontendHeadSha,
+      remote_fingerprint: null,
+      object_checksum: fakeSha(`${ROUND_PAGINATION}:${REPO_WEB_FRONTEND}:checksum`),
+    },
+  ],
+  before_fingerprint: fakeSha(`${ROUND_PAGINATION}:before`),
+  after_fingerprint: fakeSha(`${ROUND_PAGINATION}:after`),
+  created_at: minutesAgoIso(600),
+  origin_route_id: "route-fixture-1",
+};
+
+const roundPagination: ReviewRound = {
+  id: ROUND_PAGINATION,
+  collection: "local",
+  source_adapter: sourceAdapter("local"),
+  topic_identity: "pagination-cursor-fix",
+  manifest_hash: fakeSha(`${ROUND_PAGINATION}:manifest`),
+  brief: {
+    title: "Fix pagination cursor drift across core-api and web-frontend",
+    what: "Adds a version field to the pagination cursor payload, removes the unused legacy cursor codec, and introduces a typed usePagination hook on the frontend.",
+    why: "Clients holding an old-format cursor across a deploy were silently getting wrong offsets instead of a clear error.",
+    approach_alternatives: "Considered a fully new endpoint instead of versioning the cursor in place; versioning was chosen to avoid a breaking API surface change for existing integrations.",
+    testing: "Added unit tests for encode/decode round-tripping and a version-mismatch rejection test; frontend hook covered by a new usePagination.test.ts (not shown in this snapshot).",
+  },
+  manifest: paginationManifest,
+  rank: 1,
+  lifecycle: "changes_requested",
+  superseded_by: null,
+  created_at: minutesAgoIso(600),
+  origin_route_id: "route-fixture-1",
+  source_metadata: null,
+};
+
+const paginationDiff: MaterializedDiff = {
+  repositories: [
+    {
+      repository_id: REPO_CORE_API,
+      root: "core-api",
+      base_sha: coreApiBaseSha,
+      head_sha: coreApiHeadSha,
+      files: [cursorFile, legacyCursorFile],
+    },
+    {
+      repository_id: REPO_WEB_FRONTEND,
+      root: "web-frontend",
+      base_sha: webFrontendBaseSha,
+      head_sha: webFrontendHeadSha,
+      files: [usePaginationFile, paginationDiagramFile, componentFile],
+    },
+  ],
+};
+
+/* ------------------------------------------------------------------------------------------ *
+ * ROUND C — "Improve error messages for expired tokens" (github, queued)
+ * ------------------------------------------------------------------------------------------ */
+
+const ROUND_TOKENS = "round-github-expired-tokens";
+const REPO_AUTH_SERVICE = "repo-auth-service";
+
+const tokenErrorsBase = [
+  "export interface TokenError {",
+  '  code: "expired" | "revoked" | "malformed";',
+  "  expiredAt?: Date;",
+  "}",
+  "",
+  "export function describeTokenError(error: TokenError): string {",
+  "  switch (error.code) {",
+  '    case "expired":',
+  '      return "Your session expired.";',
+  '    case "revoked":',
+  '      return "Your session was revoked by an administrator.";',
+  "    default:",
+  '      return "Your session is no longer valid.";',
+  "  }",
+  "}",
+].join("\n");
+
+const tokenErrorsHead = [
+  "export interface TokenError {",
+  '  code: "expired" | "revoked" | "malformed";',
+  "  expiredAt?: Date;",
+  "}",
+  "",
+  "export function describeTokenError(error: TokenError): string {",
+  "  switch (error.code) {",
+  '    case "expired":',
+  '      return "Your session expired at " + (error.expiredAt ? error.expiredAt.toLocaleString() : "an earlier time") + ". Sign in again to continue.";',
+  '    case "revoked":',
+  '      return "Your session was revoked by an administrator.";',
+  "    default:",
+  '      return "Your session is no longer valid.";',
+  "  }",
+  "}",
+].join("\n");
+
+const tokenErrorsHunk = makeHunk(REPO_AUTH_SERVICE, 7, 7, "export function describeTokenError(error: TokenError): string {", [
+  line("context", "  switch (error.code) {"),
+  line("context", '    case "expired":'),
+  line("deletion", '      return "Your session expired.";'),
+  line("addition", '      return "Your session expired at " + (error.expiredAt ? error.expiredAt.toLocaleString() : "an earlier time") + ". Sign in again to continue.";'),
+  line("context", '    case "revoked":'),
+  line("context", '      return "Your session was revoked by an administrator.";'),
+]);
+
+const tokenErrorsTestTs = [
+  'import { describeTokenError } from "../token_errors";',
+  "",
+  'describe("describeTokenError", () => {',
+  '  it("includes the expiry timestamp for expired tokens", () => {',
+  '    const expiredAt = new Date("2026-01-01T00:00:00Z");',
+  '    const message = describeTokenError({ code: "expired", expiredAt });',
+  "    expect(message).toContain(expiredAt.toLocaleString());",
+  "  });",
+  "});",
+].join("\n");
+
+const tokenErrorsTestHunk = makeHunk(REPO_AUTH_SERVICE, 0, 1, "", tokenErrorsTestTs.split("\n").map((text) => line("addition", text)));
+
+const tokensBaseSha = fakeSha(`${ROUND_TOKENS}:base`);
+const tokensHeadSha = fakeSha(`${ROUND_TOKENS}:head`);
+const tokenErrorsBaseBlob = fakeSha(`${ROUND_TOKENS}:token_errors.ts:base`);
+const tokenErrorsHeadBlob = fakeSha(`${ROUND_TOKENS}:token_errors.ts:head`);
+const tokenErrorsTestHeadBlob = fakeSha(`${ROUND_TOKENS}:token_errors.test.ts:head`);
+const ZERO_BLOB = "0".repeat(40);
+
+const githubFiles: GithubMaterializedFile[] = [
+  {
+    path: "src/auth/token_errors.ts",
+    status: "modified",
+    base_blob_sha: tokenErrorsBaseBlob,
+    head_blob_sha: tokenErrorsHeadBlob,
+    is_binary: false,
+    base_content: tokenErrorsBase,
+    head_content: tokenErrorsHead,
+    base_content_base64: null,
+    head_content_base64: null,
+    unified_diff: renderPatch([tokenErrorsHunk]),
+  },
+  {
+    path: "src/auth/__tests__/token_errors.test.ts",
+    status: "added",
+    base_blob_sha: ZERO_BLOB,
+    head_blob_sha: tokenErrorsTestHeadBlob,
+    is_binary: false,
+    base_content: null,
+    head_content: tokenErrorsTestTs,
+    base_content_base64: null,
+    head_content_base64: null,
+    unified_diff: renderPatch([tokenErrorsTestHunk]),
+  },
+];
+
+const tokensMetadata: GithubPullRequestMetadata = {
+  host: "github.com",
+  owner: "acme-widgets",
+  repository: "auth-service",
+  pull_number: 482,
+  title: "Improve error messages for expired tokens",
+  body: "Expired-token errors were a bare \"Your session expired.\" with no timestamp, which made support tickets hard to triage. This adds the expiry timestamp to the message and a regression test.",
+  base_sha: tokensBaseSha,
+  head_sha: tokensHeadSha,
+  state: "open",
+  is_draft: false,
+  web_url: "https://github.com/acme-widgets/auth-service/pull/482",
+};
+
+const importedComments: ImportedComment[] = [
+  {
+    id: "imported-comment-1",
+    thread_id: "thread-1",
+    body: 'Nice fix — can we also cover the "revoked" case with a similarly specific message?',
+    upstream_author: "octo-reviewer",
+    upstream_created_at: minutesAgoIso(200),
+    source_url: "https://github.com/acme-widgets/auth-service/pull/482#discussion_r1",
+    kind: "review_thread_comment",
+    upstream_resolved: false,
+    upstream_review_state: null,
+    anchor: {
+      repository_id: REPO_AUTH_SERVICE,
+      workspace_relative_path: "auth-service/src/auth/token_errors.ts",
+      side: "RIGHT",
+      start_line: 9,
+      end_line: 9,
+      blob_sha: tokenErrorsHeadBlob,
+      selected_code: '      return "Your session expired at " + (error.expiredAt ? error.expiredAt.toLocaleString() : "an earlier time") + ". Sign in again to continue.";',
+    },
+  },
+  {
+    id: "imported-comment-2",
+    thread_id: "thread-2",
+    body: "Looks good overall, just the one inline note.",
+    upstream_author: "octo-reviewer",
+    upstream_created_at: minutesAgoIso(195),
+    source_url: "https://github.com/acme-widgets/auth-service/pull/482#pullrequestreview-1",
+    kind: "review_summary",
+    upstream_resolved: true,
+    upstream_review_state: "commented",
+    anchor: null,
+  },
+];
+
+const roundTokens: ReviewRound = {
+  id: ROUND_TOKENS,
+  collection: "github",
+  source_adapter: sourceAdapter("github"),
+  topic_identity: "github:acme-widgets/auth-service#482",
+  manifest_hash: fakeSha(`${ROUND_TOKENS}:manifest`),
+  brief: {
+    title: "Improve error messages for expired tokens",
+    what: "Adds the expiry timestamp to the expired-token error message and a regression test.",
+    why: "Support tickets about expired sessions lacked enough detail to tell how stale the session was.",
+    approach_alternatives: "Considered a generic \"contact support\" message instead; kept it specific since the timestamp is what support actually asks for first.",
+    testing: "One new unit test asserting the formatted timestamp appears in the message.",
+  },
+  manifest: {
+    workspace_id: nextId("workspace"),
+    workspace_root: "/Users/fixture/dev/auth-service",
+    topic: "github:acme-widgets/auth-service#482",
+    repositories: [
+      {
+        repository_id: REPO_AUTH_SERVICE,
+        root: "auth-service",
+        branch: "main",
+        base_sha: tokensBaseSha,
+        head_sha: tokensHeadSha,
+        remote_fingerprint: null,
+        object_checksum: fakeSha(`${ROUND_TOKENS}:checksum`),
+      },
+    ],
+    before_fingerprint: fakeSha(`${ROUND_TOKENS}:before`),
+    after_fingerprint: fakeSha(`${ROUND_TOKENS}:after`),
+    created_at: minutesAgoIso(210),
+    origin_route_id: null,
+  },
+  rank: 0,
+  lifecycle: "queued",
+  superseded_by: null,
+  created_at: minutesAgoIso(210),
+  origin_route_id: null,
+  source_metadata: { kind: "github", owner: "acme-widgets", repository: "auth-service", pull_number: 482, head_sha: tokensHeadSha },
+};
+
+/* ------------------------------------------------------------------------------------------ *
+ * ROUND D — "Refactor session cache eviction" (machine-sourced local round, queued)
+ * ------------------------------------------------------------------------------------------ */
+
+const ROUND_CACHE = "round-local-cache-eviction";
+const REPO_SESSION_CACHE = "repo-session-cache";
+const MACHINE_BUILDBOX = "machine-fixture-buildbox";
+const MACHINE_CACHE_ITEM = "item-cache-eviction";
+
+const evictionPyOld = [
+  "def evict(cache: dict, max_size: int) -> None:",
+  "    while len(cache) > max_size:",
+  "        oldest_key = next(iter(cache))",
+  "        del cache[oldest_key]",
+].join("\n");
+
+const evictionPyNew = [
+  'def evict(cache: "OrderedDict[str, CacheEntry]", max_size: int) -> None:',
+  "    while len(cache) > max_size:",
+  "        oldest_key, oldest_entry = next(iter(cache.items()))",
+  "        if oldest_entry.pinned:",
+  "            cache.move_to_end(oldest_key)",
+  "            continue",
+  "        del cache[oldest_key]",
+].join("\n");
+
+const evictionHunk = makeHunk(REPO_SESSION_CACHE, 1, 1, "", [
+  line("deletion", "def evict(cache: dict, max_size: int) -> None:"),
+  line("addition", 'def evict(cache: "OrderedDict[str, CacheEntry]", max_size: int) -> None:'),
+  line("context", "    while len(cache) > max_size:"),
+  line("deletion", "        oldest_key = next(iter(cache))"),
+  line("addition", "        oldest_key, oldest_entry = next(iter(cache.items()))"),
+  line("addition", "        if oldest_entry.pinned:"),
+  line("addition", "            cache.move_to_end(oldest_key)"),
+  line("addition", "            continue"),
+  line("context", "        del cache[oldest_key]"),
+]);
+
+const evictionFile = makeTextFile({
+  roundId: ROUND_CACHE,
+  repositoryId: REPO_SESSION_CACHE,
+  oldPath: "src/cache/eviction.py",
+  newPath: "src/cache/eviction.py",
+  status: "modified",
+  oldContent: evictionPyOld,
+  newContent: evictionPyNew,
+  hunks: [evictionHunk],
+});
+
+const cacheBaseSha = fakeSha(`${ROUND_CACHE}:base`);
+const cacheHeadSha = fakeSha(`${ROUND_CACHE}:head`);
+
+const roundCache: ReviewRound = {
+  id: ROUND_CACHE,
+  collection: "machine",
+  source_adapter: sourceAdapter("machine"),
+  topic_identity: "cache-eviction-refactor",
+  manifest_hash: fakeSha(`${ROUND_CACHE}:manifest`),
+  brief: {
+    title: "Refactor session cache eviction",
+    what: "Pinned cache entries are now skipped by LRU eviction instead of being evicted like any other entry.",
+    why: "An in-flight session's cache entry was occasionally evicted mid-request, causing spurious re-authentication.",
+    approach_alternatives: "Considered a separate pinned-entry cache instead of a pinned flag; the flag is simpler and keeps a single eviction code path.",
+    testing: "Added a test that pins an entry, fills the cache past max_size, and asserts the pinned entry survives eviction.",
+  },
+  manifest: {
+    workspace_id: nextId("workspace"),
+    workspace_root: "/home/build/workspaces/session-cache",
+    topic: "cache-eviction-refactor",
+    repositories: [
+      {
+        repository_id: REPO_SESSION_CACHE,
+        root: "session-cache",
+        branch: "fix/pinned-eviction",
+        base_sha: cacheBaseSha,
+        head_sha: cacheHeadSha,
+        remote_fingerprint: null,
+        object_checksum: fakeSha(`${ROUND_CACHE}:checksum`),
+      },
+    ],
+    before_fingerprint: fakeSha(`${ROUND_CACHE}:before`),
+    after_fingerprint: fakeSha(`${ROUND_CACHE}:after`),
+    created_at: minutesAgoIso(40),
+    origin_route_id: null,
+  },
+  rank: 2,
+  lifecycle: "queued",
+  superseded_by: null,
+  created_at: minutesAgoIso(40),
+  origin_route_id: null,
+  source_metadata: {
+    kind: "machine",
+    machine_id: MACHINE_BUILDBOX,
+    machine_name: "Fixture Build Machine",
+    source_item_id: MACHINE_CACHE_ITEM,
+    remote_workspace_id: "ws-session-cache",
+    remote_workspace_path: "/home/build/workspaces/session-cache",
+    cursor: "cursor-77",
+    cached_at: minutesAgoIso(40),
+  },
+};
+
+const cacheDiff: MaterializedDiff = {
+  repositories: [
+    {
+      repository_id: REPO_SESSION_CACHE,
+      root: "session-cache",
+      base_sha: cacheBaseSha,
+      head_sha: cacheHeadSha,
+      files: [evictionFile],
+    },
+  ],
+};
+
+/* ------------------------------------------------------------------------------------------ *
+ * ROUND E — "Rename legacy config module" (local, completed)
+ * ------------------------------------------------------------------------------------------ */
+
+const ROUND_RENAME = "round-local-rename-config";
+const REPO_CONFIG_SERVICE = "repo-config-service";
+
+const settingsPyOld = ['DEFAULT_LOG_LEVEL = "info"', 'FEATURE_FLAGS_PATH = "config/flags.legacy.json"'].join("\n");
+const settingsPyNew = ['DEFAULT_LOG_LEVEL = "info"', 'FEATURE_FLAGS_PATH = "config/flags.json"'].join("\n");
+
+const settingsHunk = makeHunk(REPO_CONFIG_SERVICE, 1, 1, "", [
+  line("context", 'DEFAULT_LOG_LEVEL = "info"'),
+  line("deletion", 'FEATURE_FLAGS_PATH = "config/flags.legacy.json"'),
+  line("addition", 'FEATURE_FLAGS_PATH = "config/flags.json"'),
+]);
+
+const settingsFile = makeTextFile({
+  roundId: ROUND_RENAME,
+  repositoryId: REPO_CONFIG_SERVICE,
+  oldPath: "src/config/settings.py",
+  newPath: "src/config/settings.py",
+  status: "modified",
+  oldContent: settingsPyOld,
+  newContent: settingsPyNew,
+  hunks: [settingsHunk],
+});
+
+const renameBaseSha = fakeSha(`${ROUND_RENAME}:base`);
+const renameHeadSha = fakeSha(`${ROUND_RENAME}:head`);
+
+const roundRename: ReviewRound = {
+  id: ROUND_RENAME,
+  collection: "local",
+  source_adapter: sourceAdapter("local"),
+  topic_identity: "rename-legacy-config",
+  manifest_hash: fakeSha(`${ROUND_RENAME}:manifest`),
+  brief: {
+    title: "Rename legacy config module path constant",
+    what: "Points FEATURE_FLAGS_PATH at the non-legacy flags file now that the legacy format is fully migrated.",
+    why: "The legacy path was left in place as a safety net during migration; migration finished last sprint.",
+    approach_alternatives: "",
+    testing: "Existing config-loading tests cover this constant; no new tests needed.",
+  },
+  manifest: {
+    workspace_id: nextId("workspace"),
+    workspace_root: "/Users/fixture/dev/config-service",
+    topic: "rename-legacy-config",
+    repositories: [
+      {
+        repository_id: REPO_CONFIG_SERVICE,
+        root: "config-service",
+        branch: "chore/drop-legacy-flags-path",
+        base_sha: renameBaseSha,
+        head_sha: renameHeadSha,
+        remote_fingerprint: null,
+        object_checksum: fakeSha(`${ROUND_RENAME}:checksum`),
+      },
+    ],
+    before_fingerprint: fakeSha(`${ROUND_RENAME}:before`),
+    after_fingerprint: fakeSha(`${ROUND_RENAME}:after`),
+    created_at: minutesAgoIso(4000),
+    origin_route_id: null,
+  },
+  rank: 0,
+  lifecycle: "completed",
+  superseded_by: null,
+  created_at: minutesAgoIso(4000),
+  origin_route_id: null,
+  source_metadata: null,
+};
+
+const renameDiff: MaterializedDiff = {
+  repositories: [
+    {
+      repository_id: REPO_CONFIG_SERVICE,
+      root: "config-service",
+      base_sha: renameBaseSha,
+      head_sha: renameHeadSha,
+      files: [settingsFile],
+    },
+  ],
+};
+
+/* ------------------------------------------------------------------------------------------ *
+ * Mutable in-memory store
+ * ------------------------------------------------------------------------------------------ */
+
+const rounds: ReviewRound[] = [roundRetry, roundPagination, roundTokens, roundCache, roundRename];
+
+const diffsByRoundId = new Map<string, MaterializedDiff>([
+  [ROUND_RETRY, retryDiff],
+  [ROUND_PAGINATION, paginationDiff],
+  [ROUND_CACHE, cacheDiff],
+  [ROUND_RENAME, renameDiff],
+]);
+
+const viewedFilesByRound = new Map<string, ViewedFile[]>([
+  [ROUND_PAGINATION, [{ repositoryId: REPO_CORE_API, path: "src/pagination/cursor.py" }]],
+]);
+
+function formalComment(id: string, threadId: string, body: string, anchor: Anchor | null, revision: number, deliveredRevision: number | null): FormalComment {
+  return { id, thread_id: threadId, body, anchor, revision, delivered_revision: deliveredRevision };
+}
+
+const paginationComment1Anchor: Anchor = {
+  repository_id: REPO_CORE_API,
+  workspace_relative_path: "core-api/src/pagination/cursor.py",
+  side: "RIGHT",
+  start_line: 10,
+  end_line: 10,
+  blob_sha: cursorNewBlob,
+  selected_code: '    payload = {"v": CURSOR_VERSION, "o": offset, "id": last_id}',
+};
+
+const paginationComment2Anchor: Anchor = {
+  repository_id: REPO_WEB_FRONTEND,
+  workspace_relative_path: "web-frontend/src/hooks/usePagination.ts",
+  side: "RIGHT",
+  start_line: 17,
+  end_line: 19,
+  blob_sha: usePaginationBlob,
+  selected_code: ["      const page = await fetchPage(cursor.cursor);", "      setItems((current) => [...current, ...page.items]);", "      setCursor(page.cursor);"].join("\n"),
+};
+
+const formalCommentsByRound = new Map<string, FormalComment[]>([
+  [
+    ROUND_PAGINATION,
+    [
+      formalComment(
+        "comment-pagination-1",
+        "core-api/src/pagination/cursor.py:RIGHT:10:10",
+        "Good call bumping a version into the payload — please also mention this is a breaking change for any cached client-side cursors in the changelog.",
+        paginationComment1Anchor,
+        1,
+        1,
+      ),
+      formalComment(
+        "comment-pagination-2",
+        "web-frontend/src/hooks/usePagination.ts:RIGHT:17:19",
+        "Please guard against fetchPage throwing — right now a rejected promise leaves `loading` stuck true forever since there's no catch.",
+        paginationComment2Anchor,
+        2,
+        1,
+      ),
+      formalComment(
+        "comment-pagination-3",
+        "round",
+        "Overall this looks solid. Once the changelog note is added and the loadMore error handling is fixed I'm fine approving.",
+        null,
+        1,
+        null,
+      ),
+    ],
+  ],
+]);
+
+const deliveryHistoryByRound = new Map<string, DeliveryHistoryEntry[]>([
+  [
+    ROUND_PAGINATION,
+    [
+      {
+        delivery: {
+          id: "delivery-fixture-1",
+          idempotency_key: "idem-delivery-1",
+          payload: {
+            round_id: ROUND_PAGINATION,
+            decision: "request_changes",
+            comments: [
+              formalComment("comment-pagination-1", "core-api/src/pagination/cursor.py:RIGHT:10:10", "Good call bumping a version into the payload — please also mention this is a breaking change for any cached client-side cursors in the changelog.", paginationComment1Anchor, 1, 1),
+              formalComment("comment-pagination-2", "web-frontend/src/hooks/usePagination.ts:RIGHT:17:19", "Please double check empty-page handling here.", paginationComment2Anchor, 1, 1),
+            ],
+          },
+        },
+        created_at: minutesAgoIso(90),
+        delivered_at: minutesAgoIso(85),
+        outcome: "manual_submission_confirmed",
+      },
+    ],
+  ],
+]);
+
+const decisionByRound = new Map<string, "approve" | "request_changes" | null>([
+  [ROUND_PAGINATION, "request_changes"],
+  [ROUND_RENAME, "approve"],
+]);
+
+const agentRoutes: AgentRoute[] = [
+  {
+    id: "route-fixture-1",
+    adapter_kind: "claude_code_cli",
+    agent_id: "claude-code-cli-7f3a1e",
+    endpoint: "tcp://127.0.0.1:7331",
+    session_id: "sess-9c214f",
+    status: "active",
+    last_heartbeat: minutesAgoIso(4),
+    provenance: {
+      schema_version: 1,
+      adapter_version: "1.4.0",
+      provider: "anthropic",
+      provider_version: "2026-07-01",
+      machine_id: MACHINE_BUILDBOX,
+      original_cwd: "/home/build/workspaces/web-platform",
+      cmux_workspace: "web-platform",
+      cmux_surface: "pagination-cursor-fix",
+      reconnect_recipe: "cmux attach web-platform --surface pagination-cursor-fix",
+      provider_resume_handle: "resume-8841",
+      transcript_reference: "transcript-8841-04",
+      mode: "agent",
+      model: "claude-sonnet-5",
+      thinking: "medium",
+      context: "standard",
+      last_turn: { turn_id: "turn-agent-118", status: "completed", started_at: minutesAgoIso(6), completed_at: minutesAgoIso(4) },
+    } satisfies AgentRouteProvenance,
+  },
+  {
+    id: "route-fixture-2",
+    adapter_kind: "copilot_cli",
+    agent_id: "copilot-cli-22b9",
+    endpoint: null,
+    session_id: null,
+    status: "closed",
+    last_heartbeat: minutesAgoIso(2000),
+    provenance: {
+      schema_version: 1,
+      adapter_version: "0.9.2",
+      provider: "github-copilot",
+      provider_version: null,
+      machine_id: null,
+      original_cwd: null,
+      cmux_workspace: null,
+      cmux_surface: null,
+      reconnect_recipe: null,
+      provider_resume_handle: null,
+      transcript_reference: null,
+      mode: null,
+      thinking: null,
+      context: null,
+      last_turn: null,
+    } satisfies AgentRouteProvenance,
+  },
+];
+
+/* ---- machines --------------------------------------------------------------------------- */
+
+const machines: MachineStatus[] = [
+  {
+    machine: {
+      id: MACHINE_BUILDBOX,
+      config: {
+        name: "Fixture Build Machine",
+        endpoint: { kind: "ssh", target: "buildbox", remote_socket: "/tmp/review-queue-daemon.sock", adapter: "system_open_ssh" },
+        source_type: "review_queue_daemon",
+      },
+    },
+    connection: "connected",
+    health: { protocol_version: 1, daemon_version: "0.1.0", state: "healthy", cursor: { version: "cursor-77" } },
+    cachedItemCount: 2,
+    freshness: { cached: true, cursor: { version: "cursor-77" }, cached_at: minutesAgoIso(6), age_seconds: 360 },
+    lastError: null,
+  },
+  {
+    machine: {
+      id: "machine-fixture-laptop",
+      config: {
+        name: "Fixture Laptop (offline)",
+        endpoint: { kind: "loopback", socket_path: "/tmp/review-queue-daemon-laptop.sock" },
+        source_type: "review_queue_daemon",
+      },
+    },
+    connection: "disconnected",
+    health: null,
+    cachedItemCount: 0,
+    freshness: { cached: false, cursor: null, cached_at: null, age_seconds: null },
+    lastError: null,
+  },
+];
+
+const machineIndexByMachineId = new Map<string, MachineIndexResult>([
+  [
+    MACHINE_BUILDBOX,
+    {
+      index: {
+        cursor: { version: "cursor-77" },
+        items: [
+          {
+            source_item_id: MACHINE_CACHE_ITEM,
+            remote_workspace_id: "ws-session-cache",
+            remote_workspace_path: "/home/build/workspaces/session-cache",
+            topic_key: "cache-eviction-refactor",
+            title: "Refactor session cache eviction",
+            manifest_hash: roundCache.manifest_hash,
+            snapshot_version: "v3",
+          } satisfies MachineItemSummary,
+          {
+            source_item_id: "item-flaky-test-quarantine",
+            remote_workspace_id: "ws-ci-tools",
+            remote_workspace_path: "/home/build/workspaces/ci-tools",
+            topic_key: "quarantine-flaky-tests",
+            title: "Quarantine flaky integration tests",
+            manifest_hash: fakeSha("item-flaky-test-quarantine:manifest"),
+            snapshot_version: "v1",
+          } satisfies MachineItemSummary,
+        ],
+      },
+      freshness: { cached: true, cursor: { version: "cursor-77" }, cached_at: minutesAgoIso(6), age_seconds: 360 },
+    },
+  ],
+]);
+
+/* ---- github publish attempts --------------------------------------------------------------- */
+
+const githubPublishAttempts = new Map<string, GithubPublishAttempt>();
+
+/* ---- ask / copilot conversation store ------------------------------------------------------ */
+
+interface RoundChatState {
+  active: AskConversation;
+  previous: AskConversation[];
+  optionsState: SessionOption[];
+}
+
+const chatStateByRound = new Map<string, RoundChatState>();
+const turnsByConversation = new Map<string, AskTurn[]>();
+const conversationRound = new Map<string, string>();
+
+interface PendingPoll {
+  chunks: string[];
+  index: number;
+}
+const pendingPolls = new Map<string, PendingPoll>();
+
+function freshConversation(roundId: string, sessionState: AskConversation["session_state"] = "can_continue"): AskConversation {
+  const conversation: AskConversation = {
+    id: nextId("conv"),
+    round_id: roundId,
+    session_state: sessionState,
+    history_only_reason: null,
+    provider_session_label: null,
+    options: [],
+    created_at: nowIso(),
+    archived_at: null,
+  };
+  turnsByConversation.set(conversation.id, []);
+  conversationRound.set(conversation.id, roundId);
+  return conversation;
+}
+
+function ensureChatState(roundId: string): RoundChatState {
+  let state = chatStateByRound.get(roundId);
+  if (!state) {
+    state = { active: freshConversation(roundId), previous: [], optionsState: [] };
+    chatStateByRound.set(roundId, state);
+  }
+  return state;
+}
+
+// --- pre-seed round B's rich chat history ------------------------------------------------------
+
+const paginationPrevConversation = freshConversation(ROUND_PAGINATION, "history_only");
+paginationPrevConversation.history_only_reason = "Session ended after Copilot CLI signed out.";
+paginationPrevConversation.provider_session_label = "existing Copilot CLI sign-in · fixture-user";
+paginationPrevConversation.created_at = minutesAgoIso(500);
+paginationPrevConversation.archived_at = minutesAgoIso(480);
+turnsByConversation.set(paginationPrevConversation.id, [
+  {
+    id: "turn-prev-1",
+    conversation_id: paginationPrevConversation.id,
+    idempotency_key: "idem-prev-1",
+    prompt: "What's the current pagination cursor format?",
+    anchor: null,
+    option_values: { model: "gpt-5", thinking_level: "low" },
+    state: "completed",
+    created_at: minutesAgoIso(495),
+    completed_at: minutesAgoIso(494),
+    failure_reason: null,
+    response_text: "The current cursor is a base64-encoded JSON object with `o` (offset) and `id` (last row id) — there's no version field yet, so any format change is a breaking change for clients that persist cursors across sessions.",
+  },
+]);
+
+const paginationActiveConversation = freshConversation(ROUND_PAGINATION, "can_continue");
+paginationActiveConversation.provider_session_label = null;
+paginationActiveConversation.created_at = minutesAgoIso(35);
+
+const turn1AnswerText =
+  "We decode twice because `decode_cursor` validates the version before the caller decides whether to trust the offset, and `next_cursor` re-encodes rather than mutating the incoming cursor in place. That keeps the cursor helpers stateless: callers can call `decode_cursor` purely to inspect a client-supplied cursor (for logging or metrics) without committing to advancing pagination. " +
+  "The extra decode on the query path is cheap versus the underlying database round trip, so I'd leave it rather than threading a pre-decoded cursor through both call sites — that would couple the query layer to the internal cursor representation, which is exactly what versioning (`CURSOR_VERSION`) is meant to let us change independently later. " +
+  "If you want, I can add a `decode_cursor_unchecked` that skips the version assertion for the read-only inspection path, but given the whole point of this change is enforcing the version check, I'd rather keep a single code path for now.";
+
+const turn3AnswerText =
+  "It doesn't need to — `next_cursor` only ever consumes a cursor value it produced itself via `encode_cursor` in the same request cycle, so version drift can't occur there. Version checks matter specifically for `decode_cursor`, which is the entry point for cursors a client persisted and sent back on a later, potentially older, request.";
+
+turnsByConversation.set(paginationActiveConversation.id, [
+  {
+    id: "turn-1",
+    conversation_id: paginationActiveConversation.id,
+    idempotency_key: "idem-1",
+    prompt: "Why do we decode the cursor again inside decode_cursor instead of trusting the caller already validated it?",
+    anchor: {
+      repository_id: REPO_CORE_API,
+      workspace_relative_path: "core-api/src/pagination/cursor.py",
+      side: "RIGHT",
+      start_line: 17,
+      end_line: 19,
+      blob_sha: cursorNewBlob,
+      selected_code: ['    payload = json.loads(raw)', '    if payload.get("v") != CURSOR_VERSION:', '        raise ValueError("unsupported cursor version: " + str(payload.get("v")))'].join("\n"),
+    },
+    option_values: { model: "gpt-5", thinking_level: "medium" },
+    state: "completed",
+    created_at: minutesAgoIso(30),
+    completed_at: minutesAgoIso(29),
+    failure_reason: null,
+    response_text: turn1AnswerText,
+  },
+  {
+    id: "turn-2",
+    conversation_id: paginationActiveConversation.id,
+    idempotency_key: "idem-2",
+    prompt: "Can you check whether the new pagination hook handles an empty first page correctly, and suggest a test?",
+    anchor: {
+      repository_id: REPO_WEB_FRONTEND,
+      workspace_relative_path: "web-frontend/src/hooks/usePagination.ts",
+      side: "RIGHT",
+      start_line: 8,
+      end_line: 13,
+      blob_sha: usePaginationBlob,
+      selected_code: usePaginationTs.split("\n").slice(7, 13).join("\n"),
+    },
+    option_values: { model: "gpt-5", thinking_level: "medium" },
+    state: "interrupted",
+    created_at: minutesAgoIso(25),
+    completed_at: null,
+    failure_reason: "Review Queue restarted before Copilot finished responding; nothing was resent automatically.",
+    response_text: "Looking at the empty-page branch, `cursor.hasMore` starts `true` so the first call to `loadMore` always fires",
+  },
+  {
+    id: "turn-3",
+    conversation_id: paginationActiveConversation.id,
+    idempotency_key: "idem-3",
+    prompt: "Should next_cursor also validate cursor version before advancing the offset?",
+    anchor: null,
+    option_values: { model: "gpt-5", thinking_level: "medium" },
+    state: "completed",
+    created_at: minutesAgoIso(20),
+    completed_at: minutesAgoIso(19),
+    failure_reason: null,
+    response_text: turn3AnswerText,
+  },
+]);
+
+chatStateByRound.set(ROUND_PAGINATION, {
+  active: paginationActiveConversation,
+  previous: [paginationPrevConversation],
+  optionsState: [],
+});
+
+/* ---- connection health ----------------------------------------------------------------- */
+
+const connectionHealth: ConnectionHealth = {
+  cli: { installed: true, signedIn: true, account: "fixture-user", validationIsReadOnly: true },
+  copilot: {
+    capability: "copilot_app",
+    state: "connected",
+    source: "existing_copilot_cli",
+    account: "fixture-user",
+    optional: false,
+    explanation: "Using your existing Copilot CLI sign-in (read-only validation, no token stored by Review Queue).",
+  },
+  prRead: {
+    capability: "pr_read",
+    state: "connected",
+    source: "app_owned_oauth",
+    account: "fixture-bot",
+    optional: true,
+    explanation: "Connected via Review Queue's app-owned OAuth grant, scoped to pull request reads.",
+  },
+  prPublish: {
+    capability: "pr_publish",
+    state: "not_connected",
+    source: "none",
+    account: null,
+    optional: true,
+    explanation: "Connect PR publish to post formal reviews back to GitHub.",
+  },
+  keychain: { available: true, service: "com.reviewqueue.desktop", recoveryInstructions: null },
+  publicClientId: null,
+  pendingDeviceFlow: null,
+};
+
+function copilotCapabilitiesFixture(): CopilotCapabilities {
+  const groups: CopilotCapabilityGroup[] = [
+    {
+      key: "model",
+      label: "Model",
+      supported: true,
+      unsupported_reason: null,
+      apply_policy: "applies_now",
+      choices: [
+        { value: "gpt-5", label: "GPT-5" },
+        { value: "gpt-5-mini", label: "GPT-5 mini" },
+        { value: "claude-sonnet-4.5", label: "Claude Sonnet 4.5" },
+      ],
+      selected: "gpt-5",
+    },
+    {
+      key: "thinking_level",
+      label: "Thinking level",
+      supported: true,
+      unsupported_reason: null,
+      apply_policy: "applies_now",
+      choices: [
+        { value: "low", label: "Low" },
+        { value: "medium", label: "Medium" },
+        { value: "high", label: "High" },
+      ],
+      selected: "medium",
+    },
+    {
+      key: "context_window",
+      label: "Context window",
+      supported: false,
+      unsupported_reason: "The installed Copilot SDK does not expose a discoverable context-window catalog.",
+      apply_policy: "requires_fresh_session",
+      choices: [],
+      selected: null,
+    },
+  ];
+  return { supported: true, unsupported_reason: null, option_groups: groups };
+}
+
+const optionApplyPolicy: Record<string, "applies_now" | "requires_fresh_session"> = {
+  model: "applies_now",
+  thinking_level: "applies_now",
+  context_window: "requires_fresh_session",
+};
+
+function capabilitySessionOptionsFixture(): SessionOption[] {
+  return copilotCapabilitiesFixture().option_groups.map((group) => ({
+    key: group.key,
+    label: group.label,
+    kind: "select",
+    values: group.choices.map((choice) => choice.value),
+    selected: group.selected ?? null,
+    supported: group.supported,
+    unavailable_reason: group.unsupported_reason ?? null,
+  }));
+}
+
+/* ------------------------------------------------------------------------------------------ *
+ * Round bookkeeping helpers
+ * ------------------------------------------------------------------------------------------ */
+
+function isActiveLifecycle(lifecycle: Lifecycle): boolean {
+  return lifecycle !== "completed";
+}
+
+function findRound(id: string): ReviewRound {
+  const round = rounds.find((candidate) => candidate.id === id);
+  if (!round) fail("round_not_found", "This fixture round no longer exists.");
+  return round;
+}
+
+function reorderCollection(collection: Collection, movedId: string, targetRank: number): void {
+  const group = rounds.filter((round) => round.collection === collection && isActiveLifecycle(round.lifecycle));
+  const withoutMoved = group.filter((round) => round.id !== movedId);
+  const moved = group.find((round) => round.id === movedId);
+  if (!moved) return;
+  const clamped = Math.max(0, Math.min(targetRank, withoutMoved.length));
+  withoutMoved.splice(clamped, 0, moved);
+  withoutMoved.forEach((round, index) => {
+    round.rank = index;
+  });
+}
+
+function appendToEndOfCollection(round: ReviewRound): void {
+  const group = rounds.filter((candidate) => candidate.collection === round.collection && isActiveLifecycle(candidate.lifecycle) && candidate.id !== round.id);
+  round.rank = group.length;
+}
+
+/* ------------------------------------------------------------------------------------------ *
+ * Public fixture API — structurally matches api.ts
+ * ------------------------------------------------------------------------------------------ */
+
+export const desktopAvailable = true;
+
+export async function checkForUpdate(): Promise<UpdateCheck> {
+  return { available: false, currentVersion: "0.1.0", version: null, date: null, notes: null };
+}
+
+export async function installUpdate(expectedVersion: string): Promise<UpdateInstall> {
+  return { installed: true, version: expectedVersion, relaunchRequired: true };
+}
+
+export async function relaunchAfterUpdate(): Promise<void> {
+  return undefined;
+}
+
+export async function exportRedactedDiagnostics(_openInFinder: boolean): Promise<DiagnosticsExport> {
+  const totalComments = [...formalCommentsByRound.values()].reduce((sum, list) => sum + list.length, 0);
+  const totalTurns = [...turnsByConversation.values()].reduce((sum, list) => sum + list.length, 0);
+  return {
+    path: "/Users/fixture/Library/Application Support/ReviewQueue/diagnostics/redacted-fixture.json",
+    artifact: {
+      schema_version: 1,
+      verified_at: nowIso(),
+      table_row_counts: { rounds: rounds.length, formal_comments: totalComments, ask_turns: totalTurns, machines: machines.length },
+      contains_raw_values: false,
+    },
+  };
+}
+
+export async function connectionStatus(): Promise<ConnectionHealth> {
+  return { ...connectionHealth };
+}
+
+export async function retryConnection(): Promise<ConnectionHealth> {
+  return { ...connectionHealth };
+}
+
+export async function selectExistingCopilotCli(): Promise<ConnectionHealth> {
+  connectionHealth.copilot = {
+    ...connectionHealth.copilot,
+    state: "connected",
+    source: "existing_copilot_cli",
+    account: connectionHealth.cli.account,
+  };
+  return { ...connectionHealth };
+}
+
+export async function startDeviceFlow(capability: string): Promise<DeviceFlowPublicState> {
+  const pending: DeviceFlowPublicState = {
+    capability,
+    userCode: "FIX-1234",
+    verificationUri: "https://github.com/login/device",
+    expiresAtUnixSeconds: Math.floor(Date.now() / 1000) + 900,
+    secondsRemaining: 900,
+    phase: "pending",
+    canCancel: true,
+  };
+  connectionHealth.pendingDeviceFlow = pending;
+  return pending;
+}
+
+export async function cancelDeviceFlow(): Promise<ConnectionHealth> {
+  connectionHealth.pendingDeviceFlow = null;
+  return { ...connectionHealth };
+}
+
+export async function completeDeviceFlow(): Promise<DeviceFlowPollResult> {
+  const pending = connectionHealth.pendingDeviceFlow;
+  if (!pending) {
+    return { capability: "copilot_app", phase: "expired", account: null, secondsRemaining: 0, retryAfterSeconds: null, message: "No pending connection." };
+  }
+  connectionHealth.pendingDeviceFlow = null;
+  if (pending.capability === "pr_publish") {
+    connectionHealth.prPublish = { ...connectionHealth.prPublish, state: "connected", source: "app_owned_oauth", account: "fixture-bot" };
+  } else if (pending.capability === "pr_read") {
+    connectionHealth.prRead = { ...connectionHealth.prRead, state: "connected", source: "app_owned_oauth", account: "fixture-bot" };
+  } else {
+    connectionHealth.copilot = { ...connectionHealth.copilot, state: "connected", source: "app_owned_oauth", account: "fixture-bot" };
+  }
+  return { capability: pending.capability, phase: "connected", account: "fixture-bot", secondsRemaining: 0, retryAfterSeconds: null, message: "Connected." };
+}
+
+export async function openKeychainAccess(): Promise<void> {
+  return undefined;
+}
+
+export async function disconnectCapability(capability: string, _source: ConnectionSource): Promise<ConnectionHealth> {
+  const disconnected = { state: "not_connected" as const, source: "none" as const, account: null };
+  if (capability === "pr_publish") connectionHealth.prPublish = { ...connectionHealth.prPublish, ...disconnected };
+  else if (capability === "pr_read") connectionHealth.prRead = { ...connectionHealth.prRead, ...disconnected };
+  else connectionHealth.copilot = { ...connectionHealth.copilot, ...disconnected };
+  return { ...connectionHealth };
+}
+
+export async function setPublicClientId(
+  publicClientId: string,
+  _confirmed: boolean,
+): Promise<{ changed: boolean; appOwnedRecordsCleared: boolean; sqlitePreserved: boolean }> {
+  connectionHealth.publicClientId = publicClientId;
+  return { changed: true, appOwnedRecordsCleared: false, sqlitePreserved: true };
+}
+
+export async function listRounds(collection?: Collection, includeOld = false): Promise<ReviewRound[]> {
+  return rounds.filter((round) => (collection ? round.collection === collection : true) && (includeOld || isActiveLifecycle(round.lifecycle)));
+}
+
+export async function listMachines(): Promise<MachineStatus[]> {
+  return machines.map((status) => ({ ...status }));
+}
+
+export async function addMachine(
+  name: string,
+  endpoint: MachineEndpoint,
+): Promise<{ machine: MachineStatus["machine"]; created: boolean }> {
+  const record: MachineRecord = { id: nextId("machine-fixture"), config: { name, endpoint, source_type: "review_queue_daemon" } };
+  machines.push({
+    machine: record,
+    connection: "disconnected",
+    health: null,
+    cachedItemCount: 0,
+    freshness: { cached: false, cursor: null, cached_at: null, age_seconds: null },
+    lastError: null,
+  });
+  return { machine: record, created: true };
+}
+
+export async function removeMachine(idOrName: string): Promise<{ id: string; removed: boolean }> {
+  const index = machines.findIndex((status) => status.machine.id === idOrName || status.machine.config.name === idOrName);
+  if (index === -1) return { id: idOrName, removed: false };
+  const [removed] = machines.splice(index, 1);
+  return { id: removed.machine.id, removed: true };
+}
+
+export async function connectMachine(id: string): Promise<MachineStatus> {
+  const status = machines.find((candidate) => candidate.machine.id === id);
+  if (!status) fail("machine_not_found", "This fixture machine no longer exists.");
+  status.connection = "connected";
+  status.health = { protocol_version: 1, daemon_version: "0.1.0", state: "healthy", cursor: { version: "cursor-1" } };
+  return { ...status };
+}
+
+export async function disconnectMachine(id: string): Promise<MachineStatus> {
+  const status = machines.find((candidate) => candidate.machine.id === id);
+  if (!status) fail("machine_not_found", "This fixture machine no longer exists.");
+  status.connection = "disconnected";
+  status.health = null;
+  return { ...status };
+}
+
+export async function fetchMachineIndex(id: string): Promise<MachineIndexResult> {
+  const index = machineIndexByMachineId.get(id);
+  if (!index) {
+    return { index: { cursor: { version: "cursor-0" }, items: [] }, freshness: { cached: false, cursor: null, cached_at: null, age_seconds: null } };
+  }
+  index.freshness = { ...index.freshness, cached_at: nowIso(), age_seconds: 0 };
+  return index;
+}
+
+export async function materializeMachineRound(
+  id: string,
+  sourceItemId: string,
+): Promise<{ outcome: "created" | "existing" | "superseded"; round: ReviewRound }> {
+  const existing = rounds.find((round) => round.source_metadata?.kind === "machine" && round.source_metadata.source_item_id === sourceItemId);
+  if (existing) return { outcome: "existing", round: existing };
+
+  // Materialize the second (not-yet-cached) machine index item on demand.
+  const item = machineIndexByMachineId.get(id)?.index.items.find((candidate) => candidate.source_item_id === sourceItemId);
+  const roundId = nextId("round-machine");
+  const repositoryId = nextId("repo-machine");
+  const base = fakeSha(`${roundId}:base`);
+  const head = fakeSha(`${roundId}:head`);
+  const content = ["def run_quarantine_check(test_id: str) -> bool:", "    return test_id in QUARANTINED_TEST_IDS"].join("\n");
+  const file = makeTextFile({
+    roundId,
+    repositoryId,
+    oldPath: "src/ci/quarantine.py",
+    newPath: "src/ci/quarantine.py",
+    status: "modified",
+    oldContent: "def run_quarantine_check(test_id: str) -> bool:\n    return False",
+    newContent: content,
+    hunks: [
+      makeHunk(repositoryId, 1, 1, "", [
+        line("deletion", "def run_quarantine_check(test_id: str) -> bool:"),
+        line("context", "    return False"),
+      ]),
+    ],
+  });
+  diffsByRoundId.set(roundId, {
+    repositories: [{ repository_id: repositoryId, root: "ci-tools", base_sha: base, head_sha: head, files: [file] }],
+  });
+  const round: ReviewRound = {
+    id: roundId,
+    collection: "machine",
+    source_adapter: sourceAdapter("machine"),
+    topic_identity: item?.topic_key ?? sourceItemId,
+    manifest_hash: fakeSha(`${roundId}:manifest`),
+    brief: {
+      title: item?.title ?? "Materialized machine round",
+      what: "Materialized on demand from the connected machine's cached index.",
+      why: "",
+      approach_alternatives: "",
+      testing: "",
+    },
+    manifest: {
+      workspace_id: nextId("workspace"),
+      workspace_root: item?.remote_workspace_path ?? "/home/build/workspaces/materialized",
+      topic: item?.topic_key ?? sourceItemId,
+      repositories: [{ repository_id: repositoryId, root: "ci-tools", branch: "main", base_sha: base, head_sha: head, remote_fingerprint: null, object_checksum: fakeSha(`${roundId}:checksum`) }],
+      before_fingerprint: fakeSha(`${roundId}:before`),
+      after_fingerprint: fakeSha(`${roundId}:after`),
+      created_at: nowIso(),
+      origin_route_id: null,
+    },
+    rank: 0,
+    lifecycle: "queued",
+    superseded_by: null,
+    created_at: nowIso(),
+    origin_route_id: null,
+    source_metadata: {
+      kind: "machine",
+      machine_id: id,
+      machine_name: machines.find((status) => status.machine.id === id)?.machine.config.name ?? id,
+      source_item_id: sourceItemId,
+      remote_workspace_id: item?.remote_workspace_id ?? "ws-unknown",
+      remote_workspace_path: item?.remote_workspace_path ?? "/home/build/workspaces/materialized",
+      cursor: "cursor-77",
+      cached_at: nowIso(),
+    },
+  };
+  appendToEndOfCollection(round);
+  rounds.push(round);
+  return { outcome: "created", round };
+}
+
+function githubIntakePreview(url: string): GithubPullRequestIntakePreview {
+  const match = url.match(/^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[?#].*)?$/);
+  if (!match) fail("github_pull_request_url_invalid", "Use an HTTPS pull request URL with owner, repository, and number.");
+  const [, host, owner, repository, number] = match;
+  const pullNumber = Number(number);
+  const base = fakeSha(`${host}/${owner}/${repository}#${pullNumber}:base`);
+  const head = fakeSha(`${host}/${owner}/${repository}#${pullNumber}:head`);
+  return {
+    locator: { host, owner, repository, pull_number: pullNumber },
+    metadata: {
+      host,
+      owner,
+      repository,
+      pull_number: pullNumber,
+      title: `${owner}/${repository} #${pullNumber}`,
+      body: "Fixture pull request resolved from a URL.",
+      base_sha: base,
+      head_sha: head,
+      state: "open",
+      is_draft: false,
+      web_url: `https://${host}/${owner}/${repository}/pull/${pullNumber}`,
+    },
+  };
+}
+
+export async function previewGithubPullRequest(url: string): Promise<GithubPullRequestIntakePreview> {
+  await delay(80);
+  return githubIntakePreview(url);
+}
+
+export async function confirmGithubPullRequest(
+  preview: GithubPullRequestIntakePreview,
+): Promise<SubmissionOutcome> {
+  await delay(80);
+  const current = githubIntakePreview(preview.metadata.web_url ?? `https://${preview.locator.host}/${preview.locator.owner}/${preview.locator.repository}/pull/${preview.locator.pull_number}`);
+  if (JSON.stringify(current) !== JSON.stringify(preview)) {
+    fail("github_intake_preview_stale", "The pull request changed after the preview. Resolve it again before confirming.");
+  }
+  return queueGithubPullRequest(preview.metadata.web_url ?? "");
+}
+
+export async function queueGithubPullRequest(url: string): Promise<SubmissionOutcome> {
+  const preview = githubIntakePreview(url);
+  const { owner, repository, pull_number: pullNumber } = preview.metadata;
+  const roundId = nextId("round-github");
+  const repositoryId = nextId("repo-github");
+  const { base_sha: base, head_sha: head } = preview.metadata;
+  const round: ReviewRound = {
+    id: roundId,
+    collection: "github",
+    source_adapter: sourceAdapter("github"),
+    topic_identity: `github:${owner}/${repository}#${pullNumber}`,
+    manifest_hash: fakeSha(`${roundId}:manifest`),
+    brief: {
+      title: preview.metadata.title,
+      what: "Queued from a GitHub pull request URL. Full file blobs and comments are pulled when you open the review.",
+      why: "",
+      approach_alternatives: "",
+      testing: "",
+    },
+    manifest: {
+      workspace_id: nextId("workspace"),
+      workspace_root: `/Users/fixture/dev/${repository}`,
+      topic: `github:${owner}/${repository}#${pullNumber}`,
+      repositories: [{ repository_id: repositoryId, root: repository, branch: "main", base_sha: base, head_sha: head, remote_fingerprint: null, object_checksum: fakeSha(`${roundId}:checksum`) }],
+      before_fingerprint: fakeSha(`${roundId}:before`),
+      after_fingerprint: fakeSha(`${roundId}:after`),
+      created_at: nowIso(),
+      origin_route_id: null,
+    },
+    rank: 0,
+    lifecycle: "queued",
+    superseded_by: null,
+    created_at: nowIso(),
+    origin_route_id: null,
+    source_metadata: { kind: "github", owner, repository, pull_number: pullNumber, head_sha: head },
+  };
+  appendToEndOfCollection(round);
+  rounds.push(round);
+  githubDataByRound.set(roundId, {
+    metadata: preview.metadata,
+    files: githubFiles,
+    imported: [],
+    staleness: { pinned_head_sha: head, observed_head_sha: head, checked_at: nowIso() },
+  });
+  return { outcome: "created", round };
+}
+
+interface GithubRoundData {
+  metadata: GithubPullRequestMetadata;
+  files: GithubMaterializedFile[];
+  imported: ImportedComment[];
+  staleness: { pinned_head_sha: string; observed_head_sha: string; checked_at: string };
+}
+
+const githubDataByRound = new Map<string, GithubRoundData>([
+  [
+    ROUND_TOKENS,
+    {
+      metadata: tokensMetadata,
+      files: githubFiles,
+      imported: importedComments,
+      staleness: { pinned_head_sha: tokensHeadSha, observed_head_sha: tokensHeadSha, checked_at: nowIso() },
+    },
+  ],
+]);
+
+export async function openGithubPullRequest(roundId: string): Promise<GithubOpenedPullRequest> {
+  const round = findRound(roundId);
+  const data = githubDataByRound.get(roundId);
+  if (!data) fail("github_data_missing", "No fixture GitHub data registered for this round.");
+  return {
+    payload: {
+      locator: { host: data.metadata.host, owner: data.metadata.owner, repository: data.metadata.repository, pull_number: data.metadata.pull_number },
+      metadata: data.metadata,
+      source_materialized: true,
+    },
+    files: data.files,
+  };
+}
+
+export async function cachedGithubRound(roundId: string): Promise<GithubCachedRound> {
+  const data = githubDataByRound.get(roundId);
+  if (!data) fail("github_data_missing", "No fixture GitHub data registered for this round.");
+  return {
+    round_id: roundId,
+    payload: {
+      locator: { host: data.metadata.host, owner: data.metadata.owner, repository: data.metadata.repository, pull_number: data.metadata.pull_number },
+      metadata: data.metadata,
+      source_materialized: true,
+    },
+    files: data.files,
+    imported_comments: data.imported,
+    last_staleness: data.staleness,
+  };
+}
+
+export async function refreshGithubComments(roundId: string): Promise<GithubCommentRefreshResult> {
+  const data = githubDataByRound.get(roundId);
+  if (!data) fail("github_data_missing", "No fixture GitHub data registered for this round.");
+  return { imported: data.imported, staleness: data.staleness };
+}
+
+export async function checkGithubStaleness(
+  roundId: string,
+): Promise<{ pinned_head_sha: string; observed_head_sha: string; checked_at: string }> {
+  const data = githubDataByRound.get(roundId);
+  if (!data) fail("github_data_missing", "No fixture GitHub data registered for this round.");
+  data.staleness = { ...data.staleness, checked_at: nowIso() };
+  return data.staleness;
+}
+
+export async function refreshGithubRound(roundId: string): Promise<SubmissionOutcome> {
+  const round = findRound(roundId);
+  return { outcome: "existing", round };
+}
+
+export async function prepareGithubPublish(roundId: string): Promise<GithubPublishAttempt> {
+  const round = findRound(roundId);
+  const data = githubDataByRound.get(roundId);
+  if (!data) fail("github_data_missing", "No fixture GitHub data registered for this round.");
+  const decision = decisionByRound.get(roundId) ?? "approve";
+  const comments = formalCommentsByRound.get(roundId) ?? [];
+  const importedThreadIds = new Set(
+    data.imported
+      .filter((comment) => comment.kind === "review_thread_comment")
+      .map((comment) => comment.thread_id),
+  );
+  const replies = comments.filter((comment) => importedThreadIds.has(comment.thread_id));
+  const reviewComments = comments.filter((comment) => !importedThreadIds.has(comment.thread_id));
+  const attempt: GithubPublishAttempt = {
+    id: nextId("publish-attempt"),
+    round_id: roundId,
+    preview: {
+      target: data.metadata,
+      decision,
+      event: decision,
+      comments: comments.map((comment) => ({
+        formal_comment_id: comment.id,
+        disposition: importedThreadIds.has(comment.thread_id)
+          ? "reply_to_imported_thread"
+          : comment.anchor ? "inline" : "review_body",
+        fallback_reference: null,
+      })),
+    },
+    request: {
+      idempotency_key: nextId("idem-publish"),
+      target: data.metadata,
+      decision,
+      event: decision,
+      comments: reviewComments.map((comment) => ({
+        formal_comment_id: comment.id,
+        thread_id: comment.thread_id,
+        body: comment.body,
+        disposition: comment.anchor ? "inline" : "review_body",
+        fallback_reference: null,
+        anchor: comment.anchor ?? null,
+      })),
+    },
+    replies: replies.map((comment, index) => ({
+      id: nextId("reply-attempt"),
+      round_id: roundId,
+      request: {
+        idempotency_key: nextId("idem-reply"),
+        target: data.metadata,
+        formal_comment_id: comment.id,
+        formal_revision: comment.revision,
+        upstream_comment_id: index + 1,
+        body: comment.body,
+      },
+      status: "prepared",
+      comment_id: null,
+      created_at: nowIso(),
+      completed_at: null,
+    })),
+    status: "prepared",
+    review_id: null,
+    created_at: nowIso(),
+    completed_at: null,
+  };
+  githubPublishAttempts.set(attempt.id, attempt);
+  return attempt;
+}
+
+export async function publishGithub(attemptId: string): Promise<GithubPublishAttempt> {
+  const attempt = githubPublishAttempts.get(attemptId);
+  if (!attempt) fail("publish_attempt_not_found", "This fixture publish attempt no longer exists.");
+  await delay(400);
+  const completedAt = nowIso();
+  const completed: GithubPublishAttempt = {
+    ...attempt,
+    status: "completed",
+    review_id: nextId("gh-review"),
+    completed_at: completedAt,
+    replies: attempt.replies.map((reply) => ({
+      ...reply,
+      status: "completed",
+      comment_id: nextId("gh-reply"),
+      completed_at: completedAt,
+    })),
+  };
+  githubPublishAttempts.set(attemptId, completed);
+  return completed;
+}
+
+export async function getRound(id: string): Promise<ReviewRound> {
+  return findRound(id);
+}
+
+export async function materializeRoundDiff(id: string): Promise<MaterializedDiff> {
+  findRound(id);
+  return diffsByRoundId.get(id) ?? { repositories: [] };
+}
+
+export async function materializeRoundFile(
+  roundId: string,
+  repositoryId: string,
+  path: string,
+  side: "LEFT" | "RIGHT",
+): Promise<PinnedFileContent> {
+  const found = fileContentStore.get(contentKey(roundId, repositoryId, path, side));
+  if (!found) fail("pinned_file_not_found", `No fixture content registered for ${path} (${side}).`);
+  return found;
+}
+
+export async function previewRoundReproduction(roundId: string, destination: string): Promise<ReproductionPreview> {
+  const round = findRound(roundId);
+  const repositories = round.manifest.repositories.map((repo) => ({
+    repository_id: repo.repository_id,
+    source: repo.root,
+    destination: `${destination}/${repo.root}`,
+    head_sha: repo.head_sha,
+  }));
+  const commandBundle = repositories
+    .map((repo) => `git clone --no-checkout ${repo.source} ${repo.destination} && git -C ${repo.destination} checkout ${repo.head_sha.slice(0, 8)}`)
+    .join("\n");
+  return {
+    destination,
+    repositories,
+    command_bundle: commandBundle,
+    agent_working_directory: destination,
+    launch_guidance: "Start a fresh agent in the working directory above and hand it the prepared feedback prompt manually.",
+  };
+}
+
+export async function materializeRoundReproduction(roundId: string, destination: string): Promise<ReproductionResult> {
+  return previewRoundReproduction(roundId, destination);
+}
+
+export async function listViewedFiles(roundId: string): Promise<ViewedFile[]> {
+  return viewedFilesByRound.get(roundId) ?? [];
+}
+
+export async function setFileViewed(
+  roundId: string,
+  repositoryId: string,
+  path: string,
+  viewed: boolean,
+): Promise<void> {
+  const current = viewedFilesByRound.get(roundId) ?? [];
+  const withoutFile = current.filter((entry) => !(entry.repositoryId === repositoryId && entry.path === path));
+  viewedFilesByRound.set(roundId, viewed ? [...withoutFile, { repositoryId, path }] : withoutFile);
+}
+
+export async function listFormalComments(roundId: string): Promise<FormalComment[]> {
+  return formalCommentsByRound.get(roundId) ?? [];
+}
+
+export async function createFormalComment(
+  roundId: string,
+  body: string,
+  anchor: Anchor | null = null,
+  threadId?: string,
+): Promise<FormalComment> {
+  const comment = formalComment(
+    nextId("comment"),
+    threadId ?? (anchor ? `${anchor.repository_id}:${anchor.workspace_relative_path}:${anchor.side}:${anchor.start_line}:${anchor.end_line}` : "round"),
+    body,
+    anchor,
+    1,
+    null,
+  );
+  const current = formalCommentsByRound.get(roundId) ?? [];
+  formalCommentsByRound.set(roundId, [...current, comment]);
+  return comment;
+}
+
+export async function editFormalComment(
+  commentId: string,
+  body: string,
+  anchor: Anchor | null = null,
+): Promise<FormalComment> {
+  for (const [roundId, comments] of formalCommentsByRound) {
+    const index = comments.findIndex((comment) => comment.id === commentId);
+    if (index === -1) continue;
+    const previous = comments[index];
+    const updated = formalComment(previous.id, previous.thread_id, body, anchor ?? previous.anchor ?? null, previous.revision + 1, previous.delivered_revision ?? null);
+    const next = [...comments];
+    next[index] = updated;
+    formalCommentsByRound.set(roundId, next);
+    return updated;
+  }
+  fail("comment_not_found", "This fixture comment no longer exists.");
+}
+
+export async function deleteFormalComment(commentId: string): Promise<void> {
+  for (const [roundId, comments] of formalCommentsByRound) {
+    if (comments.some((comment) => comment.id === commentId)) {
+      formalCommentsByRound.set(roundId, comments.filter((comment) => comment.id !== commentId));
+      return;
+    }
+  }
+}
+
+export async function getRoundDecision(roundId: string): Promise<"approve" | "request_changes" | null> {
+  return decisionByRound.get(roundId) ?? null;
+}
+
+export async function listAgentRoutes(): Promise<AgentRoute[]> {
+  return agentRoutes.map((route) => ({ ...route }));
+}
+
+export async function listFeedbackDeliveryHistory(roundId: string): Promise<DeliveryHistoryEntry[]> {
+  return deliveryHistoryByRound.get(roundId) ?? [];
+}
+
+export async function prepareFeedbackHandoff(
+  roundId: string,
+  routeId: string | null,
+): Promise<PreparedFeedbackPrompt> {
+  const round = findRound(roundId);
+  const comments = formalCommentsByRound.get(roundId) ?? [];
+  const decision = decisionByRound.get(roundId) ?? null;
+  const route = routeId ? agentRoutes.find((candidate) => candidate.id === routeId) ?? null : null;
+  const history = deliveryHistoryByRound.get(roundId) ?? [];
+  const pending = [...history].reverse().find((entry) => !entry.delivered_at);
+  const deliverableComments = comments.filter((comment) => comment.delivered_revision !== comment.revision);
+  const deliveryId = pending?.delivery.id ?? nextId("delivery");
+  const entry: DeliveryHistoryEntry = pending ?? {
+    delivery: { id: deliveryId, idempotency_key: nextId("idem-delivery"), payload: { round_id: roundId, decision: decision ?? "request_changes", comments } },
+    created_at: nowIso(),
+    delivered_at: null,
+    outcome: null,
+  };
+  if (!pending) {
+    entry.delivery.payload.comments = deliverableComments;
+    deliveryHistoryByRound.set(roundId, [...history, entry]);
+  }
+  const immutableDecision = entry.delivery.payload.decision;
+  const immutableComments = entry.delivery.payload.comments;
+  const promptLines = [
+    `Review round: ${roundId}`,
+    `Decision: ${immutableDecision === "approve" ? "Approve" : "Request changes"}`,
+    "",
+    "Formal feedback:",
+    "",
+    ...immutableComments.map((comment, index) => `${index + 1}. ${comment.anchor ? `${comment.anchor.workspace_relative_path}:${comment.anchor.start_line}-${comment.anchor.end_line}: ` : ""}${comment.body}`),
+  ];
+  const prompt = promptLines.join("\n");
+  const deliveryAvailable = Boolean(
+    route?.endpoint
+      && route.session_id
+      && ["active", "idle", "busy"].includes(route.status),
+  );
+  return {
+    delivery_id: deliveryId,
+    idempotency_key: entry.delivery.idempotency_key,
+    comment_count: entry.delivery.payload.comments.length,
+    prompt,
+    route_id: route?.id ?? null,
+    agent_id: route?.agent_id ?? null,
+    session_id: route?.session_id ?? null,
+    route_status: route?.status ?? null,
+    handoff_path: route ? "existing_session" : "reproduce_and_start_fresh",
+    manual_submission_required: !deliveryAvailable,
+    delivery_available: deliveryAvailable,
+    busy_policy_required: deliveryAvailable && route?.status === "busy",
+    reproduction_required: !route?.session_id,
+    guidance: deliveryAvailable
+      ? route?.status === "busy"
+        ? "The originating session is busy. Choose Queue until idle or Interrupt current turn, then review and confirm the exact immutable delivery."
+        : "The originating session is reachable. Review and confirm the exact immutable delivery."
+      : `Preview and confirm reproduction of round ${round.id}, then paste this prompt into a fresh agent session manually.`,
+  };
+}
+
+export async function deliverFeedback(
+  roundId: string,
+  deliveryId: string,
+  routeId: string,
+  policy: AcpDeliveryPolicy,
+): Promise<AcpDeliveryReceipt> {
+  const route = agentRoutes.find((candidate) => candidate.id === routeId);
+  if (!route?.endpoint || !route.session_id) {
+    fail("acp_endpoint_unreachable", "The originating agent ACP endpoint could not be reached.");
+  }
+  if (route.status === "busy" && !["queue", "interrupt"].includes(policy)) {
+    fail("acp_busy_policy_required", "Choose Queue until idle or Interrupt current turn.");
+  }
+  const history = deliveryHistoryByRound.get(roundId) ?? [];
+  const index = history.findIndex((entry) => entry.delivery.id === deliveryId);
+  if (index === -1) fail("delivery_not_found", "That formal feedback delivery no longer exists.");
+  const entry = history[index];
+  const comments = formalCommentsByRound.get(roundId) ?? [];
+  const deliveredIds = new Map(
+    entry.delivery.payload.comments.map((comment) => [comment.id, comment.revision]),
+  );
+  formalCommentsByRound.set(
+    roundId,
+    comments.map((comment) => {
+      const revision = deliveredIds.get(comment.id);
+      return revision
+        ? { ...comment, delivered_revision: Math.max(comment.delivered_revision ?? 0, revision) }
+        : comment;
+    }),
+  );
+  const next = [...history];
+  next[index] = {
+    ...entry,
+    delivered_at: nowIso(),
+    outcome: policy === "interrupt" ? "acp_delivered_interrupt" : "acp_delivered_queue",
+  };
+  deliveryHistoryByRound.set(roundId, next);
+  return {
+    delivery_id: deliveryId,
+    idempotency_key: entry.delivery.idempotency_key,
+    receipt_id: nextId("acp-receipt"),
+    policy,
+  };
+}
+
+export async function confirmManualFeedbackSubmission(deliveryId: string): Promise<void> {
+  for (const [roundId, history] of deliveryHistoryByRound) {
+    const index = history.findIndex((entry) => entry.delivery.id === deliveryId);
+    if (index === -1) continue;
+    const next = [...history];
+    next[index] = {
+      ...next[index],
+      delivered_at: nowIso(),
+      outcome: "manual_submission_confirmed",
+    };
+    deliveryHistoryByRound.set(roundId, next);
+    return;
+  }
+}
+
+export async function activeConversation(
+  roundId: string,
+  options: SessionOption[] = [],
+): Promise<AskConversation> {
+  const state = ensureChatState(roundId);
+  if (state.optionsState.length === 0 && options.length > 0) state.optionsState = options;
+  state.active = { ...state.active, options: state.optionsState };
+  return state.active;
+}
+
+export async function currentConversation(roundId: string): Promise<AskConversation | null> {
+  const state = chatStateByRound.get(roundId);
+  return state ? state.active : null;
+}
+
+export async function listPreviousChats(roundId: string): Promise<AskConversation[]> {
+  const state = chatStateByRound.get(roundId);
+  return state ? state.previous : [];
+}
+
+export async function listAskTurns(conversationId: string): Promise<AskTurn[]> {
+  return turnsByConversation.get(conversationId) ?? [];
+}
+
+async function archiveAndReset(roundId: string): Promise<AskConversation> {
+  const state = ensureChatState(roundId);
+  const archived: AskConversation = { ...state.active, session_state: "history_only", archived_at: nowIso(), history_only_reason: "Archived by Clear chat." };
+  turnsByConversation.set(archived.id, turnsByConversation.get(state.active.id) ?? []);
+  const fresh = freshConversation(roundId);
+  fresh.options = state.optionsState;
+  state.previous = [archived, ...state.previous];
+  state.active = fresh;
+  return fresh;
+}
+
+export async function clearChat(roundId: string): Promise<AskConversation> {
+  return archiveAndReset(roundId);
+}
+
+export async function copilotCapabilities(): Promise<CopilotCapabilities> {
+  return copilotCapabilitiesFixture();
+}
+
+export async function startCopilotSession(
+  roundId: string,
+  _conversationId: string,
+  optionValues: Record<string, string>,
+): Promise<CopilotSessionInfo> {
+  await delay(250);
+  const capabilities = copilotCapabilitiesFixture();
+  for (const [key, value] of Object.entries(optionValues)) {
+    const group = capabilities.option_groups.find((candidate) => candidate.key === key);
+    if (!group?.supported || !group.choices.some((choice) => choice.value === value)) {
+      throw fixtureCommandError(
+        "copilot_option_value_unavailable",
+        `The saved Copilot option ${key}=${value} is not available.`,
+        "No Copilot session was created and no prompt was sent.",
+        "Explicitly reset unavailable options and start again.",
+      );
+    }
+  }
+  const defaults = Object.fromEntries(
+    capabilities.option_groups
+      .filter((group) => group.supported && group.selected)
+      .map((group) => [group.key, group.selected as string]),
+  );
+  const activeOptions = { ...defaults, ...optionValues };
+  const state = ensureChatState(roundId);
+  state.optionsState = capabilitySessionOptionsFixture().map((option) => ({
+    ...option,
+    selected: activeOptions[option.key] ?? null,
+  }));
+  state.active = { ...state.active, options: state.optionsState };
+  return {
+    sessionId: nextId("session"),
+    authSource: "existing_cli_sign_in_read_only",
+    account: "fixture-user",
+    capabilities,
+    activeOptions,
+  };
+}
+
+export async function changeCopilotOption(
+  roundId: string,
+  _conversationId: string,
+  key: string,
+  value: string,
+): Promise<{ key: string; requested_value: string; effect: string; active_option_stamp: Record<string, string> }> {
+  const state = ensureChatState(roundId);
+  state.optionsState = state.optionsState.map((option) => (option.key === key ? { ...option, selected: value } : option));
+  const effect = optionApplyPolicy[key] ?? "applies_now";
+  const stamp = Object.fromEntries(state.optionsState.map((option) => [option.key, option.selected ?? ""]));
+  return { key, requested_value: value, effect, active_option_stamp: stamp };
+}
+
+const followUpResponses = [
+  "Good question. Looking at the current implementation, the behavior here is intentional: it keeps the change minimal and localized to the file under review, which makes it easy to reason about in isolation.",
+  "I don't see an issue with that approach in this diff — the surrounding code already assumes the same invariant, so this stays consistent with the rest of the module.",
+  "That's a fair concern. A small follow-up test covering that edge case would make this easier to trust going forward, though nothing in this change regresses existing behavior.",
+];
+
+export async function sendCopilotPrompt(
+  roundId: string,
+  conversationId: string,
+  prompt: string,
+  anchor: Anchor | null,
+  optionValues: Record<string, string>,
+): Promise<AskTurn> {
+  const turnId = nextId("turn");
+  const turn: AskTurn = {
+    id: turnId,
+    conversation_id: conversationId,
+    idempotency_key: nextId("idem-turn"),
+    prompt,
+    anchor,
+    option_values: optionValues,
+    state: "queued",
+    created_at: nowIso(),
+    completed_at: null,
+    failure_reason: null,
+    response_text: "",
+  };
+  const turns = turnsByConversation.get(conversationId) ?? [];
+  turnsByConversation.set(conversationId, [...turns, turn]);
+  conversationRound.set(conversationId, roundId);
+
+  const answer = followUpResponses[idCounter % followUpResponses.length];
+  const words = answer.split(" ");
+  const chunkSize = Math.max(4, Math.ceil(words.length / 5));
+  const chunks: string[] = [];
+  for (let i = 0; i < words.length; i += chunkSize) {
+    chunks.push(words.slice(i, i + chunkSize).join(" "));
+  }
+  pendingPolls.set(turnId, { chunks, index: 0 });
+  return turn;
+}
+
+function updateTurn(conversationId: string, turnId: string, patch: Partial<AskTurn>): AskTurn {
+  const turns = turnsByConversation.get(conversationId) ?? [];
+  const index = turns.findIndex((candidate) => candidate.id === turnId);
+  if (index === -1) fail("turn_not_found", "This fixture turn no longer exists.");
+  const updated = { ...turns[index], ...patch };
+  const next = [...turns];
+  next[index] = updated;
+  turnsByConversation.set(conversationId, next);
+  return updated;
+}
+
+function findTurn(turnId: string): { conversationId: string; turn: AskTurn } {
+  for (const [conversationId, turns] of turnsByConversation) {
+    const turn = turns.find((candidate) => candidate.id === turnId);
+    if (turn) return { conversationId, turn };
+  }
+  fail("turn_not_found", "This fixture turn no longer exists.");
+}
+
+export async function pollCopilotPrompt(turnId: string): Promise<CopilotPollResult> {
+  const { conversationId } = findTurn(turnId);
+  const pending = pendingPolls.get(turnId);
+  await delay(350);
+  if (!pending || pending.index >= pending.chunks.length) {
+    pendingPolls.delete(turnId);
+    const current = findTurn(turnId).turn;
+    const completed = updateTurn(conversationId, turnId, { state: "completed", completed_at: nowIso() });
+    return { turn: completed, update: { state: "completed", prompt_id: current.id } };
+  }
+  const text = pending.chunks[pending.index];
+  pending.index += 1;
+  const soFar = findTurn(turnId).turn.response_text + (findTurn(turnId).turn.response_text ? " " : "") + text;
+  const turn = updateTurn(conversationId, turnId, { state: "streaming", response_text: soFar });
+  return { turn, update: { state: "chunk", prompt_id: turn.id, sequence: pending.index, text } };
+}
+
+export async function cancelCopilotPrompt(turnId: string): Promise<AskTurn> {
+  const { conversationId } = findTurn(turnId);
+  pendingPolls.delete(turnId);
+  return updateTurn(conversationId, turnId, { state: "cancelled", completed_at: nowIso() });
+}
+
+export async function clearCopilotChat(roundId: string, _conversationId: string): Promise<AskConversation> {
+  return archiveAndReset(roundId);
+}
+
+export async function submitLocal(request: LocalSubmissionRequest): Promise<SubmissionOutcome> {
+  await delay(200);
+  const roundId = nextId("round-local");
+  const repositoryId = nextId("repo-submitted");
+  const base = fakeSha(`${roundId}:base`);
+  const head = fakeSha(`${roundId}:head`);
+  const oldContent = "# work in progress\n";
+  const newContent = "# work in progress\n# ready for review\n";
+  const file = makeTextFile({
+    roundId,
+    repositoryId,
+    oldPath: "NOTES.md",
+    newPath: "NOTES.md",
+    status: "modified",
+    oldContent,
+    newContent,
+    hunks: [makeHunk(repositoryId, 1, 1, "", [line("context", "# work in progress"), line("addition", "# ready for review")])],
+  });
+  diffsByRoundId.set(roundId, { repositories: [{ repository_id: repositoryId, root: request.workspacePath || "workspace", base_sha: base, head_sha: head, files: [file] }] });
+  const round: ReviewRound = {
+    id: roundId,
+    collection: "local",
+    source_adapter: sourceAdapter("local"),
+    topic_identity: request.topic,
+    manifest_hash: fakeSha(`${roundId}:manifest`),
+    brief: request.brief,
+    manifest: {
+      workspace_id: nextId("workspace"),
+      workspace_root: request.workspacePath || "/Users/fixture/dev/workspace",
+      topic: request.topic,
+      repositories: (request.participatingRepositoryIds.length ? request.participatingRepositoryIds : [repositoryId]).map((id) => ({
+        repository_id: id,
+        root: request.workspacePath || "workspace",
+        branch: "main",
+        base_sha: base,
+        head_sha: head,
+        remote_fingerprint: null,
+        object_checksum: fakeSha(`${roundId}:${id}:checksum`),
+      })),
+      before_fingerprint: fakeSha(`${roundId}:before`),
+      after_fingerprint: fakeSha(`${roundId}:after`),
+      created_at: nowIso(),
+      origin_route_id: request.originRouteId ?? null,
+    },
+    rank: 0,
+    lifecycle: "queued",
+    superseded_by: null,
+    created_at: nowIso(),
+    origin_route_id: request.originRouteId ?? null,
+    source_metadata: null,
+  };
+  appendToEndOfCollection(round);
+  rounds.push(round);
+  return { outcome: "created", round };
+}
+
+export async function preflightLocal(request: LocalSubmissionRequest): Promise<LocalPreflight> {
+  await delay(150);
+  const repositoryId = request.participatingRepositoryIds[0] ?? nextId("repo-preflight");
+  return {
+    repositories: [
+      {
+        root: request.workspacePath || "workspace",
+        repositoryId,
+        branch: "main",
+        headSha: fakeSha(`${repositoryId}:preflight`),
+        status: "clean",
+        hasChanges: true,
+        participating: true,
+      },
+    ],
+    beforeFingerprint: fakeSha(`${request.workspacePath}:${request.topic}:before`),
+    participatingRepositoryIds: [repositoryId],
+    originRouteId: request.originRouteId ?? null,
+    preflightToken: nextId("preflight-token"),
+  };
+}
+
+export async function editRoundBrief(id: string, brief: ReviewBrief): Promise<void> {
+  const round = findRound(id);
+  round.brief = brief;
+}
+
+export async function requestChanges(id: string): Promise<void> {
+  const round = findRound(id);
+  decisionByRound.set(id, "request_changes");
+  if (round.lifecycle !== "completed") round.lifecycle = "changes_requested";
+}
+
+export async function approveRemote(id: string): Promise<void> {
+  findRound(id);
+  decisionByRound.set(id, "approve");
+}
+
+export async function completeRound(id: string): Promise<void> {
+  const round = findRound(id);
+  round.lifecycle = "completed";
+}
+
+export async function requeueRound(id: string): Promise<void> {
+  const round = findRound(id);
+  round.lifecycle = "queued";
+  round.superseded_by = null;
+  appendToEndOfCollection(round);
+}
+
+export async function moveRound(id: string, targetRank: number): Promise<void> {
+  const round = findRound(id);
+  reorderCollection(round.collection, id, targetRank);
+}
+
+export async function purgeRound(id: string, confirmation: "delete" | "approve_local"): Promise<void> {
+  const index = rounds.findIndex((round) => round.id === id);
+  if (index === -1) return;
+  if (confirmation === "approve_local") decisionByRound.set(id, "approve");
+  rounds.splice(index, 1);
+  diffsByRoundId.delete(id);
+  viewedFilesByRound.delete(id);
+  formalCommentsByRound.delete(id);
+  deliveryHistoryByRound.delete(id);
+  decisionByRound.delete(id);
+  chatStateByRound.delete(id);
+  githubDataByRound.delete(id);
+}

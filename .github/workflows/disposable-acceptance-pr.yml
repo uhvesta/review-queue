@@ -1,0 +1,64 @@
+name: Disposable Review Queue acceptance PR
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-fixture:
+    if: github.event.pull_request.head.ref == 'codex/review-queue-v0.1.0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create bot-authored fixture once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          fixture_branch="acceptance/review-queue-github-publish"
+          if gh pr list \
+            --repo "$REPOSITORY" \
+            --head "$fixture_branch" \
+            --state all \
+            --json number \
+            --jq 'length' | grep -qx 1; then
+            echo "disposable acceptance pull request already exists"
+            exit 0
+          fi
+
+          if git ls-remote \
+            --exit-code \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" \
+            "refs/heads/${fixture_branch}" >/dev/null; then
+            gh pr create \
+              --repo "$REPOSITORY" \
+              --base main \
+              --head "$fixture_branch" \
+              --title "Disposable Review Queue GitHub publish acceptance" \
+              --body "Bot-authored disposable pull request for Review Queue mirror and exact-publish acceptance."
+            exit 0
+          fi
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" fixture
+          git -C fixture config user.name "github-actions[bot]"
+          git -C fixture config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C fixture switch -c "$fixture_branch" origin/main
+          mkdir -p fixture/acceptance
+          printf '%s\n' \
+            "Immutable GitHub review acceptance fixture." \
+            "This pull request is disposable and exists only to validate Review Queue publication." \
+            > fixture/acceptance/review-queue-github-publish.txt
+          git -C fixture add acceptance/review-queue-github-publish.txt
+          git -C fixture commit -m "Add disposable Review Queue publish fixture"
+          git -C fixture push -u origin "$fixture_branch"
+          gh pr create \
+            --repo "$REPOSITORY" \
+            --base main \
+            --head "$fixture_branch" \
+            --title "Disposable Review Queue GitHub publish acceptance" \
+            --body "Bot-authored disposable pull request for Review Queue mirror and exact-publish acceptance."
