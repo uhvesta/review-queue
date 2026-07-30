@@ -43,6 +43,23 @@ printf '%s\n' "$fake_session_key" > "$fixture_root/leak/credential.txt"
 assert_clear "$fixture_root/clear"
 assert_rejected_without_echo "$fixture_root/leak" "$fake_session_key"
 
+# GitHub's stock macOS runner does not include ripgrep. Exercise the portable
+# grep fallback even on developer machines where rg is installed.
+fallback_output="$(
+  REVIEW_QUEUE_SCAN_FORCE_GREP=1 "$scanner" "$fixture_root/clear" 2>&1
+)" || fail "grep fallback rejected the clear fixture"
+[[ "$fallback_output" == "release secret scan passed" ]] ||
+  fail "grep fallback emitted unexpected clear-scan output"
+if fallback_output="$(
+  REVIEW_QUEUE_SCAN_FORCE_GREP=1 "$scanner" "$fixture_root/leak" 2>&1
+)"; then
+  fail "grep fallback accepted the credential fixture"
+fi
+[[ "$fallback_output" == *"possible credential material in"* ]] ||
+  fail "grep fallback did not report the affected path"
+[[ "$fallback_output" != *"$fake_session_key"* ]] ||
+  fail "grep fallback echoed credential material"
+
 tar -czf "$fixture_root/clear.app.tar.gz" -C "$fixture_root" clear
 tar -czf "$fixture_root/leak.app.tar.gz" -C "$fixture_root" leak
 assert_clear "$fixture_root/clear.app.tar.gz"
