@@ -335,3 +335,74 @@ and is not a second approval. After a complete restart, both completed
 publication receipts retained their unchanged upstream IDs, and retry
 reconciled them without creating another review or reply. Evidence:
 `github-publish-receipt.jpeg`.
+
+## Rev3 packaged ACP delivery
+
+The notarized universal app built from
+`04ad09cade3f5097ef66c0e7f689cf84af8556c9` ran the production desktop ACP
+confirmation/claim/transport/outcome path in two separate executable
+processes.
+
+Phase one performed one explicit desktop confirmation. A fake loopback ACP
+agent accepted revision 1 once, retained its immutable key, and deliberately
+dropped the acknowledgement. Review Queue recorded the ambiguous
+acknowledgement failure without marking the revision delivered.
+
+Phase two reopened the same disposable SQLite store. Opening after restart
+sent nothing. An explicit retry reused the original delivery and key; the
+restarted fake agent suppressed the duplicate acceptance and returned its
+receipt. Editing the delivered comment created revision 2, and a second
+explicit Send used a new key carrying only revision 2. The final durable
+comment state recorded delivered revision 2.
+
+The retained [sanitized JSONL](packaged-acp-delivery.jsonl) contains only
+boolean/count/revision summaries. The disposable database, prompt, comment
+body, raw envelope, identifiers, endpoint, key, and fake-agent dedupe state
+were removed.
+
+## Rev3 packaged lifecycle and ranking
+
+The same notarized universal executable ran two restart-separated lifecycle
+phases against two disposable Git repositories and a disposable product
+database.
+
+It submitted and resubmitted a multi-repository topic, retained the
+superseded round, exercised Request changes, Complete, Requeue and rank
+movement, canceled both destructive confirmations with zero mutation, then
+reopened the database in a new process and confirmed Delete plus local
+Approve purges. Lifecycle history contained only
+`request_changes`, `complete`, `requeue`, `purge`, and `approve_local` as
+appropriate. Active ranks were identical across restart. Repository HEAD,
+tree, and complete porcelain status remained unchanged by every lifecycle
+operation.
+
+Evidence: [packaged lifecycle JSONL](packaged-lifecycle.jsonl).
+
+## Real OpenSSH connected-machine path
+
+The current signed-candidate pipeline passed a real macOS OpenSSH path using
+an ephemeral agent, unprivileged SSH server, system `ssh -N -L` Unix-socket
+forward, and the shipped standalone daemon. Health, index, item detail, and
+the immutable snapshot crossed that tunnel. Neither private-key material nor
+key/agent paths entered the desktop-form machine database, and the remote
+source repository remained unchanged.
+
+Evidence: [real SSH tunnel record](real-ssh-tunnel.md).
+
+## Rev3 CLI parity and recovery contract
+
+Real CLI binaries now cover `pr add`, `machine add`, and `submit` reruns. Each
+returns the existing ID with a success exit code and exact JSON echo; core/UI
+comparisons serialize the same persisted records byte-for-byte. Secret-shaped
+environment values never enter the owner-only socket, which still rejects
+delivery and publish operations.
+
+The shared recovery catalog contains exactly all 18 §8 states with 75 unique
+backend-code mappings. UI and CLI JSON use the same non-generic what/why/data
+safety/one-next-action/diagnostics/back contract. Real CLI integrations retain
+distinct exit codes for unreachable app, missing capability, and invalid
+machine configuration. Publish remains unreachable and disabled with its
+exact enabling action until a decision is recorded.
+
+The signed-candidate build and full validation are recorded in
+[the Rev3 acceptance candidate](rev3-acceptance-candidate.md).

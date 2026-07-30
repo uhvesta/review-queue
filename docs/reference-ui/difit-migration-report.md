@@ -236,7 +236,7 @@ pass. `npm run build` re-verified clean after each fix.
 This section separates the retained historical migration checks from checks
 run against the **current working tree**.
 
-- `cd frontend && npm test` passed: 2 files, 34 tests.
+- `cd frontend && npm test` passed: 3 files, 42 tests.
 - `cd frontend && npm run build` and `npx vite build --mode fixture` passed.
 - The in-app browser fixture passed at 1280px, 1024px, and 560px. Files and
   Chat remained reachable, continuous diffs rendered at non-zero width, and
@@ -325,10 +325,9 @@ details modal, Application settings, and Submit local review. It's also what
 surfaced the three real bugs listed above (split-mode coloring, empty-cell
 visibility, settings text collision) that a pure code read had missed.
 
-**Still outstanding:** a formal pixel-comparison capture at the exact legacy
-reference size (1152×768). Narrow layouts have since been checked at 1024px
-and 560px in the fixture browser and at the 560px native window minimum; the
-retained current evidence is listed above.
+The current suite also covers exact ACP Send confirmation/cancel/busy-policy
+recovery, local lifecycle confirmation flows, all 18 recovery-copy states,
+CLI parity fixtures, and the publish-without-decision disabled gate.
 
 ## Historical commands and results
 
